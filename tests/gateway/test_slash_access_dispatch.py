@@ -739,3 +739,124 @@ async def test_commands_only_mode_allows_admin_plain_text_to_agent_path():
         await runner._handle_message(_make_event("hello", _make_source(platform=Platform.WEIXIN, user_id="admin")))
     except RuntimeError as e:
         assert "admin reached agent path" in str(e)
+
+
+# ---------------------------------------------------------------------------
+# LLM/router natural-language command mapping in commands-only mode.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_llm_router_maps_plain_text_to_allowed_schedule_command():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+        },
+    )
+    runner._llm_route_free_text_to_command = MagicMock(
+        return_value={"decision": "allow", "command": '/s add "开会" --when "明天 9 点"'}
+    )
+    runner._handle_s_command = AsyncMock(return_value="reminder-ok")
+
+    result = await runner._handle_message(
+        _make_event("提醒我明天 9 点开会", _make_source(platform=Platform.WEIXIN, user_id="user"))
+    )
+
+    assert result == "reminder-ok"
+    event_arg = runner._handle_s_command.call_args.args[0]
+    assert event_arg.get_command() == "s"
+    assert event_arg.get_command_args() == 'add "开会" --when "明天 9 点"'
+
+
+@pytest.mark.anyio
+async def test_llm_router_denies_forbidden_command_output():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+        },
+    )
+    runner._llm_route_free_text_to_command = MagicMock(
+        return_value={"decision": "allow", "command": "/model gpt-5"}
+    )
+
+    result = await runner._handle_message(
+        _make_event("帮我换模型", _make_source(platform=Platform.WEIXIN, user_id="user"))
+    )
+
+    assert result is not None
+    assert "功能限定模式" in result
+    runner.session_store.get_or_create_session.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_llm_router_denies_free_form_output():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+        },
+    )
+    runner._llm_route_free_text_to_command = MagicMock(
+        return_value={"decision": "allow", "command": "这里是自由回答"}
+    )
+
+    result = await runner._handle_message(
+        _make_event("随便聊聊", _make_source(platform=Platform.WEIXIN, user_id="user"))
+    )
+
+    assert result is not None
+    assert "功能限定模式" in result
+    runner.session_store.get_or_create_session.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_llm_router_deny_decision_discards_input():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+        },
+    )
+    runner._llm_route_free_text_to_command = MagicMock(
+        return_value={"decision": "deny", "reason": "not an allowed function"}
+    )
+
+    result = await runner._handle_message(
+        _make_event("写一首诗", _make_source(platform=Platform.WEIXIN, user_id="user"))
+    )
+
+    assert result is not None
+    assert "功能限定模式" in result
+    runner.session_store.get_or_create_session.assert_not_called()
+    runner.session_store.append_to_transcript.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_router_off_preserves_plain_text_denial():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "off",
+        },
+    )
+    runner._llm_route_free_text_to_command = MagicMock(return_value={"decision": "allow", "command": "/status"})
+
+    result = await runner._handle_message(
+        _make_event("运行状态", _make_source(platform=Platform.WEIXIN, user_id="user"))
+    )
+
+    assert result is not None
+    assert "功能限定模式" in result
+    runner._llm_route_free_text_to_command.assert_not_called()

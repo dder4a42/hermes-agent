@@ -9165,13 +9165,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # let the adapter-level batching/queueing logic absorb them.
 
         # Commands-only platforms (e.g. personal Weixin bots used for push /
-        # reminders) may forbid free-form chat for non-admin users. Check this
-        # before the running-agent fast path so a user cannot queue/interupt an
-        # active agent with plain text.
+        # reminders) may forbid free-form chat for non-admin users. Before
+        # blocking, optionally run a non-persisting NL router that may rewrite
+        # the text into one allowed functional slash command. Forbidden or
+        # unrecognized input returns a denial before the main agent loop, so the
+        # user's free-form text is discarded and never appended to transcript.
         if not event.get_command():
-            _free_chat_denied = self._check_free_chat_access(source)
-            if _free_chat_denied is not None:
-                return _free_chat_denied
+            _routed = await self._route_free_text_to_allowed_command(event)
+            if _routed is not None:
+                logger.info(
+                    "Routed free text into /%s for %s:%s",
+                    _routed.get_command(),
+                    source.platform.value if source.platform else "?",
+                    source.user_id,
+                )
+                event = _routed
+            else:
+                _free_chat_denied = self._check_free_chat_access(source)
+                if _free_chat_denied is not None:
+                    return _free_chat_denied
 
         # Staleness eviction: detect leaked locks from hung/crashed handlers.
         # With inactivity-based timeout, active tasks can run for hours, so
@@ -12464,10 +12476,185 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return (
             "⛔ 这个 bot 已开启功能限定模式，不接受自由对话。\n"
             f"{suffix}\n"
-            "请使用上面的命令；管理员仍可自由对话。"
+            "你可以用自然语言表达这些功能；如果请求不属于这些功能，我会直接拒绝且不写入对话上下文。"
         )
 
+    def _platform_extra_for_source(self, source: SessionSource) -> dict:
+        platforms = getattr(self.config, "platforms", None) or {}
+        platform_cfg = None
+        try:
+            platform_cfg = platforms.get(source.platform)
+        except Exception:
+            platform_cfg = None
+        extra = getattr(platform_cfg, "extra", None)
+        return extra if isinstance(extra, dict) else {}
 
+    async def _route_free_text_to_allowed_command(self, event: MessageEvent) -> Optional[MessageEvent]:
+        """Route natural-language text to an allowed command, without persistence.
+
+        The router is intentionally separate from the normal gateway agent:
+        no session DB, no memory, no tools, no transcript append. It may only
+        return a slash command. The returned command is validated against the
+        same SlashAccessPolicy and will be validated again by the normal slash
+        dispatch path (defense in depth).
+        """
+        from gateway.slash_access import policy_for_source as _policy_for_source
+
+        source = event.source
+        policy = _policy_for_source(self.config, source)
+        if not policy.enabled or policy.can_free_chat(source.user_id):
+            return None
+
+        extra = self._platform_extra_for_source(source)
+        mode = str(extra.get("nl_command_router", "off") or "off").strip().lower()
+        if mode in {"", "off", "none", "false", "0"}:
+            return None
+        if mode not in {"llm", "agent"}:
+            logger.warning("Unknown nl_command_router=%r; free text will be denied", mode)
+            return None
+
+        text = (event.text or "").strip()
+        if not text:
+            return None
+
+        allowed_commands = sorted(set(policy.user_allowed_commands) | {"help", "whoami"})
+        try:
+            route = await asyncio.to_thread(
+                self._llm_route_free_text_to_command,
+                text,
+                allowed_commands,
+                source,
+            )
+        except Exception:
+            logger.exception("NL command router failed; free text will be denied")
+            return None
+        command_text = self._validated_routed_command(route, policy, source)
+        if not command_text:
+            return None
+
+        from dataclasses import replace
+        return replace(
+            event,
+            text=command_text,
+            metadata={
+                **(event.metadata or {}),
+                "nl_command_router": {
+                    "mode": mode,
+                    "original_text": text,
+                    "command": command_text,
+                },
+            },
+        )
+
+    def _llm_route_free_text_to_command(
+        self,
+        text: str,
+        allowed_commands: list[str],
+        source: SessionSource,
+    ) -> dict:
+        """Use a no-tools router agent to map text into an allowed command.
+
+        Returns a dict shaped like {decision, command, reason}. Callers must
+        validate the command before executing it. This helper deliberately uses
+        session_db=None, skip_memory=True, skip_context_files=True, and
+        enabled_toolsets=[] so router inputs/outputs don't pollute the user's
+        conversation and the model cannot take side effects.
+        """
+        import json
+        from run_agent import AIAgent
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        model_cfg = cfg.get("model") or {}
+        model = str(model_cfg.get("default") or "")
+        provider = model_cfg.get("provider")
+        base_url = model_cfg.get("base_url")
+
+        specs = self._nl_command_router_specs(allowed_commands)
+        system = (
+            "You are a command router for a commands-only Weixin bot.\n"
+            "You do not answer the user. You only classify the message into one allowed slash command.\n"
+            "If the message is outside the allowed functions, ambiguous, asks for free chat, or asks for a forbidden operation, return deny.\n"
+            "Return ONLY compact JSON with keys: decision, command, reason.\n"
+            "decision must be 'allow' or 'deny'.\n"
+            "If decision is 'allow', command must start with '/' and its first word must be one of the allowed commands.\n"
+            "Do not invent commands. Do not include markdown.\n\n"
+            f"Allowed command specs:\n{specs}"
+        )
+        prompt = (
+            "Route this user message.\n"
+            f"Allowed command names: {', '.join('/' + c for c in allowed_commands)}\n"
+            f"User message: {text!r}\n"
+        )
+        agent = AIAgent(
+            model=model,
+            provider=provider,
+            base_url=base_url,
+            max_iterations=1,
+            enabled_toolsets=[],
+            disabled_toolsets=[],
+            quiet_mode=True,
+            skip_memory=True,
+            skip_context_files=True,
+            session_db=None,
+            max_tokens=512,
+            ephemeral_system_prompt=system,
+            platform=getattr(source.platform, "value", None) if source else None,
+            user_id=getattr(source, "user_id", None) if source else None,
+            chat_id=getattr(source, "chat_id", None) if source else None,
+            chat_type=getattr(source, "chat_type", None) if source else None,
+        )
+        result = agent.run_conversation(prompt, conversation_history=[])
+        raw = str((result or {}).get("final_response") or "").strip()
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw, flags=re.S)
+            if not match:
+                return {"decision": "deny", "reason": "router returned non-json"}
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return {"decision": "deny", "reason": "router returned invalid json"}
+
+    def _nl_command_router_specs(self, allowed_commands: list[str]) -> str:
+        specs = {
+            "paper": "Research Copilot. Use /paper topics, /paper history [n], /paper health, /paper now, /paper save <id>, /paper skip <id> [reason], /paper read <id>, /paper feedback <id> <text>.",
+            "s": "Timed reminders. Use /s status, /s list, /s add \"title\" --when \"time expression\" [--notes \"...\"], /s done <id>, /s rm <id>, /s pause <id>, /s resume <id>.",
+            "th": "Thought incubation. Use /th status, /th list, /th show <id>, /th done <id>, /th rm <id>, /th pause <id>, /th resume <id>.",
+            "status": "Gateway/session status. Use /status.",
+            "help": "Help. Use /help.",
+            "whoami": "Show caller access tier and allowed commands. Use /whoami.",
+        }
+        lines = []
+        for cmd in allowed_commands:
+            if cmd in specs:
+                lines.append(f"/{cmd}: {specs[cmd]}")
+        return "\n".join(lines)
+
+    def _validated_routed_command(self, route: object, policy: object, source: SessionSource) -> Optional[str]:
+        if not isinstance(route, dict):
+            return None
+        if str(route.get("decision") or "").lower() != "allow":
+            return None
+        command_text = str(route.get("command") or "").strip()
+        if not command_text.startswith("/") or "\n" in command_text or "\r" in command_text:
+            return None
+        command_name = command_text.split(maxsplit=1)[0][1:].lower()
+        if not command_name or "/" in command_name:
+            return None
+        try:
+            from hermes_cli.commands import resolve_command, is_gateway_known_command
+            cmd_def = resolve_command(command_name)
+            canonical = cmd_def.name if cmd_def else command_name
+            if not is_gateway_known_command(canonical):
+                return None
+        except Exception:
+            canonical = command_name
+        if not policy.can_run(source.user_id, canonical):
+            logger.info("NL router produced disallowed command /%s; denying", canonical)
+            return None
+        return command_text
 
 
 
