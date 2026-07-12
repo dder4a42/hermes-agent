@@ -22,9 +22,10 @@ Backward compatibility:
 
 The gate is applied at the slash command dispatch site in
 ``gateway/run.py`` so it covers BOTH built-in and plugin-registered
-commands via the live registry. Gating slash commands does not affect
-plain chat — non-admin users can still talk to the agent normally,
-they just can't trigger commands outside ``user_allowed_commands``.
+commands via the live registry. Operators can also set ``user_free_chat:
+false`` (or ``group_user_free_chat: false``) to make non-admin users
+commands-only: plain chat is blocked while the listed slash commands remain
+available.
 
 Authored as a slimmed-down salvage of PR #4443's permission tiers
 (co-authored by @ReqX). The full tier system, audit log, usage
@@ -65,6 +66,7 @@ class SlashAccessPolicy:
     enabled: bool                      # gating active for this scope?
     admin_user_ids: FrozenSet[str]
     user_allowed_commands: FrozenSet[str]
+    user_free_chat: bool = True         # non-admin plain chat allowed?
 
     def is_admin(self, user_id: Optional[str]) -> bool:
         if not self.enabled:
@@ -86,6 +88,13 @@ class SlashAccessPolicy:
         if canonical_cmd in _ALWAYS_ALLOWED_FOR_USERS:
             return True
         return canonical_cmd in self.user_allowed_commands
+
+    def can_free_chat(self, user_id: Optional[str]) -> bool:
+        if not self.enabled:
+            return True
+        if self.is_admin(user_id):
+            return True
+        return bool(self.user_free_chat)
 
 
 _DM_CHAT_TYPES = frozenset({"dm", "direct", "private", ""})
@@ -160,11 +169,28 @@ def _platform_extra(platform_config: Any) -> dict:
     return {}
 
 
-def _keys_for_scope(scope: str) -> Tuple[str, str]:
-    """Return (admin_key, user_cmd_key) names for a scope."""
+def _keys_for_scope(scope: str) -> Tuple[str, str, str]:
+    """Return (admin_key, user_cmd_key, free_chat_key) names for a scope."""
     if scope == "group":
-        return ("group_allow_admin_from", "group_user_allowed_commands")
-    return ("allow_admin_from", "user_allowed_commands")
+        return ("group_allow_admin_from", "group_user_allowed_commands", "group_user_free_chat")
+    return ("allow_admin_from", "user_allowed_commands", "user_free_chat")
+
+
+def _coerce_bool(raw: Any, default: bool = True) -> bool:
+    """Coerce YAML bool-ish values; unknown values fall back to default."""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, (int, float)):
+        return bool(raw)
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "allow", "allowed"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "deny", "denied"}:
+            return False
+    return default
 
 
 def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
@@ -176,20 +202,26 @@ def policy_from_extra(extra: dict, scope: str) -> SlashAccessPolicy:
     forcing duplication. Admin lists are NOT cross-scope: an admin in
     DMs is not implicitly an admin in a group.
     """
-    admin_key, cmd_key = _keys_for_scope(scope)
+    admin_key, cmd_key, free_chat_key = _keys_for_scope(scope)
     admin_ids = _coerce_id_list(extra.get(admin_key))
     cmds = _coerce_command_list(extra.get(cmd_key))
+    user_free_chat = _coerce_bool(extra.get(free_chat_key), default=True)
 
     if scope == "dm" and not cmds:
         # DM didn't specify — let group's user_allowed_commands fall through
         # so operators only need to list it once if it's the same.
         cmds = _coerce_command_list(extra.get("group_user_allowed_commands"))
+    if scope == "dm" and free_chat_key not in extra and "group_user_free_chat" in extra:
+        # Same ergonomic fallback as commands: if only group_user_free_chat is
+        # specified, use it for DM too. Admin lists remain scope-specific.
+        user_free_chat = _coerce_bool(extra.get("group_user_free_chat"), default=True)
 
-    enabled = bool(admin_ids)
+    enabled = bool(admin_ids) or bool(cmds) or not user_free_chat
     return SlashAccessPolicy(
         enabled=enabled,
         admin_user_ids=admin_ids,
         user_allowed_commands=cmds,
+        user_free_chat=user_free_chat,
     )
 
 
@@ -209,6 +241,7 @@ def policy_for_source(gateway_config: Any, source: Any) -> SlashAccessPolicy:
             enabled=False,
             admin_user_ids=frozenset(),
             user_allowed_commands=frozenset(),
+            user_free_chat=True,
         )
     platforms = getattr(gateway_config, "platforms", None)
     platform_config = None

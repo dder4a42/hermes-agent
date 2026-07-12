@@ -117,7 +117,7 @@ def _make_runner(*, platform_extra: dict | None = None,
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_whoami_unrestricted_when_no_admin_list():
     runner = _make_runner(platform_extra={})  # no admin list
     result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="999")))
@@ -125,14 +125,14 @@ async def test_whoami_unrestricted_when_no_admin_list():
     assert "no admin list configured" in result
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_whoami_admin_user():
     runner = _make_runner(platform_extra={"allow_admin_from": ["111"]})
     result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="111")))
     assert "**admin**" in result
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_whoami_non_admin_lists_runnable_commands():
     runner = _make_runner(
         platform_extra={
@@ -153,7 +153,7 @@ async def test_whoami_non_admin_lists_runnable_commands():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_non_admin_denied_for_unlisted_command():
     runner = _make_runner(
         platform_extra={
@@ -169,7 +169,7 @@ async def test_non_admin_denied_for_unlisted_command():
     assert "/status" in result  # denial preview shows what they CAN run
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_non_admin_with_empty_user_commands_gets_floor_only():
     runner = _make_runner(
         platform_extra={
@@ -191,7 +191,7 @@ async def test_non_admin_with_empty_user_commands_gets_floor_only():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_admin_runs_unlisted_command():
     runner = _make_runner(
         platform_extra={
@@ -207,7 +207,7 @@ async def test_admin_runs_unlisted_command():
     assert "**admin**" in result
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_user_runs_listed_command():
     runner = _make_runner(
         platform_extra={
@@ -225,7 +225,7 @@ async def test_user_runs_listed_command():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_backward_compat_no_admin_list_means_no_gate():
     runner = _make_runner(platform_extra={})  # nothing configured
     # Random non-listed user runs /whoami; should return unrestricted profile,
@@ -240,7 +240,7 @@ async def test_backward_compat_no_admin_list_means_no_gate():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_dm_admin_is_not_group_admin():
     runner = _make_runner(
         platform_extra={
@@ -257,7 +257,7 @@ async def test_dm_admin_is_not_group_admin():
     assert "⛔" in result
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_group_only_gating_leaves_dm_unrestricted():
     runner = _make_runner(
         platform_extra={
@@ -274,7 +274,7 @@ async def test_group_only_gating_leaves_dm_unrestricted():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_plugin_registered_command_is_gated(monkeypatch):
     """The gate must recognize plugin-registered slash commands, not just
     built-in COMMAND_REGISTRY entries. We verify by stubbing
@@ -315,7 +315,7 @@ async def test_plugin_registered_command_is_gated(monkeypatch):
     assert "/myplugin is admin-only here" in result
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_non_admin_denied_for_unlisted_quick_command_exec():
     """A non-admin must not reach the quick_commands exec sink for a command
     that isn't in user_allowed_commands. Regression for #44727 — quick
@@ -341,7 +341,7 @@ async def test_non_admin_denied_for_unlisted_quick_command_exec():
     assert "quick-command-bypass-confirmed" not in result
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_listed_quick_command_runs_for_non_admin():
     """When the operator lists the quick command in user_allowed_commands, a
     non-admin can run it — the gate must allow, not blanket-deny."""
@@ -362,7 +362,7 @@ async def test_listed_quick_command_runs_for_non_admin():
     assert result == "quick-command-allowed"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_admin_runs_quick_command_when_gating_enabled():
     """An admin runs the quick command even under an enabled gate with an
     empty user_allowed_commands list."""
@@ -394,7 +394,7 @@ async def test_admin_runs_quick_command_when_gating_enabled():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_running_agent_fastpath_blocks_non_admin_command():
     """When an agent is running, /restart from a non-admin must be denied."""
     runner = _make_runner(
@@ -415,7 +415,7 @@ async def test_running_agent_fastpath_blocks_non_admin_command():
     assert "/restart is admin-only here" in result
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_running_agent_fastpath_allows_admin_command():
     """Admins must still be able to run privileged commands like /restart
     through the running-agent fast-path. We check that we don't get the
@@ -439,7 +439,7 @@ async def test_running_agent_fastpath_allows_admin_command():
     assert "⛔" not in (result or "")
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_running_agent_fastpath_status_always_works():
     """/status is intentionally pre-gate on the fast-path so users can
     always see session state, even non-admins."""
@@ -466,7 +466,7 @@ async def test_running_agent_fastpath_status_always_works():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_gate_uses_canonical_name_not_alias():
     """If /hist resolves to canonical 'history' and history is in
     user_allowed_commands, the alias must be allowed too."""
@@ -493,7 +493,7 @@ async def test_gate_uses_canonical_name_not_alias():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_gate_does_not_intercept_unknown_command():
     """Random non-command text like /xyzzy is not in the registry. The gate
     must not produce a denial message — the existing unknown-command path
@@ -526,7 +526,7 @@ async def test_gate_does_not_intercept_unknown_command():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_dm_admin_blocked_in_group_with_separate_admin_list():
     runner = _make_runner(
         platform_extra={
@@ -548,7 +548,7 @@ async def test_dm_admin_blocked_in_group_with_separate_admin_list():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_gating_isolated_per_platform():
     """When Discord is gated and Telegram isn't, the same user_id on
     Telegram must be unrestricted."""
@@ -621,3 +621,121 @@ async def test_gating_isolated_per_platform():
     tg_src = _make_source(platform=Platform.TELEGRAM, user_id="999", chat_id="t1")
     result = await runner._handle_message(_make_event("/whoami", tg_src))
     assert "Tier: unrestricted" in result
+
+
+# ---------------------------------------------------------------------------
+# Commands-only free-chat gating — used by Weixin push/reminder bots.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_commands_only_mode_blocks_non_admin_plain_text_before_agent_loop():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+
+    result = await runner._handle_message(_make_event("hello", _make_source(platform=Platform.WEIXIN, user_id="user")))
+
+    assert result is not None
+    assert "功能限定模式" in result
+    assert "/paper" in result
+    # The agent/session path should not be entered for blocked plain text.
+    runner.session_store.get_or_create_session.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_commands_only_mode_allows_listed_command():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+    # Avoid depending on Research Copilot data; stub the handler.
+    runner._handle_paper_command = AsyncMock(return_value="paper-ok")
+
+    result = await runner._handle_message(_make_event("/paper topics", _make_source(platform=Platform.WEIXIN, user_id="user")))
+
+    assert result == "paper-ok"
+
+
+@pytest.mark.anyio
+async def test_commands_only_mode_keeps_unlisted_command_denied():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+
+    result = await runner._handle_message(_make_event("/model gpt-5", _make_source(platform=Platform.WEIXIN, user_id="user")))
+
+    assert result is not None
+    assert "⛔" in result
+    assert "/model is admin-only here" in result
+
+
+@pytest.mark.anyio
+async def test_commands_only_mode_does_not_intercept_unknown_slash_command():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+    runner.session_store.get_or_create_session.side_effect = RuntimeError("would have proceeded past gate")
+
+    try:
+        await runner._handle_message(_make_event("/notarealcommand", _make_source(platform=Platform.WEIXIN, user_id="user")))
+    except RuntimeError as e:
+        assert "would have proceeded past gate" in str(e)
+
+
+@pytest.mark.anyio
+async def test_commands_only_mode_blocks_plain_text_even_when_agent_running():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+    src = _make_source(platform=Platform.WEIXIN, user_id="user")
+    sk = build_session_key(src)
+    runner._running_agents[sk] = MagicMock()
+    runner._running_agents_ts[sk] = 0
+
+    result = await runner._handle_message(_make_event("hello while busy", src))
+
+    assert result is not None
+    assert "功能限定模式" in result
+
+
+@pytest.mark.anyio
+async def test_commands_only_mode_allows_admin_plain_text_to_agent_path():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+    runner.session_store.get_or_create_session.side_effect = RuntimeError("admin reached agent path")
+
+    try:
+        await runner._handle_message(_make_event("hello", _make_source(platform=Platform.WEIXIN, user_id="admin")))
+    except RuntimeError as e:
+        assert "admin reached agent path" in str(e)

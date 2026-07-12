@@ -9164,6 +9164,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # simultaneous updates. Do NOT interrupt for photo-only follow-ups here;
         # let the adapter-level batching/queueing logic absorb them.
 
+        # Commands-only platforms (e.g. personal Weixin bots used for push /
+        # reminders) may forbid free-form chat for non-admin users. Check this
+        # before the running-agent fast path so a user cannot queue/interupt an
+        # active agent with plain text.
+        if not event.get_command():
+            _free_chat_denied = self._check_free_chat_access(source)
+            if _free_chat_denied is not None:
+                return _free_chat_denied
+
         # Staleness eviction: detect leaked locks from hung/crashed handlers.
         # With inactivity-based timeout, active tasks can run for hours, so
         # wall-clock age alone isn't sufficient.  Evict only when the agent
@@ -12423,6 +12432,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "or to set user_allowed_commands."
             )
         return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
+
+    def _check_free_chat_access(self, source: SessionSource) -> Optional[str]:
+        """Return a denial message when commands-only mode blocks plain chat.
+
+        Slash command access and free-chat access share the same policy object.
+        The feature is opt-in and backward-compatible: if slash gating is not
+        enabled for this platform/scope, free chat stays allowed.
+        """
+        from gateway.slash_access import policy_for_source as _policy_for_source
+
+        policy = _policy_for_source(self.config, source)
+        if not policy.enabled or policy.can_free_chat(source.user_id):
+            return None
+
+        allowed_preview = sorted(policy.user_allowed_commands)
+        floor = ["help", "whoami"]
+        allowed = []
+        seen = set()
+        for cmd in [*allowed_preview, *floor]:
+            if cmd not in seen:
+                seen.add(cmd)
+                allowed.append(cmd)
+        if allowed:
+            suffix = "可用功能：" + "、".join(f"/{c}" for c in allowed[:12])
+            if len(allowed) > 12:
+                suffix += "…"
+            suffix += "。"
+        else:
+            suffix = "当前没有为普通用户启用任何功能命令。"
+        return (
+            "⛔ 这个 bot 已开启功能限定模式，不接受自由对话。\n"
+            f"{suffix}\n"
+            "请使用上面的命令；管理员仍可自由对话。"
+        )
 
 
 

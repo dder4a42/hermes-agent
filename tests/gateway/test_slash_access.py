@@ -286,3 +286,76 @@ class TestPolicyForSource:
         p = policy_for_source(cfg, tg_src)
         assert p.enabled is False
         assert p.can_run("999", "stop") is True
+
+
+# ---------------------------------------------------------------------------
+# user_free_chat — commands-only bot mode
+# ---------------------------------------------------------------------------
+
+
+def test_default_free_chat_allowed_for_backward_compat():
+    p = policy_from_extra({"allow_admin_from": ["admin"]}, "dm")
+    assert p.can_free_chat("user") is True
+
+
+def test_non_admin_free_chat_can_be_disabled():
+    p = policy_from_extra(
+        {
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+        "dm",
+    )
+    assert p.can_free_chat("user") is False
+    assert p.can_free_chat("admin") is True
+    assert p.can_run("user", "paper") is True
+
+
+def test_group_free_chat_does_not_affect_dm_when_dm_key_set():
+    extra = {
+        "allow_admin_from": ["admin-dm"],
+        "user_free_chat": True,
+        "group_allow_admin_from": ["admin-group"],
+        "group_user_free_chat": False,
+    }
+    dm = policy_from_extra(extra, "dm")
+    gp = policy_from_extra(extra, "group")
+    assert dm.can_free_chat("user") is True
+    assert gp.can_free_chat("user") is False
+
+
+def test_dm_free_chat_falls_back_to_group_when_dm_unset():
+    p = policy_from_extra(
+        {
+            "allow_admin_from": ["admin"],
+            "group_user_free_chat": False,
+        },
+        "dm",
+    )
+    assert p.can_free_chat("user") is False
+
+
+def test_free_chat_disabled_policy_still_allows_admin():
+    p = policy_from_extra(
+        {
+            "allow_admin_from": ["admin"],
+            "user_free_chat": False,
+        },
+        "dm",
+    )
+    assert p.can_free_chat("admin") is True
+
+
+def test_free_chat_disabled_enables_policy_even_without_admin_list():
+    p = policy_from_extra(
+        {
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+        "dm",
+    )
+    assert p.enabled is True
+    assert p.can_free_chat("user") is False
+    assert p.can_run("user", "paper") is True
+    assert p.can_run("user", "model") is False
