@@ -1185,6 +1185,19 @@ class CLICommandsMixin:
         tokens = shlex.split(cmd)
         subcmd = tokens[1].strip().lower() if len(tokens) > 1 else "status"
 
+        # Route ask / discuss / end through shared domain-discussion module.
+        if subcmd in {"ask", "discuss", "end"}:
+            try:
+                from gateway.domain_discussion import handle_domain_subcommand
+            except ImportError:
+                print("❌ discussion module unavailable")
+                return
+            args_str = cmd[len("s "):].strip() if cmd.lower().startswith("s ") else " ".join(tokens[1:])
+            response = handle_domain_subcommand("s", args_str)
+            if response is not None:
+                print(response)
+                return
+
         if subcmd == "status":
             tasks = list_tasks(state="active")
             print()
@@ -1289,6 +1302,16 @@ class CLICommandsMixin:
             print(f"(._.) Unknown subcommand: {subcmd}")
             print("  Usage: /s [status|add|list|done|rm|pause|resume]")
 
+    def _handle_end_command(self, cmd: str):
+        """Handle /end — close the active domain discussion."""
+        try:
+            from gateway.domain_discussion import clear_active_discussion
+        except ImportError:
+            print("❌ discussion module unavailable")
+            return
+        cleared = clear_active_discussion()
+        print("✅ 已结束当前讨论。" if cleared else "（当前没有进行中的讨论。）")
+
     def _handle_paper_command(self, cmd: str):
         """Handle /paper — manage Research Copilot state."""
         from research_copilot.commands import handle_paper_command
@@ -1314,6 +1337,19 @@ class CLICommandsMixin:
 
         tokens = shlex.split(cmd)
         subcmd = tokens[1].strip().lower() if len(tokens) > 1 else "status"
+
+        # Route ask / discuss / end through shared domain-discussion module.
+        if subcmd in {"ask", "discuss", "end"}:
+            try:
+                from gateway.domain_discussion import handle_domain_subcommand
+            except ImportError:
+                print("❌ discussion module unavailable")
+                return
+            args_str = cmd[len("th "):].strip() if cmd.lower().startswith("th ") else " ".join(tokens[1:])
+            response = handle_domain_subcommand("th", args_str)
+            if response is not None:
+                print(response)
+                return
 
         if subcmd == "status":
             active = list_thoughts(state="active")

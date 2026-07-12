@@ -29,7 +29,10 @@ def _usage() -> str:
         "/paper read <id>\n"
         "/paper feedback <id> <text>\n"
         "/paper health\n"
-        "/paper now"
+        "/paper now\n"
+        "/paper ask <question>\n"
+        "/paper discuss [<paper_id>] [<question>]\n"
+        "/paper end"
     )
 
 
@@ -155,6 +158,17 @@ def handle_paper_command(args: str = "") -> str:
     args = (args or "").strip()
     if not args:
         return _usage()
+    # Route ask / discuss / end through the shared domain-discussion module.
+    parts_first = args.split(maxsplit=1)
+    first_sub = parts_first[0].lower() if parts_first else ""
+    if first_sub in {"ask", "discuss", "end"}:
+        try:
+            from gateway.domain_discussion import handle_domain_subcommand
+        except ImportError:
+            return "❌ discussion module unavailable"
+        response = handle_domain_subcommand("paper", args)
+        if response is not None:
+            return response
     parts = args.split()
     subcmd = parts[0].lower()
     rest = parts[1:]

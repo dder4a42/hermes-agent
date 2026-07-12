@@ -51,6 +51,10 @@ from typing import Any, FrozenSet, Iterable, Optional, Tuple
 _ALWAYS_ALLOWED_FOR_USERS: FrozenSet[str] = frozenset({
     "help",
     "whoami",
+    # Always let users end whatever domain discussion is active. Without this,
+    # a commands-only bot that has enabled discussions could get "stuck" if a
+    # profile hasn't listed /end in user_allowed_commands.
+    "end",
 })
 
 

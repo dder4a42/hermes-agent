@@ -4663,6 +4663,16 @@ class GatewaySlashCommandsMixin:
         )
 
         args = (event.get_command_args() or "").strip()
+        # Route ask / discuss / end through shared domain-discussion module.
+        first_token = args.split(maxsplit=1)[0].lower() if args else ""
+        if first_token in {"ask", "discuss", "end"}:
+            try:
+                from gateway.domain_discussion import handle_domain_subcommand
+            except ImportError:
+                return "❌ discussion module unavailable"
+            response = handle_domain_subcommand("s", args)
+            if response is not None:
+                return response
         tokens = args.split()
         subcmd = tokens[0].lower() if tokens else "status"
 
@@ -4762,6 +4772,16 @@ class GatewaySlashCommandsMixin:
         )
 
         args = (event.get_command_args() or "").strip()
+        # Route ask / discuss / end through shared domain-discussion module.
+        first_token = args.split(maxsplit=1)[0].lower() if args else ""
+        if first_token in {"ask", "discuss", "end"}:
+            try:
+                from gateway.domain_discussion import handle_domain_subcommand
+            except ImportError:
+                return "❌ discussion module unavailable"
+            response = handle_domain_subcommand("th", args)
+            if response is not None:
+                return response
         tokens = args.split()
         subcmd = tokens[0].lower() if tokens else "status"
 

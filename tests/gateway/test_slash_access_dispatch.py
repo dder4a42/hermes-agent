@@ -860,3 +860,118 @@ async def test_router_off_preserves_plain_text_denial():
     assert result is not None
     assert "功能限定模式" in result
     runner._llm_route_free_text_to_command.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase B: sticky active-discussion routes follow-up plain text
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_active_discussion_routes_plain_text_to_domain_ask(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+    from gateway.domain_discussion import open_active_discussion
+    open_active_discussion("th", ttl_minutes=30)
+
+    runner._handle_th_command = AsyncMock(return_value="ask-ok")
+
+    result = await runner._handle_message(_make_event(
+        "帮我想想我的 evidence chain 想法",
+        _make_source(platform=Platform.WEIXIN, user_id="user"),
+    ))
+
+    assert result == "ask-ok"
+    event_arg = runner._handle_th_command.call_args.args[0]
+    assert event_arg.get_command() == "th"
+    assert event_arg.get_command_args().startswith("ask ")
+
+
+@pytest.mark.anyio
+async def test_active_discussion_end_intent_routes_to_end(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+    from gateway.domain_discussion import open_active_discussion
+    open_active_discussion("th", ttl_minutes=30)
+
+    runner._handle_end_command = AsyncMock(return_value="ended-ok")
+
+    result = await runner._handle_message(_make_event(
+        "算了",
+        _make_source(platform=Platform.WEIXIN, user_id="user"),
+    ))
+
+    assert result == "ended-ok"
+
+
+@pytest.mark.anyio
+async def test_no_active_discussion_falls_back_to_llm_router(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+        },
+    )
+    runner._llm_route_free_text_to_command = MagicMock(
+        return_value={"decision": "allow", "command": "/status"}
+    )
+    runner._handle_status_command = AsyncMock(return_value="status-ok")
+
+    result = await runner._handle_message(_make_event(
+        "运行状态",
+        _make_source(platform=Platform.WEIXIN, user_id="user"),
+    ))
+
+    assert result == "status-ok"
+
+
+@pytest.mark.anyio
+async def test_expired_discussion_does_not_route(tmp_path, monkeypatch):
+    """An expired sticky discussion should be ignored (and cleared)."""
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "active_discussion.json").write_text(
+        json.dumps({
+            "domain": "th",
+            "subject_id": None,
+            "opened_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+            "kind": "discuss",
+        }),
+        encoding="utf-8",
+    )
+
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "off",
+        },
+    )
+
+    result = await runner._handle_message(_make_event(
+        "hello",
+        _make_source(platform=Platform.WEIXIN, user_id="user"),
+    ))
+
+    # With router off and no valid active discussion, plain text is denied.
+    assert result is not None
+    assert "功能限定模式" in result

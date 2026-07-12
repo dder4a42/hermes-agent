@@ -8690,6 +8690,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._handle_paper_command(cmd_original)
         elif canonical == "th":
             self._handle_th_command(cmd_original)
+        elif canonical == "end":
+            self._handle_end_command(cmd_original)
         elif canonical == "suggestions":
             self._handle_suggestions_command(cmd_original)
         elif canonical == "blueprint":

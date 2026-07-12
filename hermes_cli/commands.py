@@ -196,13 +196,14 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("list", "add", "create", "edit", "pause", "resume", "run", "remove")),
     CommandDef("s", "Manage timed reminders (add, list, done, pause, resume)", "Tools & Skills",
                aliases=("schedule",), args_hint="[subcommand]",
-               subcommands=("status", "add", "list", "done", "rm", "pause", "resume")),
+               subcommands=("status", "add", "list", "done", "rm", "pause", "resume", "ask", "discuss", "end")),
     CommandDef("th", "Manage thought incubation (capture, list, done, pause, resume)", "Tools & Skills",
                aliases=("thought", "thoughts"), args_hint="[subcommand]",
-               subcommands=("status", "list", "show", "done", "rm", "pause", "resume")),
+               subcommands=("status", "list", "show", "done", "rm", "pause", "resume", "ask", "discuss", "end")),
     CommandDef("paper", "Manage Research Copilot topics, history, and feedback", "Tools & Skills",
-               args_hint="[now|topics|history|save|skip|read|feedback|health]",
-               subcommands=("now", "topics", "history", "save", "skip", "read", "feedback", "health")),
+               args_hint="[now|topics|history|save|skip|read|feedback|health|ask|discuss|end]",
+               subcommands=("now", "topics", "history", "save", "skip", "read", "feedback", "health", "ask", "discuss", "end")),
+    CommandDef("end", "End the current bot discussion (paper/s/th)", "Tools & Skills"),
     CommandDef("suggestions", "Review suggested automations (accept/dismiss)",
                "Tools & Skills", aliases=("suggest",), args_hint="[accept|dismiss N | catalog]",
                subcommands=("accept", "dismiss", "catalog", "clear")),
@@ -1177,7 +1178,7 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     traffic commands at the 50-command cap.
 #   - s/th: personal reminder/thought controls; CLI + Weixin-first, routed
 #     through /hermes on Slack to avoid consuming native slash slots.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug", "paper", "s", "th"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug", "paper", "s", "th", "end"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

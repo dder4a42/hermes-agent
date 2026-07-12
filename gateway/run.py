@@ -10019,6 +10019,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "th":
             return await self._handle_th_command(event)
 
+        if canonical == "end":
+            return await self._handle_end_command(event)
+
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
@@ -12505,6 +12508,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not policy.enabled or policy.can_free_chat(source.user_id):
             return None
 
+        text = (event.text or "").strip()
+        if not text:
+            return None
+
+        # Phase B: if a discussion is active in some domain, continue plain
+        # text in that domain's ``ask`` handler instead of routing via the LLM.
+        # End-intent phrases still fall through to /end so the sticky session
+        # can be closed.
+        try:
+            from gateway.domain_discussion import (
+                DOMAINS as _DOMAINS,
+                load_active_discussion as _load_active_discussion,
+                looks_like_end_intent as _looks_like_end_intent,
+            )
+        except ImportError:
+            _load_active_discussion = None  # type: ignore
+            _looks_like_end_intent = None  # type: ignore
+            _DOMAINS = ()  # type: ignore
+        if _load_active_discussion is not None:
+            active = _load_active_discussion()
+            if active:
+                domain = str(active.get("domain") or "")
+                if _looks_like_end_intent and _looks_like_end_intent(text):
+                    from dataclasses import replace
+                    return replace(
+                        event,
+                        text="/end",
+                        metadata={
+                            **(event.metadata or {}),
+                            "nl_command_router": {
+                                "decision": "end_discussion",
+                                "original_text": text,
+                            },
+                        },
+                    )
+                if domain in _DOMAINS and policy.can_run(source.user_id, domain):
+                    from dataclasses import replace
+                    return replace(
+                        event,
+                        text=f"/{domain} ask {text}",
+                        metadata={
+                            **(event.metadata or {}),
+                            "nl_command_router": {
+                                "decision": "continue_discussion",
+                                "domain": domain,
+                                "original_text": text,
+                            },
+                        },
+                    )
+
         extra = self._platform_extra_for_source(source)
         mode = str(extra.get("nl_command_router", "off") or "off").strip().lower()
         if mode in {"", "off", "none", "false", "0"}:
@@ -12513,11 +12566,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Unknown nl_command_router=%r; free text will be denied", mode)
             return None
 
-        text = (event.text or "").strip()
-        if not text:
-            return None
-
-        allowed_commands = sorted(set(policy.user_allowed_commands) | {"help", "whoami"})
+        allowed_commands = sorted(set(policy.user_allowed_commands) | {"help", "whoami", "end"})
         try:
             route = await asyncio.to_thread(
                 self._llm_route_free_text_to_command,
@@ -12655,6 +12704,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.info("NL router produced disallowed command /%s; denying", canonical)
             return None
         return command_text
+
+    async def _handle_end_command(self, event: MessageEvent) -> str:
+        """Handle top-level /end — close the active domain discussion."""
+        try:
+            from gateway.domain_discussion import clear_active_discussion
+        except ImportError:
+            return "❌ discussion module unavailable"
+        cleared = clear_active_discussion()
+        return "✅ 已结束当前讨论。" if cleared else "（当前没有进行中的讨论。）"
 
 
 

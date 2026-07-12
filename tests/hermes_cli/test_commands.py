@@ -107,6 +107,9 @@ class TestCommandRegistry:
             "read",
             "feedback",
             "health",
+            "ask",
+            "discuss",
+            "end",
         )
 
 
