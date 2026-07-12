@@ -8684,6 +8684,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self.save_conversation()
         elif canonical == "cron":
             self._handle_cron_command(cmd_original)
+        elif canonical == "paper":
+            self._handle_paper_command(cmd_original)
         elif canonical == "suggestions":
             self._handle_suggestions_command(cmd_original)
         elif canonical == "blueprint":

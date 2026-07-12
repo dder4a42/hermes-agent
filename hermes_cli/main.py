@@ -319,6 +319,8 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.research_copilot import build_research_copilot_parser
+from hermes_cli.subcommands.weixin_bot import build_weixin_bot_parser
 
 
 def _require_tty(command_name: str) -> None:
@@ -4296,6 +4298,20 @@ def cmd_project(args):
     from hermes_cli.projects_cmd import projects_command
 
     return projects_command(args)
+
+
+def cmd_research_copilot(args):
+    """Research Copilot profile initialization and management."""
+    from hermes_cli.research_copilot_cmd import cmd_research_copilot as _cmd
+
+    return _cmd(args)
+
+
+def cmd_weixin_bot(args):
+    """One-profile-per-user Weixin bot bootstrap."""
+    from hermes_cli.weixin_bot_cmd import cmd_weixin_bot as _cmd
+
+    return _cmd(args)
 
 
 def cmd_hooks(args):
@@ -13080,6 +13096,16 @@ def main():
 
     project_parser = _build_project_parser(subparsers)
     project_parser.set_defaults(func=cmd_project)
+
+    # =========================================================================
+    # research-copilot command — profile-local research assistant bootstrap
+    # =========================================================================
+    build_research_copilot_parser(subparsers, cmd_research_copilot=cmd_research_copilot)
+
+    # =========================================================================
+    # weixin-bot command — product wrapper for one-profile-one-gateway setup
+    # =========================================================================
+    build_weixin_bot_parser(subparsers, cmd_weixin_bot=cmd_weixin_bot)
 
     # =========================================================================
     # hooks command — shell-hook inspection and management

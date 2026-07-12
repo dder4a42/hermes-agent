@@ -89,6 +89,26 @@ class TestCommandRegistry:
             assert not (cmd.cli_only and cmd.gateway_only), \
                 f"{cmd.name} cannot be both cli_only and gateway_only"
 
+    def test_paper_command_is_available_in_cli_and_gateway(self):
+        paper = resolve_command("paper")
+
+        assert paper is not None
+        assert paper.name == "paper"
+        assert paper.category == "Tools & Skills"
+        assert not paper.cli_only
+        assert not paper.gateway_only
+        assert "paper" in GATEWAY_KNOWN_COMMANDS
+        assert paper.subcommands == (
+            "now",
+            "topics",
+            "history",
+            "save",
+            "skip",
+            "read",
+            "feedback",
+            "health",
+        )
+
 
 # ---------------------------------------------------------------------------
 # resolve_command tests

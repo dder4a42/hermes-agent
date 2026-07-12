@@ -1174,6 +1174,21 @@ class CLICommandsMixin:
         _set_active(result.slug)
         print(f"(^_^)b {result.display_name} hatched and adopted — it'll pop in shortly!")
 
+    def _handle_paper_command(self, cmd: str):
+        """Handle /paper — manage Research Copilot state."""
+        from research_copilot.commands import handle_paper_command
+
+        raw = (cmd or "").strip()
+        if raw.startswith("/"):
+            raw = raw[1:]
+        if raw == "paper":
+            args = ""
+        elif raw.startswith("paper "):
+            args = raw[len("paper "):].strip()
+        else:
+            args = raw
+        print(handle_paper_command(args))
+
     def _handle_cron_command(self, cmd: str):
         """Handle the /cron command to manage scheduled tasks."""
         from cli import get_job

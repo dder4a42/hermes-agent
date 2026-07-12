@@ -4654,3 +4654,10 @@ class GatewaySlashCommandsMixin:
 
         self._schedule_update_notification_watch()
         return t("gateway.update.starting")
+
+    async def _handle_paper_command(self, event: MessageEvent) -> str:
+        """Handle /paper in the gateway — Research Copilot controls."""
+        from research_copilot.commands import handle_paper_command
+
+        return handle_paper_command((event.get_command_args() or "").strip())
+

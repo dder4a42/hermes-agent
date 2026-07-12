@@ -194,6 +194,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("cron", "Manage scheduled tasks", "Tools & Skills",
                cli_only=True, args_hint="[subcommand]",
                subcommands=("list", "add", "create", "edit", "pause", "resume", "run", "remove")),
+    CommandDef("paper", "Manage Research Copilot topics, history, and feedback", "Tools & Skills",
+               args_hint="[now|topics|history|save|skip|read|feedback|health]",
+               subcommands=("now", "topics", "history", "save", "skip", "read", "feedback", "health")),
     CommandDef("suggestions", "Review suggested automations (accept/dismiss)",
                "Tools & Skills", aliases=("suggest",), args_hint="[accept|dismiss N | catalog]",
                subcommands=("accept", "dismiss", "catalog", "clear")),
@@ -1163,7 +1166,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug"})
+#   - paper: Research Copilot control; Weixin/CLI-first, low-frequency on Slack,
+#     routed through /hermes paper to preserve native slash slots for higher-
+#     traffic commands at the 50-command cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug", "paper"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
