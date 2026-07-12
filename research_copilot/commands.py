@@ -110,6 +110,21 @@ def _record_action(action: str, item_id: str, *, status: str | None = None, **ex
     return f"{verb} {item_id}."
 
 
+def _format_health() -> str:
+    """Return the weekly Research Copilot health report."""
+    try:
+        from .scripts.paper_health import build_report
+    except ImportError:
+        cfg = load_config()
+        pipeline = cfg.get("pipeline", "unknown") if isinstance(cfg, dict) else "unknown"
+        return (
+            "Research Copilot Health\n"
+            f"Pipeline: {pipeline}\n"
+            "(detailed report unavailable — paper_health module not importable)"
+        )
+    return build_report(window_days=7).rstrip()
+
+
 def _trigger_daily_pick() -> str:
     """Trigger the profile-local daily-paper-pick cron job on the next tick."""
     from hermes_constants import get_hermes_home
@@ -163,9 +178,7 @@ def handle_paper_command(args: str = "") -> str:
             return "Usage: /paper feedback <id> <text>"
         return _record_action("feedback", item_id, text=text)
     if subcmd == "health":
-        cfg = load_config()
-        pipeline = cfg.get("pipeline", "unknown") if isinstance(cfg, dict) else "unknown"
-        return f"Research Copilot Health\nPipeline: {pipeline}\nUse /paper history to inspect recent picks."
+        return _format_health()
     if subcmd == "now":
         return _trigger_daily_pick()
     return _usage()
