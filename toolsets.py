@@ -65,6 +65,9 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     # Cronjob management
     "cronjob",
+    # Scheduling & thought tools
+    "task_add", "task_done", "task_remove", "task_pause", "task_resume", "task_list",
+    "thought_capture", "thought_list", "thought_done", "thought_remove", "thought_pause", "thought_resume",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Kanban multi-agent coordination — only in schema when the agent is

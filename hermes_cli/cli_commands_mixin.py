@@ -1174,6 +1174,121 @@ class CLICommandsMixin:
         _set_active(result.slug)
         print(f"(^_^)b {result.display_name} hatched and adopted — it'll pop in shortly!")
 
+    def _handle_s_command(self, cmd: str):
+        """Handle /s (schedule) — manage timed reminders."""
+        import shlex
+        from tools.thought_tools import (
+            add_task, done_task, remove_task,
+            pause_task, resume_task, list_tasks,
+        )
+
+        tokens = shlex.split(cmd)
+        subcmd = tokens[1].strip().lower() if len(tokens) > 1 else "status"
+
+        if subcmd == "status":
+            tasks = list_tasks(state="active")
+            print()
+            print("+" + "-" * 60 + "+")
+            print("|" + " " * 16 + "(^.^) Timed Reminders" + " " * 19 + "|")
+            print("+" + "-" * 60 + "+")
+            if not tasks:
+                print("  No active reminders.")
+            else:
+                for i, t in enumerate(tasks, 1):
+                    print(f"  #{i} [{t['id']}] {t['title']}")
+                    print(f"      Schedule: {t.get('schedule_raw', '?')}")
+                    print(f"      Notes:    {t.get('notes', '-')}")
+                    print()
+            print("  Commands:")
+            print('    /s add "task title" --when "tomorrow 2pm"')
+            print("    /s done <id>")
+            print("    /s pause <id> / /s resume <id>")
+            print("    /s rm <id>")
+
+        elif subcmd == "add":
+            # Interactive: just show the format
+            raw = cmd[len("s add"):].strip() if len(cmd) > 5 else ""
+            if not raw:
+                print("(._.) Usage: /s add \"Reminder text\" --when \"tomorrow 2pm\" [--notes \"...\"]")
+                print("  Or just tell me in natural language and I'll set it up!")
+                return
+            # Parse --when and --notes flags
+            when = ""
+            notes = ""
+            rest = raw
+            if "--when" in rest:
+                parts = rest.split("--when", 1)
+                title_part = parts[0].strip().strip("\"'")
+                when = parts[1].strip().strip("\"'")
+                if "--notes" in when:
+                    wp = when.split("--notes", 1)
+                    when = wp[0].strip().strip("\"'")
+                    notes = wp[1].strip().strip("\"'")
+            else:
+                title_part = rest.strip().strip("\"'")
+
+            if not when:
+                print("(._.) Missing --when. Usage: /s add \"title\" --when \"tomorrow 2pm\"")
+                return
+
+            task = add_task(title=title_part, schedule_raw=when, notes=notes)
+            print(f"(^_^) Reminder set! [{task['id']}]")
+            print(f"  {title_part} — {when}")
+
+        elif subcmd == "list":
+            state_filter = tokens[2].strip().lower() if len(tokens) > 2 else "active"
+            tasks = list_tasks(state=state_filter)
+            print(f"\n(^_^) Tasks ({state_filter}):")
+            if not tasks:
+                print("  (none)")
+            else:
+                for t in tasks:
+                    print(f"  [{t['id']}] {t['title']} ({t.get('schedule_raw', '?')})")
+
+        elif subcmd == "done":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /s done <task_id>")
+                return
+            if done_task(tid):
+                print(f"(^_^) Task {tid} marked done!")
+            else:
+                print(f"(._.) Task {tid} not found.")
+
+        elif subcmd in ("rm", "remove"):
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /s rm <task_id>")
+                return
+            if remove_task(tid):
+                print(f"(^_^) Task {tid} removed.")
+            else:
+                print(f"(._.) Task {tid} not found.")
+
+        elif subcmd == "pause":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /s pause <task_id>")
+                return
+            if pause_task(tid):
+                print(f"(._.)zZ Task {tid} paused.")
+            else:
+                print(f"(._.) Task {tid} not found.")
+
+        elif subcmd == "resume":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /s resume <task_id>")
+                return
+            if resume_task(tid):
+                print(f"(^_^) Task {tid} resumed!")
+            else:
+                print(f"(._.) Task {tid} not found.")
+
+        else:
+            print(f"(._.) Unknown subcommand: {subcmd}")
+            print("  Usage: /s [status|add|list|done|rm|pause|resume]")
+
     def _handle_paper_command(self, cmd: str):
         """Handle /paper — manage Research Copilot state."""
         from research_copilot.commands import handle_paper_command
@@ -1188,6 +1303,112 @@ class CLICommandsMixin:
         else:
             args = raw
         print(handle_paper_command(args))
+
+    def _handle_th_command(self, cmd: str):
+        """Handle /th (thought) — manage thought incubation."""
+        import shlex
+        from tools.thought_tools import (
+            capture_thought, list_thoughts, archive_thought,
+            remove_thought, pause_thought, resume_thought,
+        )
+
+        tokens = shlex.split(cmd)
+        subcmd = tokens[1].strip().lower() if len(tokens) > 1 else "status"
+
+        if subcmd == "status":
+            active = list_thoughts(state="active")
+            dormant = list_thoughts(state="dormant")
+            archived = list_thoughts(state="archived")
+            print()
+            print("+" + "-" * 60 + "+")
+            print("|" + " " * 16 + "(^.^) Thought Incubator" + " " * 18 + "|")
+            print("+" + "-" * 60 + "+")
+            print(f"  Active:  {len(active)}")
+            print(f"  Dormant: {len(dormant)}")
+            print(f"  Done:    {len(archived)}")
+            print()
+            if active:
+                print("  Active thoughts:")
+                for th in active[:5]:
+                    print(f"    [{th['id']}] {th['title']}")
+            print()
+            print("  Commands: /th list, /th show <id>, /th done <id>")
+
+        elif subcmd == "list":
+            sf = tokens[2].strip().lower() if len(tokens) > 2 else "active"
+            thoughts = list_thoughts(state=sf if sf != "all" else "")
+            print(f"\n(^_^) Thoughts ({sf}):")
+            if not thoughts:
+                print("  (none)")
+            else:
+                for th in thoughts:
+                    tags = ", ".join(th.get("tags", [])) or "-"
+                    surfaced = f" surfaced {th.get('surface_count', 0)}x" if th.get("surface_count", 0) else ""
+                    print(f"  [{th['id']}] {th['title']}  ({th.get('state', '?')}{surfaced})")
+
+        elif subcmd == "show":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /th show <thought_id>")
+                return
+            all_th = list_thoughts(state="") + list_thoughts(state="dormant") + list_thoughts(state="archived")
+            th = next((t for t in all_th if t["id"] == tid), None)
+            if not th:
+                print(f"(._.) Thought {tid} not found.")
+                return
+            print(f"\n[{th['id']}] {th['title']}")
+            print(f"  State:    {th.get('state', '?')}")
+            print(f"  Summary:  {th.get('summary', '-')}")
+            print(f"  Source:   {th.get('source', '-')}")
+            if th.get("tags"):
+                print(f"  Tags:     {', '.join(th['tags'])}")
+            print(f"  Created:  {th.get('created_at', '?')}")
+            if th.get("surfaced_at"):
+                print(f"  Surfaced: {th['surfaced_at']} ({th.get('surface_count', 0)}x)")
+
+        elif subcmd == "done":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /th done <thought_id>")
+                return
+            if archive_thought(tid):
+                print(f"(^_^) Thought {tid} archived.")
+            else:
+                print(f"(._.) Thought {tid} not found.")
+
+        elif subcmd in ("rm", "remove"):
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /th rm <thought_id>")
+                return
+            if remove_thought(tid):
+                print(f"(^_^) Thought {tid} removed.")
+            else:
+                print(f"(._.) Thought {tid} not found.")
+
+        elif subcmd == "pause":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /th pause <thought_id>")
+                return
+            if pause_thought(tid):
+                print(f"(._.)zZ Thought {tid} set dormant.")
+            else:
+                print(f"(._.) Thought {tid} not found.")
+
+        elif subcmd == "resume":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /th resume <thought_id>")
+                return
+            if resume_thought(tid):
+                print(f"(^_^) Thought {tid} reactivated!")
+            else:
+                print(f"(._.) Thought {tid} not found.")
+
+        else:
+            print(f"(._.) Unknown subcommand: {subcmd}")
+            print("  Usage: /th [status|list|show|done|rm|pause|resume]")
 
     def _handle_cron_command(self, cmd: str):
         """Handle the /cron command to manage scheduled tasks."""

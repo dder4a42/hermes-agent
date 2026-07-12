@@ -4655,9 +4655,200 @@ class GatewaySlashCommandsMixin:
         self._schedule_update_notification_watch()
         return t("gateway.update.starting")
 
+    async def _handle_s_command(self, event: MessageEvent) -> str:
+        """Handle /s in the gateway — manage timed reminders."""
+        from tools.thought_tools import (
+            add_task, done_task, remove_task,
+            pause_task, resume_task, list_tasks,
+        )
+
+        args = (event.get_command_args() or "").strip()
+        tokens = args.split()
+        subcmd = tokens[0].lower() if tokens else "status"
+
+        if subcmd == "status":
+            tasks = list_tasks(state="active")
+            lines = ["📋 **Timed Reminders**"]
+            if not tasks:
+                lines.append("  No active reminders.")
+            else:
+                for t in tasks:
+                    lines.append(f"  • **{t['title']}**")
+                    lines.append(f"    ⏰ {t.get('schedule_raw', '?')}")
+                    if t.get("notes"):
+                        lines.append(f"    📝 {t['notes']}")
+                    lines.append(f"    `{t['id']}`")
+            lines.append("")
+            lines.append("`/s add \"title\" --when \"tomorrow 2pm\"` — set reminder")
+            lines.append("`/s done <id>` / `/s rm <id>` — complete/delete")
+            lines.append("`/s pause <id>` / `/s resume <id>`")
+            return "\n".join(lines)
+
+        if subcmd == "add":
+            # Parse --when flag
+            rest = args[3:].strip() if len(args) > 3 else ""
+            if not rest or "--when" not in rest:
+                return 'Usage: `/s add "Reminder text" --when "tomorrow 2pm" [--notes "..."]`'
+            parts = rest.split("--when", 1)
+            title = parts[0].strip().strip("\"'")
+            when_part = parts[1].strip().strip("\"'")
+            notes = ""
+            if "--notes" in when_part:
+                wp = when_part.split("--notes", 1)
+                when_part = wp[0].strip().strip("\"'")
+                notes = wp[1].strip().strip("\"'")
+            if not when_part:
+                return "Missing schedule. Usage: `/s add \"title\" --when \"tomorrow 2pm\"`"
+            task = add_task(title=title, schedule_raw=when_part, notes=notes)
+            return f"✅ Reminder set! **{title}** — {when_part} (`{task['id']}`)"
+
+        if subcmd in ("done", "finish"):
+            tid = tokens[1].strip() if len(tokens) > 1 else ""
+            if not tid:
+                return "Usage: `/s done <task_id>`"
+            if done_task(tid):
+                return f"✅ Task `{tid}` marked done!"
+            return f"Task `{tid}` not found."
+
+        if subcmd in ("rm", "remove", "delete"):
+            tid = tokens[1].strip() if len(tokens) > 1 else ""
+            if not tid:
+                return "Usage: `/s rm <task_id>`"
+            if remove_task(tid):
+                return f"✅ Task `{tid}` removed."
+            return f"Task `{tid}` not found."
+
+        if subcmd == "list":
+            sf = tokens[1].strip().lower() if len(tokens) > 1 else "active"
+            tasks = list_tasks(state=sf)
+            lines = [f"📋 **Tasks ({sf})**"]
+            if not tasks:
+                lines.append("  (none)")
+            else:
+                for t in tasks:
+                    lines.append(f"  • `{t['id']}` **{t['title']}** — {t.get('schedule_raw', '?')}")
+            return "\n".join(lines)
+
+        if subcmd == "pause":
+            tid = tokens[1].strip() if len(tokens) > 1 else ""
+            if not tid:
+                return "Usage: `/s pause <task_id>`"
+            if pause_task(tid):
+                return f"⏸️ Task `{tid}` paused."
+            return f"Task `{tid}` not found."
+
+        if subcmd == "resume":
+            tid = tokens[1].strip() if len(tokens) > 1 else ""
+            if not tid:
+                return "Usage: `/s resume <task_id>`"
+            if resume_task(tid):
+                return f"▶️ Task `{tid}` resumed!"
+            return f"Task `{tid}` not found."
+
+        return "Usage: `/s [status|add|list|done|rm|pause|resume]`"
+
     async def _handle_paper_command(self, event: MessageEvent) -> str:
         """Handle /paper in the gateway — Research Copilot controls."""
         from research_copilot.commands import handle_paper_command
 
         return handle_paper_command((event.get_command_args() or "").strip())
+
+
+    async def _handle_th_command(self, event: MessageEvent) -> str:
+        """Handle /th in the gateway — manage thought incubation."""
+        from tools.thought_tools import (
+            capture_thought, list_thoughts, archive_thought,
+            remove_thought, pause_thought, resume_thought,
+        )
+
+        args = (event.get_command_args() or "").strip()
+        tokens = args.split()
+        subcmd = tokens[0].lower() if tokens else "status"
+
+        if subcmd == "status":
+            active = list_thoughts(state="active")
+            dormant = list_thoughts(state="dormant")
+            archived = list_thoughts(state="archived")
+            lines = ["💭 **Thought Incubator**"]
+            lines.append(f"  • Active: **{len(active)}** thoughts")
+            lines.append(f"  • Dormant: **{len(dormant)}**")
+            lines.append(f"  • Archived: **{len(archived)}**")
+            if active:
+                lines.append("")
+                lines.append("**Active:**")
+                for th in active[:5]:
+                    lines.append(f"  • `{th['id']}` {th['title']}")
+            lines.append("")
+            lines.append("`/th list` — all thoughts")
+            lines.append("`/th show <id>` — detail")
+            lines.append("`/th done <id>` — archive")
+            return "\n".join(lines)
+
+        if subcmd == "list":
+            sf = tokens[1].strip().lower() if len(tokens) > 1 else "active"
+            thoughts = list_thoughts(state=sf if sf != "all" else "")
+            lines = [f"📋 **Thoughts ({sf})**"]
+            if not thoughts:
+                lines.append("  (none)")
+            else:
+                for th in thoughts:
+                    cnt = th.get("surface_count", 0) or 0
+                    surf = f" 🔔{cnt}x" if cnt else ""
+                    lines.append(f"  • `{th['id']}` **{th['title']}** ({th.get('state', '?')}{surf})")
+            return "\n".join(lines)
+
+        if subcmd == "show":
+            tid = tokens[1].strip() if len(tokens) > 1 else ""
+            if not tid:
+                return "Usage: `/th show <thought_id>`"
+            all_th = list_thoughts(state="")
+            th = next((t for t in all_th if t["id"] == tid), None)
+            if not th:
+                return f"Thought `{tid}` not found."
+            lines = [f"💭 **{th['title']}**", ""]
+            lines.append(f"  ID: `{th['id']}`")
+            lines.append(f"  State: **{th.get('state', '?')}**")
+            lines.append(f"  Summary: {th.get('summary', '-')}")
+            if th.get("source"):
+                lines.append(f"  Source: {th['source']}")
+            if th.get("tags"):
+                lines.append(f"  Tags: {', '.join(th['tags'])}")
+            lines.append(f"  Created: {th.get('created_at', '?')}")
+            if th.get("surfaced_at"):
+                lines.append(f"  Surfaced: {th['surfaced_at']} ({th.get('surface_count', 0)}x)")
+            return "\n".join(lines)
+
+        if subcmd == "done":
+            tid = tokens[1].strip() if len(tokens) > 1 else ""
+            if not tid:
+                return "Usage: `/th done <thought_id>`"
+            if archive_thought(tid):
+                return f"✅ Thought `{tid}` archived."
+            return f"Thought `{tid}` not found."
+
+        if subcmd in ("rm", "remove"):
+            tid = tokens[1].strip() if len(tokens) > 1 else ""
+            if not tid:
+                return "Usage: `/th rm <thought_id>`"
+            if remove_thought(tid):
+                return f"✅ Thought `{tid}` removed."
+            return f"Thought `{tid}` not found."
+
+        if subcmd == "pause":
+            tid = tokens[1].strip() if len(tokens) > 1 else ""
+            if not tid:
+                return "Usage: `/th pause <thought_id>`"
+            if pause_thought(tid):
+                return f"⏸️ Thought `{tid}` set dormant."
+            return f"Thought `{tid}` not found."
+
+        if subcmd == "resume":
+            tid = tokens[1].strip() if len(tokens) > 1 else ""
+            if not tid:
+                return "Usage: `/th resume <thought_id>`"
+            if resume_thought(tid):
+                return f"▶️ Thought `{tid}` reactivated!"
+            return f"Thought `{tid}` not found."
+
+        return "Usage: `/th [status|list|show|done|rm|pause|resume]`"
 
