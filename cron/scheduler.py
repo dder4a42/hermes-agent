@@ -2046,6 +2046,17 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     scripts_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir_resolved = scripts_dir.resolve()
 
+    # Also allow scripts under the hermes-agent repo canonical roots so a
+    # profile can symlink into repo-owned scripts (e.g. research_copilot
+    # scripts, cron surfacers) without giving up the anti-traversal guard.
+    # Both roots are first-party trusted code that ships with hermes-agent.
+    _repo_root = Path(__file__).resolve().parent.parent
+    _allowed_roots = [
+        scripts_dir_resolved,
+        (_repo_root / "scripts").resolve(),
+        (_repo_root / "research_copilot" / "scripts").resolve(),
+    ]
+
     raw = Path(script_path).expanduser()
     if raw.is_absolute():
         path = raw.resolve()
@@ -2053,13 +2064,21 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         path = (scripts_dir / raw).resolve()
 
     # Guard against path traversal, absolute path injection, and symlink
-    # escape — scripts MUST reside within HERMES_HOME/scripts/.
-    try:
-        path.relative_to(scripts_dir_resolved)
-    except ValueError:
+    # escape — scripts MUST resolve into HERMES_HOME/scripts/ OR a
+    # repo-owned canonical scripts directory.
+    def _inside_any(target: Path, roots: list) -> bool:
+        for root in roots:
+            try:
+                target.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    if not _inside_any(path, _allowed_roots):
         return False, (
-            f"Blocked: script path resolves outside the scripts directory "
-            f"({scripts_dir_resolved}): {script_path!r}"
+            f"Blocked: script path resolves outside the allowed scripts directories "
+            f"({[str(r) for r in _allowed_roots]}): {script_path!r}"
         )
 
     if not path.exists():

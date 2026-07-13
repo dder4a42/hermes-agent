@@ -432,6 +432,59 @@ class TestScriptPathContainment:
         assert "blocked" in output.lower() or "outside" in output.lower()
 
 
+    def test_symlink_to_repo_scripts_allowed(self, cron_env):
+        """A symlink from ~/.hermes/scripts/ into the hermes-agent repo's
+        scripts/ dir must be allowed — that's where the canonical no_agent
+        scripts (paper-fetch, task-surfacer, thought-surfacer) live so
+        profiles can share one source of truth."""
+        from pathlib import Path
+        from cron.scheduler import _run_job_script
+        import cron.scheduler as sched_mod
+
+        repo_scripts = Path(sched_mod.__file__).resolve().parent.parent / "scripts"
+        assert repo_scripts.exists(), f"repo scripts dir missing: {repo_scripts}"
+
+        target = repo_scripts / "task_surfacer.py"
+        if not target.exists():
+            candidates = list(repo_scripts.glob("*.py"))
+            assert candidates, "no repo scripts to test against"
+            target = candidates[0]
+
+        link = cron_env / "scripts" / "legit.py"
+        link.symlink_to(target)
+
+        success, output = _run_job_script("legit.py")
+        assert success is True, f"repo-owned symlink was blocked: {output}"
+
+    def test_symlink_to_research_copilot_scripts_allowed(self, cron_env):
+        """Symlinks to research_copilot/scripts/ (paper_fetch.py etc.)
+        allowed by the same repo-root whitelist."""
+        from pathlib import Path
+        from cron.scheduler import _run_job_script
+        import cron.scheduler as sched_mod
+
+        rc_scripts = (
+            Path(sched_mod.__file__).resolve().parent.parent
+            / "research_copilot"
+            / "scripts"
+        )
+        target = rc_scripts / "paper_fetch.py"
+        if not target.exists():
+            candidates = list(rc_scripts.glob("*.py"))
+            if not candidates:
+                import pytest
+                pytest.skip("no research_copilot/scripts to test against")
+            target = candidates[0]
+
+        link = cron_env / "scripts" / "legit_rc.py"
+        link.symlink_to(target)
+
+        success, output = _run_job_script("legit_rc.py")
+        assert "blocked" not in output.lower() and "outside the allowed" not in output.lower(), (
+            f"repo-owned symlink to research_copilot was blocked: {output}"
+        )
+
+
 class TestCronjobToolScriptValidation:
     """Test API-boundary validation of cron script paths in cronjob_tools."""
 
