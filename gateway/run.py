@@ -12604,6 +12604,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not command_text:
             return None
 
+        # Defensive: the router sometimes emits a bare '/paper' / '/s' / '/th'
+        # with no subcommand args when it can't decide. That fires the bare
+        # handler which just prints Usage — unhelpful for a natural-language
+        # user. Rewrite to '<cmd> ask <original text>' which is the sandboxed
+        # Q&A subcommand always available on those domains.
+        tokens = command_text.split(maxsplit=1)
+        head = tokens[0] if tokens else ""
+        has_args = len(tokens) > 1
+        if not has_args and head in ("/paper", "/s", "/th") and text:
+            fallback = f"{head} ask {text}"
+            logger.info(
+                "NL router emitted bare %s; rewriting to %r for %s:%s",
+                head, fallback, source.platform.value if source.platform else "?",
+                source.user_id,
+            )
+            command_text = fallback
+
         from dataclasses import replace
         return replace(
             event,
@@ -12656,12 +12673,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         specs = self._nl_command_router_specs(allowed_commands)
         system = (
             "You are a command router for a commands-only Weixin bot.\n"
-            "You do not answer the user. You only classify the message into one allowed slash command.\n"
-            "If the message is outside the allowed functions, ambiguous, asks for free chat, or asks for a forbidden operation, return deny.\n"
+            "You do not answer the user. You only classify the message into one allowed slash command AND emit that command WITH its arguments, verbatim.\n"
             "Return ONLY compact JSON with keys: decision, command, reason.\n"
             "decision must be 'allow' or 'deny'.\n"
-            "If decision is 'allow', command must start with '/' and its first word must be one of the allowed commands.\n"
-            "Do not invent commands. Do not include markdown.\n\n"
+            "\n"
+            "Prefer allow: the user is a legitimate owner of a personal research bot; only deny when the message is clearly outside every allowed function (e.g. asking for weather, general free chat, or explicitly forbidden operations like modifying system config). Ambiguity is NOT sufficient grounds to deny.\n"
+            "\n"
+            "Routing heuristics (apply in order):\n"
+            "  1. If the message directly invokes one of the structured subcommands, emit that subcommand with its arguments. Example: '推送论文' -> /paper now.\n"
+            "  2. If the message is a QUESTION about the user's research data, profile, saved papers, topics, agenda, beliefs, gaps -> /paper ask <original message verbatim>.\n"
+            "     Signals: contains 问号, 或以 '我的'/'为什么'/'怎么样'/'如何'/'为啥'/'看看'/'告诉我'/'查看'/'查询'/'介绍' 开头, 或 English '?', 'what', 'how', 'why', 'show', 'tell', 'explain'.\n"
+            "  3. If the message is a QUESTION about the user's schedule/reminders -> /s ask <original message verbatim>.\n"
+            "  4. If the message is a QUESTION about the user's thoughts/ideas -> /th ask <original message verbatim>.\n"
+            "  5. If the message describes a NEW reminder/task -> /s add <original message verbatim>.\n"
+            "  6. If the message describes a NEW thought/idea to capture -> /th capture <original message verbatim>.\n"
+            "  7. If none of the above fit AND the message is clearly not asking for anything the allowed commands can do, return deny.\n"
+            "\n"
+            "When emitting an ask command, include the user's ORIGINAL wording after the subcommand (do not paraphrase or shorten). Example:\n"
+            "  user: '我的科研画像如何？'\n"
+            "  -> {\"decision\":\"allow\",\"command\":\"/paper ask 我的科研画像如何？\",\"reason\":\"question about user\'s research profile\"}\n"
+            "\n"
+            "If decision is 'allow', command must start with '/' and its first word must be one of the allowed commands. Do not invent commands or subcommands. Do not include markdown, code fences, or preamble. Emit just the JSON.\n"
+            "\n"
             f"Allowed command specs:\n{specs}"
         )
         prompt = (
@@ -12681,7 +12714,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 skip_memory=True,
                 skip_context_files=True,
                 session_db=None,
-                max_tokens=512,
+                max_tokens=1600,
                 ephemeral_system_prompt=system,
                 platform=getattr(source.platform, "value", None) if source else None,
                 user_id=getattr(source, "user_id", None) if source else None,
