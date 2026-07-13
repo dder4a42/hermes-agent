@@ -1265,6 +1265,7 @@ class CLICommandsMixin:
                 tags=parsed["tags"],
                 remind_before_min=parsed["remind_before"],
                 checklist=parsed["checklist"],
+                input_raw=rest,
             )
             perr = (task.get("parse") or {}).get("error")
             print(f"(^_^) Reminder set! [{task['id']}]")

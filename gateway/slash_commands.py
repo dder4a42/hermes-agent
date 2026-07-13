@@ -4731,6 +4731,7 @@ class GatewaySlashCommandsMixin:
                     tags=parsed["tags"],
                     remind_before_min=parsed["remind_before"],
                     checklist=parsed["checklist"],
+                    input_raw=rest,
                 )
                 perr = (task.get("parse") or {}).get("error")
                 lines = [f"✅ Reminder set! **{parsed['title']}** — {parsed['schedule_raw']} (`{task['id']}`)"]

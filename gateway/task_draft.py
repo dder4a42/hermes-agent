@@ -38,6 +38,9 @@ class TaskDraft:
     turn: int = 0
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     last_touched: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Verbatim user messages per turn — persisted alongside the task so we
+    # can audit what the LLM rewrote it into. Joined with " / ".
+    input_history: list = field(default_factory=list)
 
 
 @dataclass
@@ -134,6 +137,7 @@ def _commit(user_id: str, draft: TaskDraft) -> DraftReply:
         tags=fields.get("tags") or [],
         remind_before_min=fields.get("remind_before_min") or 0,
         checklist=fields.get("checklist") or [],
+        input_raw=" / ".join(draft.input_history or []),
     )
     _drafts.pop(user_id, None)
 
@@ -186,6 +190,8 @@ def start_or_advance(
             _drafts[user_id] = draft
         draft.turn += 1
         draft.last_touched = _now()
+        if user_text and user_text.strip():
+            draft.input_history.append(user_text.strip())
         current_turn = draft.turn
         current_fields = dict(draft.fields)
 

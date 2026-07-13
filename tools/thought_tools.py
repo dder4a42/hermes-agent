@@ -152,6 +152,7 @@ def add_task(
     tags=None,
     remind_before_min=0,
     checklist=None,
+    input_raw: str = "",
 ) -> dict:
     """Create a concrete timed reminder. Returns the saved task dict.
 
@@ -170,6 +171,10 @@ def add_task(
                           Accepts int OR strings like '30m', '1h', '2小时'.
         checklist         list of prep items -- bare strings or
                           {text, done} dicts. Deduped + capped at 20.
+        input_raw         verbatim user text (all turns concatenated) so we
+                          can audit how the LLM rewrote it into title/notes/
+                          checklist. Never surfaced in reminders, only in
+                          debug tooling.
     """
     from tools.schedule_parser import parse_schedule
 
@@ -206,6 +211,7 @@ def add_task(
         "last_reminded": None,
         "lead_reminded_at": None,
         "remind_count": 0,
+        "input_raw": (input_raw or "").strip(),
         "url": (url or "").strip(),
         "location": (location or "").strip(),
         "attendees": _normalize_str_list(attendees),

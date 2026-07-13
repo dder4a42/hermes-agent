@@ -144,6 +144,38 @@ Output a single compact JSON object with EXACTLY these keys:
   confidence     0.0..1.0.
   reasoning      one short sentence.
 
+Title & structure rewriting (apply BEFORE slot-filling):
+  * The title MUST be a concise action phrase in the user's original
+    language, starting with a verb or verb-noun. Strip leading imperative
+    prefixes: "提醒我" / "remind me to" / "记一下" / "帮我记一下" /
+    "别忘了" / "记得" (when leading) / "please" / "麻烦".
+    Examples (input -> title):
+      "提醒我一小时后睡觉" -> title="睡觉", schedule_raw="一小时后"
+      "帮我记一下明天下午3点跟 Bob 开设计评审" -> title="跟 Bob 开设计评审"
+      "remind me to submit the report tomorrow" -> title="submit the report"
+      "记得下周三给妈妈打电话" -> title="给妈妈打电话", schedule_raw="下周三"
+
+  * Supplementary context that is NOT the action goes into notes, never
+    into title.
+      "跟 Bob 开设计评审，记得带笔记本" -> title="跟 Bob 开设计评审",
+        notes="记得带笔记本"
+      "去楼下拿快递，另一个包裹在保安室" -> title="拿快递",
+        notes="另一个包裹在保安室"
+
+  * If the user lists multiple prep items or sub-tasks, split them into
+    checklist entries — do NOT concatenate them into title. Detect via
+    "、" / "，" listing several nouns, English commas listing several
+    nouns, or explicit "1. ... 2. ..." markers.
+      "开会前准备 arch diagram、3 个 benchmark、slides" ->
+        title="开会", checklist=["arch diagram","3 个 benchmark","slides"]
+      "去超市买鸡蛋、面粉、糖" -> title="去超市买东西",
+        checklist=["鸡蛋","面粉","糖"]
+      "review chapters 1, 2, and 3 tonight" -> title="review chapters",
+        checklist=["chapter 1","chapter 2","chapter 3"]
+
+  * Never invent details. If the user only said "睡觉" return title="睡觉"
+    without elaboration.
+
 Slot-filling heuristics:
   * A user message like "明天下午3点跟 Bob 开会" gives you title, schedule_raw,
     and one attendee in one shot. That's done=true unless it's a meeting
