@@ -119,7 +119,10 @@ def _pending_checklist(task: dict):
 
 
 def _fmt_main(task: dict) -> str:
-    lines = [f"⏰ Reminder: {task.get('title', 'Untitled')}"]
+    title = task.get("title", "Untitled")
+    narrated = _try_narrate(task, mode="main")
+    lead = narrated or f"⏰ Reminder: {title}"
+    lines = [f"⏰ {lead}"] if narrated else [lead]
     notes = task.get("notes")
     if notes:
         lines.append(f"📝 {notes}")
@@ -142,7 +145,10 @@ def _fmt_main(task: dict) -> str:
 
 def _fmt_pre(task: dict, minutes: int) -> str:
     pending = _pending_checklist(task)
-    lines = [f"⏰ 距 {task.get('title', 'Untitled')} 还有 {minutes} 分钟"]
+    title = task.get("title", "Untitled")
+    narrated = _try_narrate(task, mode="pre", minutes_left=minutes)
+    lead = narrated or f"距 {title} 还有 {minutes} 分钟"
+    lines = [f"⏰ {lead}"]
     if pending:
         lines.append("📋 尚未完成的准备：")
         for it in pending:
@@ -154,6 +160,28 @@ def _fmt_pre(task: dict, minutes: int) -> str:
     if url:
         lines.append(f"🔗 {url}")
     return "\n".join(lines) + "\n"
+
+
+def _try_narrate(task: dict, *, mode: str, minutes_left: int = 0):
+    """Ask the LLM narrator for a single-line opener. Returns None on
+    any failure (missing key, network, empty output) so the caller falls
+    back to the static template."""
+    try:
+        # Optional import — surfacer must still work if the module is
+        # missing or hermes-agent isn't on the path (e.g. bare cron env
+        # before installation completes).
+        import sys, os
+        from pathlib import Path
+        repo_root = Path(__file__).resolve().parent.parent
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        from tools.reminder_narrator import narrate_reminder
+    except Exception:
+        return None
+    try:
+        return narrate_reminder(task, mode=mode, minutes_left=minutes_left)
+    except Exception:
+        return None
 
 
 def main() -> None:
