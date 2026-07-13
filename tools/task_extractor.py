@@ -99,8 +99,8 @@ def _default_llm_call(system: str, user: str, model: str, base_url: str,
             {"role": "user", "content": user},
         ],
         response_format={"type": "json_object"},
-        max_tokens=800,
-        temperature=0.2,
+        max_tokens=1600,
+        temperature=0.1,
     )
     return resp.choices[0].message.content or ""
 
@@ -175,6 +175,30 @@ Title & structure rewriting (apply BEFORE slot-filling):
 
   * Never invent details. If the user only said "睡觉" return title="睡觉"
     without elaboration.
+
+  * Agenda-style title polish: after stripping and splitting, rewrite the
+    title into a compact noun / verb-noun phrase that reads like a
+    calendar entry, not a spoken sentence. Concrete objects, names and
+    specifics move to notes (or checklist, when they're a list). Keep it
+    in the user's original language. Do not shorten so far that a user
+    scanning /s status can't recall what the reminder is about — the
+    domain must survive.
+    Examples (colloquial -> agenda):
+      "去超市买鸡蛋、面粉、糖" -> title="超市购物",
+        checklist=["鸡蛋","面粉","糖"]  (checklist already carries the items)
+      "给妈妈打电话" -> title="电话联络家人", notes="妈妈"
+      "跟 Bob 开设计评审" -> title="设计评审", attendees=["Bob"]  (attendees
+        keep the participant; title focuses on the meeting subject)
+      "开会前准备 arch diagram、3 benchmarks、slides，明天下午3点开会" ->
+        title="会议准备",
+        checklist=["arch diagram","3 benchmarks","slides"]
+      "睡觉" -> title="就寝"  (short but still recognisable)
+      "拿快递" -> title="取快递"  (verb polish, not abstraction)
+      "review chapters 1, 2, and 3 tonight" -> title="chapter review",
+        checklist=["chapter 1","chapter 2","chapter 3"]
+    When the colloquial phrase is already agenda-like (e.g. "季度汇报"),
+    leave it alone. When polishing would erase the only identifying
+    detail (single-purpose task like "去 IKEA 退货"), keep the original.
 
 Slot-filling heuristics:
   * A user message like "明天下午3点跟 Bob 开会" gives you title, schedule_raw,
