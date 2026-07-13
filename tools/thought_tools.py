@@ -64,14 +64,112 @@ def _new_id(prefix: str) -> str:
 
 # ── Public helpers (imported by cron scripts and tests) ───────────────────────
 
-def add_task(title: str, schedule_raw: str, notes: str = "", recurrence: str = "once") -> dict:
+_MAX_CHECKLIST_ITEMS = 20
+
+
+def _normalize_checklist(items):
+    """Return a list of checklist item dicts from raw input.
+
+    Accepts a list of strings, a list of dicts (with text/done keys), or None.
+    Deduplicates by text (case-insensitive) and caps at _MAX_CHECKLIST_ITEMS
+    so a runaway extractor cannot balloon a task.
+    """
+    if not items:
+        return []
+    seen = set()
+    out = []
+    for entry in items:
+        if isinstance(entry, str):
+            text = entry.strip()
+            done = False
+            checked_at = None
+        elif isinstance(entry, dict):
+            text = str(entry.get("text", "")).strip()
+            done = bool(entry.get("done"))
+            checked_at = entry.get("checked_at")
+        else:
+            continue
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "id": _new_id("ci"),
+            "text": text,
+            "done": done,
+            "checked_at": checked_at,
+        })
+        if len(out) >= _MAX_CHECKLIST_ITEMS:
+            break
+    return out
+
+
+def _normalize_str_list(values):
+    if not values:
+        return []
+    if isinstance(values, str):
+        values = [v.strip() for v in values.split(",")]
+    return [str(v).strip() for v in values if str(v).strip()]
+
+
+def _normalize_remind_before(value):
+    """Convert user-facing lead-time expressions to integer minutes.
+
+    Accepts int, or strings like '30m', '1h', '30分钟', '2小时', '1天'.
+    Bare digits are treated as minutes.
+    """
+    if value in (None, "", 0, "0"):
+        return 0
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    s = str(value).strip().lower()
+    if not s:
+        return 0
+    import re as _re
+    m = _re.match(r"^(\d+)\s*(m|min|mins|minute|minutes|分|分钟)?$", s)
+    if m:
+        return max(0, int(m.group(1)))
+    m = _re.match(r"^(\d+)\s*(h|hr|hrs|hour|hours|小时)$", s)
+    if m:
+        return max(0, int(m.group(1)) * 60)
+    m = _re.match(r"^(\d+)\s*(d|day|days|天)$", s)
+    if m:
+        return max(0, int(m.group(1)) * 60 * 24)
+    return 0
+
+
+def add_task(
+    title: str,
+    schedule_raw: str,
+    notes: str = "",
+    recurrence: str = "once",
+    *,
+    url: str = "",
+    location: str = "",
+    attendees=None,
+    tags=None,
+    remind_before_min=0,
+    checklist=None,
+) -> dict:
     """Create a concrete timed reminder. Returns the saved task dict.
 
-    Resolves schedule_raw ("tomorrow 3pm", "明天下午3点", "每周三下午2点", …)
+    Resolves schedule_raw ('tomorrow 3pm', '明天下午3点', '每周三下午2点', ...)
     into an absolute scheduled_at via tools.schedule_parser. If the parser
     fails (network down, ambiguous phrasing, invalid time), the task is still
     saved with scheduled_at=None and a parse_error string so the surfacer
-    stays silent and the user can update the schedule later.
+    stays silent; the user can update the schedule later.
+
+    Optional structured fields (any subset may be provided):
+        url               join link / doc link.
+        location          physical or virtual place.
+        attendees         list[str] or comma-separated string.
+        tags              list[str] or comma-separated string.
+        remind_before_min minutes before scheduled_at for a pre-reminder.
+                          Accepts int OR strings like '30m', '1h', '2小时'.
+        checklist         list of prep items -- bare strings or
+                          {text, done} dicts. Deduped + capped at 20.
     """
     from tools.schedule_parser import parse_schedule
 
@@ -87,8 +185,6 @@ def add_task(title: str, schedule_raw: str, notes: str = "", recurrence: str = "
     if result.ok:
         scheduled_at = result.scheduled_at
         schedule_cron = result.schedule_cron or ""
-        # Trust the LLM when the caller passed the default 'once'; caller-set
-        # non-default recurrence wins (explicit intent from CLI/tool arg).
         if recurrence == "once":
             resolved_recurrence = result.recurrence
         parse_confidence = result.confidence
@@ -110,6 +206,12 @@ def add_task(title: str, schedule_raw: str, notes: str = "", recurrence: str = "
         "last_reminded": None,
         "lead_reminded_at": None,
         "remind_count": 0,
+        "url": (url or "").strip(),
+        "location": (location or "").strip(),
+        "attendees": _normalize_str_list(attendees),
+        "tags": _normalize_str_list(tags),
+        "remind_before_min": _normalize_remind_before(remind_before_min),
+        "checklist": _normalize_checklist(checklist),
         "parse": {
             "error": parse_error,
             "confidence": parse_confidence,
@@ -121,6 +223,107 @@ def add_task(title: str, schedule_raw: str, notes: str = "", recurrence: str = "
     return task
 
 
+
+
+def _find_task(store, task_id: str):
+    for t in store.get("tasks", []):
+        if t["id"] == task_id:
+            return t
+    return None
+
+
+def _resolve_item(task: dict, ref):
+    """Find a checklist item by 1-based index, id, or id-prefix.
+
+    Returns (index, item) or (-1, None) if not found.
+    """
+    items = task.get("checklist") or []
+    if not items:
+        return -1, None
+    if isinstance(ref, int) or (isinstance(ref, str) and ref.strip().isdigit()):
+        idx = int(ref) - 1
+        if 0 <= idx < len(items):
+            return idx, items[idx]
+        return -1, None
+    if not isinstance(ref, str):
+        return -1, None
+    ref = ref.strip()
+    for i, it in enumerate(items):
+        if it.get("id") == ref:
+            return i, it
+    for i, it in enumerate(items):
+        if it.get("id", "").startswith(ref) or it.get("text", "").lower().startswith(ref.lower()):
+            return i, it
+    return -1, None
+
+
+def check_task_item(task_id: str, item_ref) -> bool:
+    """Mark a checklist item done. Returns True if found and updated."""
+    store = _load_store()
+    task = _find_task(store, task_id)
+    if task is None:
+        return False
+    idx, item = _resolve_item(task, item_ref)
+    if item is None:
+        return False
+    item["done"] = True
+    item["checked_at"] = _now_iso()
+    _save_store(store)
+    return True
+
+
+def uncheck_task_item(task_id: str, item_ref) -> bool:
+    store = _load_store()
+    task = _find_task(store, task_id)
+    if task is None:
+        return False
+    idx, item = _resolve_item(task, item_ref)
+    if item is None:
+        return False
+    item["done"] = False
+    item["checked_at"] = None
+    _save_store(store)
+    return True
+
+
+def add_task_item(task_id: str, text: str) -> dict:
+    """Append a new checklist item. Returns the item dict or None if the task
+    doesn\'t exist / duplicate text / cap hit."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    store = _load_store()
+    task = _find_task(store, task_id)
+    if task is None:
+        return None
+    existing = task.setdefault("checklist", [])
+    lowered = {(it.get("text") or "").strip().lower() for it in existing}
+    if text.lower() in lowered:
+        return None
+    if len(existing) >= _MAX_CHECKLIST_ITEMS:
+        return None
+    item = {
+        "id": _new_id("ci"),
+        "text": text,
+        "done": False,
+        "checked_at": None,
+    }
+    existing.append(item)
+    _save_store(store)
+    return item
+
+
+def remove_task_item(task_id: str, item_ref) -> bool:
+    store = _load_store()
+    task = _find_task(store, task_id)
+    if task is None:
+        return False
+    idx, item = _resolve_item(task, item_ref)
+    if item is None:
+        return False
+    del task["checklist"][idx]
+    _save_store(store)
+    return True
 def done_task(task_id: str) -> bool:
     """Mark a task as done. Returns True if found."""
     store = _load_store()
@@ -276,6 +479,83 @@ def tasks_due() -> List[dict]:
             due.append(t)
     return due
 
+
+
+
+def parse_s_add_args(raw: str) -> dict:
+    """Tokenise the argument tail of into a flat dict.
+
+    Shared by the CLI () and the gateway
+    () so both surfaces accept the same flags.
+
+    Supported flags (all optional except --when):
+        --when "..."          schedule expression   (required)
+        --notes "..."         free-form notes
+        --url URL              join/doc link
+        --where / --location   physical or virtual place
+        --attendees a,b,c      comma-separated
+        --tags t1,t2           comma-separated
+        --remind-before / --lead  lead-time spec (30m, 1h, ...)
+        --checklist "a;b;c"    semicolon-separated
+
+    Everything else is joined back into the title. Uses shlex so quoted
+    values survive intact. Returns raw strings — actual normalisation
+    (attendee dedup, remind-before -> minutes) happens inside add_task.
+    """
+    import shlex
+    text = (raw or "").strip()
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        tokens = text.split()
+
+    flags = {
+        "--when": "schedule_raw",
+        "--notes": "notes",
+        "--url": "url",
+        "--where": "location",
+        "--location": "location",
+        "--attendees": "attendees",
+        "--with": "attendees",
+        "--tags": "tags",
+        "--remind-before": "remind_before",
+        "--lead": "remind_before",
+        "--checklist": "checklist",
+    }
+    out = {
+        "title": "",
+        "schedule_raw": "",
+        "notes": "",
+        "url": "",
+        "location": "",
+        "attendees": [],
+        "tags": [],
+        "remind_before": "",
+        "checklist": [],
+    }
+    title_tokens = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        target = flags.get(tok)
+        if target is None:
+            title_tokens.append(tok)
+            i += 1
+            continue
+        i += 1
+        if i >= len(tokens):
+            break
+        value = tokens[i]
+        if target in ("attendees", "tags"):
+            out[target] = [v.strip() for v in value.split(",") if v.strip()]
+        elif target == "checklist":
+            out[target] = [v.strip() for v in value.split(";") if v.strip()]
+        else:
+            out[target] = value
+        i += 1
+
+    out["title"] = " ".join(title_tokens).strip().strip('\"\'')
+    return out
 
 # ── Hermes Agent Tools ────────────────────────────────────────────────────────
 

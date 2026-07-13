@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""Task Surfacer — checks every 5 minutes for due tasks.
+"""Task Surfacer -- checks every 5 minutes for due tasks.
 
-Reads ``$HERMES_HOME/thoughts.json``, finds active tasks whose absolute
-scheduled_at has arrived (with optional 'schedule_cron' fallback for older
-records), and prints reminders to stdout for cron delivery.
+Reads $HERMES_HOME/thoughts.json, finds active tasks whose absolute
+scheduled_at has arrived (or whose pre-reminder window has opened), and
+prints reminders to stdout for cron delivery.
 
-Recurring tasks (recurrence != 'once') advance to the next occurrence in
-schedule_cron on fire; one-shot tasks flip state='done'.
+Two firing paths per task:
+  * pre-reminder: when now >= scheduled_at - remind_before_min AND
+    lead_reminded_at is None. Renders pending checklist items so the user
+    can prep. Fires at most once.
+  * main reminder: when now >= scheduled_at AND last_reminded is None
+    (single-fire semantics). Renders url / location / attendees /
+    outstanding checklist alongside the title.
 
-Designed to run as a ``no_agent=True`` cron job.
+Recurring tasks (recurrence != 'once') advance to the next occurrence
+after the main reminder fires; one-shot tasks flip state='done'.
 
-Silent (empty stdout) when nothing is due.
+Designed to run as a no_agent=True cron job. Silent when nothing is due.
 
 Environment:
-  HERMES_HOME  — profile home; defaults to ~/.hermes.
+  HERMES_HOME  -- profile home; defaults to ~/.hermes.
 """
 from __future__ import annotations
 
@@ -41,7 +47,7 @@ def _save_store(store: dict) -> None:
 
 
 def _cron_matches(cron_expr: str, now: datetime) -> bool:
-    """Legacy cron matcher — kept for tasks that only have schedule_cron."""
+    """Legacy cron matcher for tasks that only have schedule_cron."""
     if not cron_expr:
         return False
     parts = cron_expr.strip().split()
@@ -69,7 +75,7 @@ def _cron_matches(cron_expr: str, now: datetime) -> bool:
     return True
 
 
-def _parse_iso(dt_str) -> datetime | None:
+def _parse_iso(dt_str):
     if not isinstance(dt_str, str) or not dt_str.strip():
         return None
     try:
@@ -78,29 +84,25 @@ def _parse_iso(dt_str) -> datetime | None:
         return None
 
 
-def _now_local(tz_hint: datetime | None = None) -> datetime:
+def _now_local(tz_hint=None) -> datetime:
     if tz_hint is not None and tz_hint.tzinfo is not None:
         return datetime.now(tz_hint.tzinfo)
-    # Default to CST for legacy tasks lacking tz info.
     return datetime.now(timezone(timedelta(hours=8)))
 
 
-def _advance_recurrence(scheduled: datetime, recurrence: str) -> datetime | None:
-    """Bump scheduled_at to the next occurrence for a recurring task."""
+def _advance_recurrence(scheduled: datetime, recurrence: str):
     r = (recurrence or "once").lower()
     if r == "daily":
         return scheduled + timedelta(days=1)
     if r == "weekly":
         return scheduled + timedelta(days=7)
     if r == "monthly":
-        # Rough +1 month; good enough for reminders.
         month = scheduled.month + 1
         year = scheduled.year + (month - 1) // 12
         month = ((month - 1) % 12) + 1
         try:
             return scheduled.replace(year=year, month=month)
         except ValueError:
-            # e.g. Jan 31 → Feb 31 doesn't exist. Fall back to last day of month.
             import calendar
             last = calendar.monthrange(year, month)[1]
             return scheduled.replace(year=year, month=month, day=last)
@@ -112,11 +114,45 @@ def _advance_recurrence(scheduled: datetime, recurrence: str) -> datetime | None
     return None
 
 
-def _format_reminder(task: dict) -> str:
+def _pending_checklist(task: dict):
+    return [it for it in (task.get("checklist") or []) if not it.get("done")]
+
+
+def _fmt_main(task: dict) -> str:
     lines = [f"⏰ Reminder: {task.get('title', 'Untitled')}"]
     notes = task.get("notes")
     if notes:
         lines.append(f"📝 {notes}")
+    location = task.get("location")
+    if location:
+        lines.append(f"📍 {location}")
+    url = task.get("url")
+    if url:
+        lines.append(f"🔗 {url}")
+    attendees = task.get("attendees") or []
+    if attendees:
+        lines.append(f"👥 {', '.join(attendees)}")
+    pending = _pending_checklist(task)
+    if pending:
+        lines.append("📋 Pending:")
+        for it in pending:
+            lines.append(f"  [ ] {it.get('text','')}")
+    return "\n".join(lines) + "\n"
+
+
+def _fmt_pre(task: dict, minutes: int) -> str:
+    pending = _pending_checklist(task)
+    lines = [f"⏰ 距 {task.get('title', 'Untitled')} 还有 {minutes} 分钟"]
+    if pending:
+        lines.append("📋 尚未完成的准备：")
+        for it in pending:
+            lines.append(f"  [ ] {it.get('text','')}")
+    location = task.get("location")
+    if location:
+        lines.append(f"📍 {location}")
+    url = task.get("url")
+    if url:
+        lines.append(f"🔗 {url}")
     return "\n".join(lines) + "\n"
 
 
@@ -139,24 +175,43 @@ def main() -> None:
             continue
 
         scheduled = _parse_iso(t.get("scheduled_at"))
-        fired = False
+        remind_before = int(t.get("remind_before_min") or 0)
+        already_lead = t.get("lead_reminded_at") is not None
+        already_main = t.get("last_reminded") is not None
+
+        fired_main = False
+        fired_pre = False
 
         if scheduled is not None:
             if scheduled.tzinfo is None:
                 scheduled = scheduled.replace(tzinfo=now.tzinfo)
-            if now >= scheduled:
-                fired = True
-        else:
-            # Legacy fallback for tasks without scheduled_at: honour a
-            # populated schedule_cron string using the old wall-clock match.
-            cron = t.get("schedule_cron", "") or ""
-            if cron and _cron_matches(cron, now):
-                fired = True
 
-        if not fired:
+            # Pre-reminder window: [scheduled - remind_before, scheduled).
+            if remind_before > 0 and not already_lead and not already_main:
+                lead_at = scheduled - timedelta(minutes=remind_before)
+                if lead_at <= now < scheduled:
+                    fired_pre = True
+
+            # Main reminder: now >= scheduled and not yet fired.
+            if not already_main and now >= scheduled:
+                fired_main = True
+        else:
+            cron = t.get("schedule_cron", "") or ""
+            if cron and not already_main and _cron_matches(cron, now):
+                fired_main = True
+
+        if fired_pre and not fired_main:
+            minutes_left = int((scheduled - now).total_seconds() // 60) if scheduled else remind_before
+            minutes_left = max(0, minutes_left)
+            output_lines.append(_fmt_pre(t, minutes_left))
+            t["lead_reminded_at"] = now_utc.isoformat()
+            changed = True
             continue
 
-        output_lines.append(_format_reminder(t))
+        if not fired_main:
+            continue
+
+        output_lines.append(_fmt_main(t))
         t["last_reminded"] = now_utc.isoformat()
         t["remind_count"] = (t.get("remind_count", 0) or 0) + 1
         changed = True
@@ -168,6 +223,9 @@ def main() -> None:
             nxt = _advance_recurrence(scheduled, recurrence)
             if nxt is not None:
                 t["scheduled_at"] = nxt.isoformat(timespec="seconds")
+                # Reset per-occurrence gates so the next cycle fires.
+                t["last_reminded"] = None
+                t["lead_reminded_at"] = None
 
     if changed:
         _save_store(store)

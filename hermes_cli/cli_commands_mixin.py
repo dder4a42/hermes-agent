@@ -1209,44 +1209,76 @@ class CLICommandsMixin:
             else:
                 for i, t in enumerate(tasks, 1):
                     print(f"  #{i} [{t['id']}] {t['title']}")
-                    print(f"      Schedule: {t.get('schedule_raw', '?')}")
-                    print(f"      Notes:    {t.get('notes', '-')}")
+                    when_display = t.get("scheduled_at") or t.get("schedule_raw", "?")
+                    print(f"      When:     {when_display}")
+                    perr = (t.get("parse") or {}).get("error")
+                    if perr:
+                        print(f"      ⚠ Fix:    {perr}")
+                    if t.get("location"):
+                        print(f"      Where:    {t['location']}")
+                    if t.get("url"):
+                        print(f"      URL:      {t['url']}")
+                    attendees = t.get("attendees") or []
+                    if attendees:
+                        print(f"      With:     {', '.join(attendees)}")
+                    if t.get("remind_before_min"):
+                        print(f"      Lead:     {t['remind_before_min']} min before")
+                    checklist = t.get("checklist") or []
+                    if checklist:
+                        print("      Checklist:")
+                        for it in checklist:
+                            box = "[x]" if it.get("done") else "[ ]"
+                            print(f"        {box} {it.get('text','')}")
+                    if t.get("notes"):
+                        print(f"      Notes:    {t['notes']}")
                     print()
             print("  Commands:")
             print('    /s add "task title" --when "tomorrow 2pm"')
+            print('        [--url URL] [--where "..."] [--attendees a,b]')
+            print('        [--tags t1,t2] [--remind-before 30m] [--checklist "a;b"]')
+            print("    /s check <id> <item> / /s uncheck <id> <item>")
+            print('    /s item add <id> "text" / /s item rm <id> <item>')
             print("    /s done <id>")
             print("    /s pause <id> / /s resume <id>")
             print("    /s rm <id>")
 
         elif subcmd == "add":
-            # Interactive: just show the format
+            from tools.thought_tools import parse_s_add_args
             raw = cmd[len("s add"):].strip() if len(cmd) > 5 else ""
-            if not raw:
-                print("(._.) Usage: /s add \"Reminder text\" --when \"tomorrow 2pm\" [--notes \"...\"]")
-                print("  Or just tell me in natural language and I'll set it up!")
+            parsed = parse_s_add_args(raw)
+            if not parsed["schedule_raw"]:
+                print("(._.) Usage: /s add \"title\" --when \"tomorrow 2pm\"")
+                print("  Optional: --notes \"...\"  --url URL  --where \"...\"")
+                print("           --attendees a,b  --tags t1,t2")
+                print("           --remind-before 30m  --checklist \"a;b;c\"")
                 return
-            # Parse --when and --notes flags
-            when = ""
-            notes = ""
-            rest = raw
-            if "--when" in rest:
-                parts = rest.split("--when", 1)
-                title_part = parts[0].strip().strip("\"'")
-                when = parts[1].strip().strip("\"'")
-                if "--notes" in when:
-                    wp = when.split("--notes", 1)
-                    when = wp[0].strip().strip("\"'")
-                    notes = wp[1].strip().strip("\"'")
-            else:
-                title_part = rest.strip().strip("\"'")
-
-            if not when:
-                print("(._.) Missing --when. Usage: /s add \"title\" --when \"tomorrow 2pm\"")
+            if not parsed["title"]:
+                print("(._.) Missing title. Put the reminder text before the flags.")
                 return
-
-            task = add_task(title=title_part, schedule_raw=when, notes=notes)
+            task = add_task(
+                title=parsed["title"],
+                schedule_raw=parsed["schedule_raw"],
+                notes=parsed["notes"],
+                url=parsed["url"],
+                location=parsed["location"],
+                attendees=parsed["attendees"],
+                tags=parsed["tags"],
+                remind_before_min=parsed["remind_before"],
+                checklist=parsed["checklist"],
+            )
+            perr = (task.get("parse") or {}).get("error")
             print(f"(^_^) Reminder set! [{task['id']}]")
-            print(f"  {title_part} — {when}")
+            print(f"  {parsed['title']} — {parsed['schedule_raw']}")
+            if task.get("scheduled_at"):
+                print(f"  scheduled_at: {task['scheduled_at']}")
+            if perr:
+                print(f"  ⚠ 时间解析失败: {perr}")
+            if task.get("remind_before_min"):
+                print(f"  pre-reminder: {task['remind_before_min']} minutes before")
+            if task.get("checklist"):
+                print("  checklist:")
+                for it in task["checklist"]:
+                    print(f"    [ ] {it['text']}")
 
         elif subcmd == "list":
             state_filter = tokens[2].strip().lower() if len(tokens) > 2 else "active"
@@ -1298,9 +1330,48 @@ class CLICommandsMixin:
             else:
                 print(f"(._.) Task {tid} not found.")
 
+        elif subcmd in ("check", "uncheck"):
+            from tools.thought_tools import check_task_item, uncheck_task_item
+            if len(tokens) < 4:
+                print(f"(._.) Usage: /s {subcmd} <task_id> <item_index_or_id>")
+                return
+            tid, ref = tokens[2], tokens[3]
+            fn = check_task_item if subcmd == "check" else uncheck_task_item
+            if fn(tid, ref):
+                mark = "[x]" if subcmd == "check" else "[ ]"
+                print(f"(^_^) Item {mark} {ref} on {tid}")
+            else:
+                print(f"(._.) Item {ref!r} not found on {tid}")
+
+        elif subcmd == "item":
+            from tools.thought_tools import add_task_item, remove_task_item
+            sub2 = tokens[2].strip().lower() if len(tokens) > 2 else ""
+            if sub2 == "add":
+                if len(tokens) < 5:
+                    print('(._.) Usage: /s item add <task_id> "item text"')
+                    return
+                tid = tokens[3]
+                text = " ".join(tokens[4:]).strip().strip('"\'')
+                item = add_task_item(tid, text)
+                if item:
+                    print(f"(^_^) Added item [{item['id']}] {item['text']}")
+                else:
+                    print("(._.) Could not add (task missing, duplicate, or at cap)")
+            elif sub2 in ("rm", "remove", "delete"):
+                if len(tokens) < 5:
+                    print("(._.) Usage: /s item rm <task_id> <index_or_id>")
+                    return
+                tid, ref = tokens[3], tokens[4]
+                if remove_task_item(tid, ref):
+                    print(f"(^_^) Removed item {ref} from {tid}")
+                else:
+                    print(f"(._.) Item {ref!r} not found on {tid}")
+            else:
+                print("(._.) Usage: /s item [add|rm] <task_id> ...")
+
         else:
             print(f"(._.) Unknown subcommand: {subcmd}")
-            print("  Usage: /s [status|add|list|done|rm|pause|resume]")
+            print("  Usage: /s [status|add|list|done|rm|pause|resume|check|uncheck|item]")
 
     def _handle_end_command(self, cmd: str):
         """Handle /end — close the active domain discussion."""

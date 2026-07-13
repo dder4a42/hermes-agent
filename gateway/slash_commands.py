@@ -4684,33 +4684,71 @@ class GatewaySlashCommandsMixin:
             else:
                 for t in tasks:
                     lines.append(f"  • **{t['title']}**")
-                    lines.append(f"    ⏰ {t.get('schedule_raw', '?')}")
+                    when_display = t.get("scheduled_at") or t.get("schedule_raw", "?")
+                    lines.append(f"    ⏰ {when_display}")
+                    perr = (t.get("parse") or {}).get("error")
+                    if perr:
+                        lines.append(f"    ⚠ 待修复: {perr}")
+                    if t.get("location"):
+                        lines.append(f"    📍 {t['location']}")
+                    if t.get("url"):
+                        lines.append(f"    🔗 {t['url']}")
+                    attendees = t.get("attendees") or []
+                    if attendees:
+                        lines.append(f"    👥 {', '.join(attendees)}")
+                    if t.get("remind_before_min"):
+                        lines.append(f"    🔔 前 {t['remind_before_min']} 分钟")
+                    checklist = t.get("checklist") or []
+                    if checklist:
+                        for it in checklist:
+                            box = "[x]" if it.get("done") else "[ ]"
+                            lines.append(f"    {box} {it.get('text','')}")
                     if t.get("notes"):
                         lines.append(f"    📝 {t['notes']}")
                     lines.append(f"    `{t['id']}`")
             lines.append("")
             lines.append("`/s add \"title\" --when \"tomorrow 2pm\"` — set reminder")
+            lines.append("`/s check <id> <item>` / `/s item add <id> \"text\"`")
             lines.append("`/s done <id>` / `/s rm <id>` — complete/delete")
             lines.append("`/s pause <id>` / `/s resume <id>`")
             return "\n".join(lines)
 
         if subcmd == "add":
-            # Parse --when flag
+            from tools.thought_tools import parse_s_add_args
             rest = args[3:].strip() if len(args) > 3 else ""
-            if not rest or "--when" not in rest:
-                return 'Usage: `/s add "Reminder text" --when "tomorrow 2pm" [--notes "..."]`'
-            parts = rest.split("--when", 1)
-            title = parts[0].strip().strip("\"'")
-            when_part = parts[1].strip().strip("\"'")
-            notes = ""
-            if "--notes" in when_part:
-                wp = when_part.split("--notes", 1)
-                when_part = wp[0].strip().strip("\"'")
-                notes = wp[1].strip().strip("\"'")
-            if not when_part:
-                return "Missing schedule. Usage: `/s add \"title\" --when \"tomorrow 2pm\"`"
-            task = add_task(title=title, schedule_raw=when_part, notes=notes)
-            return f"✅ Reminder set! **{title}** — {when_part} (`{task['id']}`)"
+            parsed = parse_s_add_args(rest)
+            if not parsed["schedule_raw"]:
+                return (
+                    'Usage: `/s add "title" --when "tomorrow 2pm"`\n'
+                    'Optional: --notes / --url / --where / --attendees a,b / --tags t1,t2 '
+                    '/ --remind-before 30m / --checklist "a;b;c"'
+                )
+            if not parsed["title"]:
+                return "Missing title. Put the reminder text before the flags."
+            task = add_task(
+                title=parsed["title"],
+                schedule_raw=parsed["schedule_raw"],
+                notes=parsed["notes"],
+                url=parsed["url"],
+                location=parsed["location"],
+                attendees=parsed["attendees"],
+                tags=parsed["tags"],
+                remind_before_min=parsed["remind_before"],
+                checklist=parsed["checklist"],
+            )
+            perr = (task.get("parse") or {}).get("error")
+            lines = [f"✅ Reminder set! **{parsed['title']}** — {parsed['schedule_raw']} (`{task['id']}`)"]
+            if task.get("scheduled_at"):
+                lines.append(f"⏰ {task['scheduled_at']}")
+            if perr:
+                lines.append(f"⚠ 时间解析失败: {perr}")
+            if task.get("remind_before_min"):
+                lines.append(f"🔔 会前 {task['remind_before_min']} 分钟提醒准备")
+            if task.get("checklist"):
+                lines.append("📋 checklist:")
+                for it in task["checklist"]:
+                    lines.append(f"  [ ] {it['text']}")
+            return "\n".join(lines)
 
         if subcmd in ("done", "finish"):
             tid = tokens[1].strip() if len(tokens) > 1 else ""
@@ -4755,7 +4793,41 @@ class GatewaySlashCommandsMixin:
                 return f"▶️ Task `{tid}` resumed!"
             return f"Task `{tid}` not found."
 
-        return "Usage: `/s [status|add|list|done|rm|pause|resume]`"
+        if subcmd in ("check", "uncheck"):
+            from tools.thought_tools import check_task_item, uncheck_task_item
+            tid = tokens[1] if len(tokens) > 1 else ""
+            ref = tokens[2] if len(tokens) > 2 else ""
+            if not tid or not ref:
+                return f"Usage: `/s {subcmd} <task_id> <item_index_or_id>`"
+            fn = check_task_item if subcmd == "check" else uncheck_task_item
+            if fn(tid, ref):
+                mark = "[x]" if subcmd == "check" else "[ ]"
+                return f"{mark} Item {ref} on `{tid}`"
+            return f"Item {ref!r} not found on `{tid}`"
+
+        if subcmd == "item":
+            from tools.thought_tools import add_task_item, remove_task_item
+            sub2 = tokens[1].strip().lower() if len(tokens) > 1 else ""
+            if sub2 == "add":
+                tid = tokens[2] if len(tokens) > 2 else ""
+                text = " ".join(tokens[3:]).strip().strip('"\'')
+                if not tid or not text:
+                    return 'Usage: `/s item add <task_id> "item text"`'
+                item = add_task_item(tid, text)
+                if item:
+                    return f"✅ Added item [`{item['id']}`] {item['text']}"
+                return "Could not add (task missing, duplicate, or at cap)."
+            if sub2 in ("rm", "remove", "delete"):
+                tid = tokens[2] if len(tokens) > 2 else ""
+                ref = tokens[3] if len(tokens) > 3 else ""
+                if not tid or not ref:
+                    return "Usage: `/s item rm <task_id> <index_or_id>`"
+                if remove_task_item(tid, ref):
+                    return f"✅ Removed item {ref} from `{tid}`"
+                return f"Item {ref!r} not found on `{tid}`"
+            return "Usage: `/s item [add|rm] <task_id> ...`"
+
+        return "Usage: `/s [status|add|list|done|rm|pause|resume|check|uncheck|item]`"
 
     async def _handle_paper_command(self, event: MessageEvent) -> str:
         """Handle /paper in the gateway — Research Copilot controls."""

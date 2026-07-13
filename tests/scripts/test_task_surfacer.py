@@ -140,3 +140,73 @@ def test_legacy_cron_fallback_still_matches(hermes_home):
     stdout, store = _run_surfacer(hermes_home)
     assert "cron legacy" in stdout
     assert store["tasks"][0]["state"] == "done"
+
+
+def test_pre_reminder_fires_once_and_renders_checklist(hermes_home):
+    """When now enters the [scheduled - remind_before, scheduled) window and
+    lead_reminded_at is still null, the surfacer must emit a pre-reminder
+    containing pending checklist items, then set lead_reminded_at so it
+    doesn\'t fire twice."""
+    upcoming = (datetime.now(CST) + timedelta(minutes=10)).isoformat(timespec="seconds")
+    _write_store(hermes_home, [{
+        "id": "tk_meet", "title": "Design review", "schedule_raw": "in 10 min",
+        "scheduled_at": upcoming, "schedule_cron": "", "recurrence": "once",
+        "state": "active", "created_at": "2026-07-13T00:00:00+08:00",
+        "last_reminded": None, "lead_reminded_at": None, "remind_count": 0,
+        "url": "https://meet.example/abc", "location": "Room 42",
+        "attendees": ["Bob"], "tags": ["meeting"], "remind_before_min": 30,
+        "checklist": [
+            {"id": "ci_1", "text": "arch diagram", "done": False, "checked_at": None},
+            {"id": "ci_2", "text": "benchmarks", "done": True, "checked_at": "..."},
+        ],
+    }])
+
+    stdout, store = _run_surfacer(hermes_home)
+    assert "Design review" in stdout
+    # Pre-reminder wording, not the main "⏰ Reminder" one.
+    assert "分钟" in stdout
+    assert "arch diagram" in stdout
+    # Done items are not shown.
+    assert "benchmarks" not in stdout
+    task = store["tasks"][0]
+    assert task["lead_reminded_at"] is not None
+    assert task["last_reminded"] is None
+    assert task["state"] == "active"
+
+    # Second run in the same window: no output, no double-fire.
+    stdout2, _ = _run_surfacer(hermes_home)
+    assert stdout2 == ""
+
+
+def test_main_reminder_renders_structured_fields(hermes_home):
+    past = (datetime.now(CST) - timedelta(minutes=2)).isoformat(timespec="seconds")
+    _write_store(hermes_home, [{
+        "id": "tk_meet", "title": "Design review", "schedule_raw": "just now",
+        "scheduled_at": past, "schedule_cron": "", "recurrence": "once",
+        "state": "active", "created_at": "2026-07-13T00:00:00+08:00",
+        "last_reminded": None, "lead_reminded_at": None, "remind_count": 0,
+        "url": "https://meet.example/abc", "location": "Room 42",
+        "attendees": ["Bob", "Alice"], "tags": ["meeting"], "remind_before_min": 0,
+        "checklist": [{"id": "ci_1", "text": "slides", "done": False, "checked_at": None}],
+    }])
+    stdout, store = _run_surfacer(hermes_home)
+    assert "Design review" in stdout
+    assert "https://meet.example/abc" in stdout
+    assert "Room 42" in stdout
+    assert "Bob" in stdout and "Alice" in stdout
+    assert "slides" in stdout
+    assert store["tasks"][0]["state"] == "done"
+
+
+def test_pre_reminder_skipped_if_remind_before_zero(hermes_home):
+    upcoming = (datetime.now(CST) + timedelta(minutes=1)).isoformat(timespec="seconds")
+    _write_store(hermes_home, [{
+        "id": "tk_a", "title": "quiet reminder", "schedule_raw": "soon",
+        "scheduled_at": upcoming, "schedule_cron": "", "recurrence": "once",
+        "state": "active", "created_at": "2026-07-13T00:00:00+08:00",
+        "last_reminded": None, "lead_reminded_at": None, "remind_count": 0,
+        "remind_before_min": 0,
+    }])
+    stdout, store = _run_surfacer(hermes_home)
+    assert stdout == ""
+    assert store["tasks"][0]["lead_reminded_at"] is None
