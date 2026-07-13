@@ -65,19 +65,56 @@ def _new_id(prefix: str) -> str:
 # ── Public helpers (imported by cron scripts and tests) ───────────────────────
 
 def add_task(title: str, schedule_raw: str, notes: str = "", recurrence: str = "once") -> dict:
-    """Create a concrete timed reminder. Returns the saved task dict."""
+    """Create a concrete timed reminder. Returns the saved task dict.
+
+    Resolves schedule_raw ("tomorrow 3pm", "明天下午3点", "每周三下午2点", …)
+    into an absolute scheduled_at via tools.schedule_parser. If the parser
+    fails (network down, ambiguous phrasing, invalid time), the task is still
+    saved with scheduled_at=None and a parse_error string so the surfacer
+    stays silent and the user can update the schedule later.
+    """
+    from tools.schedule_parser import parse_schedule
+
+    result = parse_schedule(schedule_raw)
+
+    resolved_recurrence = recurrence
+    scheduled_at = None
+    schedule_cron = ""
+    parse_error = None
+    parse_confidence = None
+    parse_reasoning = None
+
+    if result.ok:
+        scheduled_at = result.scheduled_at
+        schedule_cron = result.schedule_cron or ""
+        # Trust the LLM when the caller passed the default 'once'; caller-set
+        # non-default recurrence wins (explicit intent from CLI/tool arg).
+        if recurrence == "once":
+            resolved_recurrence = result.recurrence
+        parse_confidence = result.confidence
+        parse_reasoning = result.reasoning
+    else:
+        parse_error = result.error
+
     store = _load_store()
     task = {
         "id": _new_id("tk"),
         "title": title,
         "notes": notes or "",
         "schedule_raw": schedule_raw,
-        "schedule_cron": "",         # resolved by the surfer script
-        "recurrence": recurrence,
+        "scheduled_at": scheduled_at,
+        "schedule_cron": schedule_cron,
+        "recurrence": resolved_recurrence,
         "state": "active",
         "created_at": _now_iso(),
         "last_reminded": None,
+        "lead_reminded_at": None,
         "remind_count": 0,
+        "parse": {
+            "error": parse_error,
+            "confidence": parse_confidence,
+            "reasoning": parse_reasoning,
+        },
     }
     store.setdefault("tasks", []).append(task)
     _save_store(store)

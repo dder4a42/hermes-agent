@@ -1,0 +1,142 @@
+"""Behavioural tests for scripts/task_surfacer.py — the no-agent cron script
+that reads scheduled_at and emits reminder text."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+CST = timezone(timedelta(hours=8))
+SURFACER = Path(__file__).resolve().parent.parent.parent / "scripts" / "task_surfacer.py"
+
+
+@pytest.fixture
+def hermes_home(tmp_path):
+    (tmp_path / "scripts").mkdir()
+    return tmp_path
+
+
+def _write_store(hermes_home: Path, tasks: list) -> Path:
+    path = hermes_home / "thoughts.json"
+    path.write_text(json.dumps({"thoughts": [], "tasks": tasks}, ensure_ascii=False))
+    return path
+
+
+def _run_surfacer(hermes_home: Path) -> tuple[str, dict]:
+    result = subprocess.run(
+        [sys.executable, str(SURFACER)],
+        env={"HERMES_HOME": str(hermes_home), "PATH": "/usr/bin:/bin"},
+        capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    store = json.loads((hermes_home / "thoughts.json").read_text())
+    return result.stdout, store
+
+
+def test_due_task_emits_reminder_and_marks_done(hermes_home):
+    past = (datetime.now(CST) - timedelta(minutes=5)).isoformat(timespec="seconds")
+    _write_store(hermes_home, [{
+        "id": "tk_a", "title": "drink water", "schedule_raw": "5 min ago",
+        "scheduled_at": past, "schedule_cron": "", "recurrence": "once",
+        "state": "active", "created_at": "2026-07-13T00:00:00+08:00",
+        "last_reminded": None, "lead_reminded_at": None, "remind_count": 0,
+    }])
+    stdout, store = _run_surfacer(hermes_home)
+    assert "drink water" in stdout
+    assert "⏰" in stdout
+    task = store["tasks"][0]
+    assert task["state"] == "done"
+    assert task["remind_count"] == 1
+    assert task["last_reminded"] is not None
+
+
+def test_future_task_stays_silent(hermes_home):
+    future = (datetime.now(CST) + timedelta(hours=2)).isoformat(timespec="seconds")
+    _write_store(hermes_home, [{
+        "id": "tk_b", "title": "future thing", "schedule_raw": "in 2h",
+        "scheduled_at": future, "schedule_cron": "", "recurrence": "once",
+        "state": "active", "created_at": "2026-07-13T00:00:00+08:00",
+        "last_reminded": None, "lead_reminded_at": None, "remind_count": 0,
+    }])
+    stdout, store = _run_surfacer(hermes_home)
+    assert stdout == ""
+    assert store["tasks"][0]["state"] == "active"
+
+
+def test_recurring_task_advances_scheduled_at(hermes_home):
+    scheduled = (datetime.now(CST) - timedelta(minutes=1)).isoformat(timespec="seconds")
+    _write_store(hermes_home, [{
+        "id": "tk_c", "title": "weekly review", "schedule_raw": "weekly",
+        "scheduled_at": scheduled, "schedule_cron": "0 14 * * 3",
+        "recurrence": "weekly", "state": "active",
+        "created_at": "2026-07-13T00:00:00+08:00",
+        "last_reminded": None, "lead_reminded_at": None, "remind_count": 0,
+    }])
+    stdout, store = _run_surfacer(hermes_home)
+    assert "weekly review" in stdout
+    task = store["tasks"][0]
+    assert task["state"] == "active"    # weekly stays active
+    old_dt = datetime.fromisoformat(scheduled)
+    new_dt = datetime.fromisoformat(task["scheduled_at"])
+    assert new_dt - old_dt == timedelta(days=7)
+
+
+def test_legacy_task_without_scheduled_at_stays_silent(hermes_home):
+    """A pre-M0 task with scheduled_at=None must NOT trigger — that would
+    fire every 5 min forever."""
+    _write_store(hermes_home, [{
+        "id": "tk_legacy", "title": "legacy", "schedule_raw": "someday",
+        "scheduled_at": None, "schedule_cron": "", "recurrence": "once",
+        "state": "active", "created_at": "2026-07-13T00:00:00+08:00",
+        "last_reminded": None, "remind_count": 0,
+    }])
+    stdout, store = _run_surfacer(hermes_home)
+    assert stdout == ""
+    assert store["tasks"][0]["state"] == "active"
+
+
+def test_paused_task_never_fires(hermes_home):
+    past = (datetime.now(CST) - timedelta(minutes=10)).isoformat(timespec="seconds")
+    _write_store(hermes_home, [{
+        "id": "tk_p", "title": "paused", "schedule_raw": "...",
+        "scheduled_at": past, "schedule_cron": "", "recurrence": "once",
+        "state": "paused", "created_at": "2026-07-13T00:00:00+08:00",
+        "last_reminded": None, "lead_reminded_at": None, "remind_count": 0,
+    }])
+    stdout, store = _run_surfacer(hermes_home)
+    assert stdout == ""
+    assert store["tasks"][0]["state"] == "paused"
+
+
+def test_missing_store_is_silent(hermes_home):
+    # no thoughts.json at all
+    stdout, _ = subprocess.run(
+        [sys.executable, str(SURFACER)],
+        env={"HERMES_HOME": str(hermes_home), "PATH": "/usr/bin:/bin"},
+        capture_output=True, text=True, timeout=15,
+    ), None
+    # Actually assert on the CompletedProcess:
+    assert stdout.returncode == 0
+    assert stdout.stdout == ""
+
+
+def test_legacy_cron_fallback_still_matches(hermes_home):
+    """Pre-M0 tasks that never got scheduled_at but do have schedule_cron
+    (unlikely but possible if user tinkered) should still fire via the
+    legacy _cron_matches path."""
+    now = datetime.now(CST)
+    cron = f"{now.minute} {now.hour} * * *"
+    _write_store(hermes_home, [{
+        "id": "tk_cron", "title": "cron legacy", "schedule_raw": "...",
+        "scheduled_at": None, "schedule_cron": cron, "recurrence": "once",
+        "state": "active", "created_at": "2026-07-13T00:00:00+08:00",
+        "last_reminded": None, "lead_reminded_at": None, "remind_count": 0,
+    }])
+    stdout, store = _run_surfacer(hermes_home)
+    assert "cron legacy" in stdout
+    assert store["tasks"][0]["state"] == "done"
