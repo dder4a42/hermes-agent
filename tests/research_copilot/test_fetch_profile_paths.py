@@ -114,3 +114,68 @@ def test_gmail_addr_reads_env(tmp_path, monkeypatch):
     sys.modules.pop("research_copilot.scripts.paper_fetch", None)
     module = importlib.import_module("research_copilot.scripts.paper_fetch")
     assert module.GMAIL_ADDR == "alice@example.com"
+
+
+def test_arxiv_url_phrase_quotes_multiword(isolated_profile, monkeypatch):
+    """Multi-word arxiv queries must be phrase-quoted so arXiv does not AND the
+    tokens across every field (which buries topical papers under loose matches)."""
+    _, module = isolated_profile
+
+    captured_urls: list[str] = []
+
+    class _StubResp:
+        def read(self):
+            return b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"></feed>'
+
+    def _fake_urlopen(url, timeout=None):
+        captured_urls.append(url)
+        return _StubResp()
+
+    monkeypatch.setattr(module, "urlopen", _fake_urlopen)
+    # Reset the throttle so the sleep is skipped.
+    monkeypatch.setattr(module, "_LAST_ARXIV_CALL_AT", 0.0, raising=False)
+    module.search_arxiv_by_keyword("speculative decoding", max_results=5)
+    assert captured_urls, "search_arxiv_by_keyword did not call urlopen"
+    assert "%22speculative+decoding%22" in captured_urls[0] or \
+           "%22speculative%20decoding%22" in captured_urls[0], (
+        f"multi-word arxiv query is not phrase-quoted: {captured_urls[0]}"
+    )
+
+
+def test_arxiv_url_no_quotes_for_single_word(isolated_profile, monkeypatch):
+    _, module = isolated_profile
+
+    captured_urls: list[str] = []
+
+    class _StubResp:
+        def read(self):
+            return b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"></feed>'
+
+    def _fake_urlopen(url, timeout=None):
+        captured_urls.append(url)
+        return _StubResp()
+
+    monkeypatch.setattr(module, "urlopen", _fake_urlopen)
+    monkeypatch.setattr(module, "_LAST_ARXIV_CALL_AT", 0.0, raising=False)
+    module.search_arxiv_by_keyword("vLLM", max_results=5)
+    assert captured_urls
+    assert "%22" not in captured_urls[0], (
+        f"single-word query should not be phrase-quoted: {captured_urls[0]}"
+    )
+
+
+def test_stage_persist_flushes_to_disk(isolated_profile):
+    profile_home, module = isolated_profile
+    module.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    new_candidates: list = []
+    cand = {"id": "stage-test-1", "title": "stage persist", "url": "https://x"}
+    module._stage_persist(new_candidates, cand)
+    # In-memory list must contain the candidate exactly once.
+    assert len(new_candidates) == 1
+    # And it must already be on disk after the single call.
+    content = module.CANDIDATES_PATH.read_text()
+    assert '"stage-test-1"' in content
+    # Second call with same object is a no-op (idempotent).
+    module._stage_persist(new_candidates, cand)
+    assert len(new_candidates) == 1
+    assert content.count("stage-test-1") <= 1

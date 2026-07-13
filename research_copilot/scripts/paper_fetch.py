@@ -153,6 +153,11 @@ def _fetch(url: str, timeout: int = 15) -> str:
         return ""
 
 
+class _RateLimitedError(RuntimeError):
+    """Raised when an upstream API returns 429 so per-topic loops can bail out
+    rather than continuing to hammer the endpoint."""
+
+
 def _fetch_via_proxy(url: str, timeout: int = 20) -> str:
     """Fetch a URL through the Mihomo proxy for GFW-blocked sources."""
     if not PROXY_URL:
@@ -335,6 +340,9 @@ def fetch_semantic_scholar(query: str, limit: int = 5) -> list:
     """
     Search Semantic Scholar API. Free, no key required for basic search.
     Returns papers ranked by relevance with citation counts.
+
+    Raises ``_RateLimitedError`` on HTTP 429 so callers can back off for
+    the rest of the run rather than hammering the endpoint per topic.
     """
     import urllib.parse
     q = urllib.parse.quote(query)
@@ -342,7 +350,19 @@ def fetch_semantic_scholar(query: str, limit: int = 5) -> list:
         f"https://api.semanticscholar.org/graph/v1/paper/search"
         f"?query={q}&limit={limit}&fields=title,url,authors,year,externalIds,publicationDate"
     )
-    raw = _fetch(url)
+    req = Request(url, headers=HTTP_HEADERS)
+    try:
+        resp = urlopen(req, timeout=15)
+        raw = resp.read().decode("utf-8", errors="replace")
+    except HTTPError as e:
+        if e.code == 429:
+            raise _RateLimitedError(f"Semantic Scholar 429 on query {query!r}") from None
+        print(f"  fetch failed: {url[:60]} — {e}", file=sys.stderr)
+        return []
+    except (URLError, OSError) as e:
+        print(f"  fetch failed: {url[:60]} — {e}", file=sys.stderr)
+        return []
+
     if not raw:
         return []
 
@@ -431,15 +451,52 @@ def fetch_github_trending(language: str = "python") -> list:
 def search_arxiv_by_keyword(query: str, max_results: int = 5) -> list:
     """Search arXiv API directly. Free, no key needed.
     Marked as fallback because raw arXiv is noisy (AIGC slop).
+
+    Enforces a ~3s inter-request delay (per arXiv API TOS) so batch queries
+    don't hit HTTP 429 after the first few. Retries once on 429 with a
+    longer backoff.
     """
     import urllib.parse
-    q = urllib.parse.quote(query)
-    url = f"https://export.arxiv.org/api/query?search_query=all:{q}&start=0&max_results={max_results}&sortBy=submittedDate&sortOrder=descending"
+    # arXiv recommends >=3s between requests. Sleep before every call so
+    # per-topic batch loops don't burst.
+    _now = time.monotonic()
+    global _LAST_ARXIV_CALL_AT  # type: ignore[name-defined]
     try:
-        resp = urlopen(url, timeout=15)
-        xml = resp.read().decode()
-    except (URLError, OSError) as e:
-        print(f"  arXiv error: {e}", file=sys.stderr)
+        _last = _LAST_ARXIV_CALL_AT  # type: ignore[name-defined]
+    except NameError:
+        _last = 0.0
+    gap = _now - _last
+    if gap < 3.5:
+        time.sleep(3.5 - gap)
+    _q_raw = query.strip()
+    # Wrap multi-word queries as a phrase so arxiv does not AND the tokens across all fields
+    # (unquoted "speculative decoding" matches any paper containing both words anywhere, which
+    # buries topical papers under thousands of loose matches).
+    if " " in _q_raw:
+        q = urllib.parse.quote(f'"{_q_raw}"')
+    else:
+        q = urllib.parse.quote(_q_raw)
+    url = f"https://export.arxiv.org/api/query?search_query=all:{q}&start=0&max_results={max_results}&sortBy=submittedDate&sortOrder=descending"
+    attempt_max = 2
+    xml = ""
+    for attempt in range(1, attempt_max + 1):
+        try:
+            resp = urlopen(url, timeout=15)
+            xml = resp.read().decode()
+            break
+        except HTTPError as e:
+            if e.code == 429 and attempt < attempt_max:
+                time.sleep(15)
+                continue
+            print(f"  arXiv error: {e}", file=sys.stderr)
+            _LAST_ARXIV_CALL_AT = time.monotonic()  # type: ignore[name-defined]
+            return []
+        except (URLError, OSError) as e:
+            print(f"  arXiv error: {e}", file=sys.stderr)
+            _LAST_ARXIV_CALL_AT = time.monotonic()  # type: ignore[name-defined]
+            return []
+    _LAST_ARXIV_CALL_AT = time.monotonic()  # type: ignore[name-defined]
+    if not xml:
         return []
 
     papers = []
@@ -839,6 +896,17 @@ def to_candidate(item: dict, topic_name: str) -> dict:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+
+def _stage_persist(new_candidates: list, cand: dict) -> None:
+    """Append a fresh candidate to the in-memory list AND flush it to disk
+    immediately so a mid-run interrupt (timeout, SIGTERM) doesn't discard the
+    work of earlier stages. Idempotent when combined with _is_duplicate."""
+    if cand.get('_persisted'):
+        return
+    new_candidates.append(cand)
+    _append_jsonl(CANDIDATES_PATH, cand)
+    cand['_persisted'] = True
+
 def main():
     topics = _load_json(TOPICS_PATH, {"topics": []})
     source_registry = _load_json(SOURCE_REGISTRY_PATH, {"sources": []})
@@ -873,17 +941,43 @@ def main():
                 if not _is_duplicate(cand, existing + new_candidates):
                     # Boost source tier — HF is top quality
                     cand["source_tier"] = 1.0
-                    new_candidates.append(cand)
+                    _stage_persist(new_candidates, cand)
 
-    # 2. Semantic Scholar — citation-signaled results per topic
+    # 2. Semantic Scholar — citation-signaled results per topic.
+    # Uses ``max(2, KEYWORDS_PER_TOPIC)`` include keywords per topic and bails
+    # out of the whole S2 stage on the first HTTP 429 so we don't burn the
+    # rest of the topics on retries.
     print("Fetching Semantic Scholar...", file=sys.stderr)
+    _S2_KW_LIMIT = int(os.environ.get("RESEARCH_COPILOT_S2_KEYWORDS_PER_TOPIC", "5") or "5")
+    _s2_rate_limited = False
+    _s2_added = 0
     for topic in active_topics:
-        keywords = topic.get("include", [])
-        for kw in keywords[:2]:
-            for result in fetch_semantic_scholar(kw, limit=5):
+        if _s2_rate_limited:
+            break
+        # Prefer the topic name plus the top-N include keywords, deduped and
+        # in original order so priority keywords go first.
+        seen: set = set()
+        kw_pool: list = []
+        for kw in [topic.get("name", "")] + (topic.get("include") or []):
+            k = (kw or "").strip()
+            if k and k.lower() not in seen:
+                seen.add(k.lower())
+                kw_pool.append(k)
+            if len(kw_pool) >= _S2_KW_LIMIT:
+                break
+        for kw in kw_pool:
+            try:
+                results = fetch_semantic_scholar(kw, limit=5)
+            except _RateLimitedError as e:
+                print(f"  Semantic Scholar rate-limited; skipping remaining S2 queries this run. {e}", file=sys.stderr)
+                _s2_rate_limited = True
+                break
+            for result in results:
                 cand = to_candidate(result, topic["name"])
                 if not _is_duplicate(cand, existing + new_candidates):
-                    new_candidates.append(cand)
+                    _stage_persist(new_candidates, cand)
+                    _s2_added += 1
+    print(f"  → semantic_scholar added {_s2_added} candidates", file=sys.stderr)
 
     # 3. GitHub Trending for AI repos
     print("Fetching GitHub Trending...", file=sys.stderr)
@@ -894,7 +988,7 @@ def main():
             if any(kw.lower() in text for kw in keywords):
                 cand = to_candidate(repo, topic["name"])
                 if not _is_duplicate(cand, existing + new_candidates):
-                    new_candidates.append(cand)
+                    _stage_persist(new_candidates, cand)
 
     # 4. AlphaXiv — recently discussed papers
     print("Fetching AlphaXiv...", file=sys.stderr)
@@ -907,7 +1001,7 @@ def main():
             if any(kw.lower() in text for kw in keywords):
                 cand = to_candidate(ap, topic["name"])
                 if not _is_duplicate(cand, existing + new_candidates):
-                    new_candidates.append(cand)
+                    _stage_persist(new_candidates, cand)
 
     # 5. Gmail Newsletters — curated emails from ResearchFeeds
     print("Fetching Newsletters...", file=sys.stderr)
@@ -920,7 +1014,7 @@ def main():
             if any(kw.lower() in text for kw in keywords) or not text:
                 cand = to_candidate(np, topic["name"])
                 if not _is_duplicate(cand, existing + new_candidates):
-                    new_candidates.append(cand)
+                    _stage_persist(new_candidates, cand)
 
     # 6. Source Registry feeds — lab/company/researcher/community signals
     print("Fetching Source Registry feeds...", file=sys.stderr)
@@ -933,7 +1027,7 @@ def main():
         topic_name = item.get("matched_topic") or "Research Signal"
         cand = to_candidate(item, topic_name)
         if not _is_duplicate(cand, existing + new_candidates):
-            new_candidates.append(cand)
+            _stage_persist(new_candidates, cand)
 
     # 7. Source Registry directed search — curated domains per topic
     print("Fetching Source Registry Tavily searches...", file=sys.stderr)
@@ -941,35 +1035,69 @@ def main():
         for result in fetch_tavily_for_source_registry(topic, sources, max_results=4):
             cand = to_candidate(result, topic.get("name", "Research Signal"))
             if not _is_duplicate(cand, existing + new_candidates):
-                new_candidates.append(cand)
+                _stage_persist(new_candidates, cand)
 
-    # 8. arXiv fallback — broad coverage but noisy. Disabled by default.
+    # 8. arXiv fallback — broad coverage but noisy. Off by default.
+    # When enabled, uses ``max(2, RESEARCH_COPILOT_ARXIV_KEYWORDS_PER_TOPIC)``
+    # include keywords per topic so niche topics with priority terms deeper in
+    # the list (e.g. ``speculative decoding`` at position 7) still get covered.
     if ENABLE_ARXIV_FALLBACK:
         print("Fetching arXiv (fallback)...", file=sys.stderr)
+        _arxiv_kw_limit = int(os.environ.get("RESEARCH_COPILOT_ARXIV_KEYWORDS_PER_TOPIC", "5") or "5")
+        _arxiv_added = 0
         for topic in active_topics:
             name = topic.get("name", "")
-            keywords = topic.get("include", []) or [name]
-            for kw in keywords[:2]:
-                for result in search_arxiv_by_keyword(kw, max_results=5):
+            seen: set = set()
+            kw_pool: list = []
+            for kw in [name] + (topic.get("include") or []):
+                k = (kw or "").strip()
+                if k and k.lower() not in seen:
+                    seen.add(k.lower())
+                    kw_pool.append(k)
+                if len(kw_pool) >= _arxiv_kw_limit:
+                    break
+            for kw in kw_pool:
+                for result in search_arxiv_by_keyword(kw, max_results=30):
                     cand = to_candidate(result, name)
                     if not _is_duplicate(cand, existing + new_candidates):
-                        new_candidates.append(cand)
+                        _stage_persist(new_candidates, cand)
+                        _arxiv_added += 1
+        print(f"  → arxiv_api_fallback added {_arxiv_added} candidates", file=sys.stderr)
     else:
         print("Skipping arXiv fallback (RESEARCH_COPILOT_ARXIV_FALLBACK=0).", file=sys.stderr)
 
-    # 9. Tavily — broad gated quality domains, per topic
+    # 9. Tavily — broad gated quality domains, per topic.
+    # Same keyword-coverage expansion as the S2 stage so niche include-list
+    # terms actually get queried.
     print("Fetching Tavily...", file=sys.stderr)
+    _tavily_kw_limit = int(os.environ.get("RESEARCH_COPILOT_TAVILY_KEYWORDS_PER_TOPIC", "3") or "3")
+    _tavily_added = 0
     for topic in active_topics:
         name = topic.get("name", "")
-        primary_kw = (topic.get("include", []) or [name])[0]
-        for result in fetch_tavily(primary_kw, max_results=5):
-            cand = to_candidate(result, name)
-            if not _is_duplicate(cand, existing + new_candidates):
-                new_candidates.append(cand)
+        seen: set = set()
+        kw_pool: list = []
+        for kw in [name] + (topic.get("include") or []):
+            k = (kw or "").strip()
+            if k and k.lower() not in seen:
+                seen.add(k.lower())
+                kw_pool.append(k)
+            if len(kw_pool) >= _tavily_kw_limit:
+                break
+        for kw in kw_pool:
+            for result in fetch_tavily(kw, max_results=5):
+                cand = to_candidate(result, name)
+                if not _is_duplicate(cand, existing + new_candidates):
+                    _stage_persist(new_candidates, cand)
+                    _tavily_added += 1
+    print(f"  → tavily added {_tavily_added} candidates", file=sys.stderr)
 
-    # Append all new candidates
+    # Append any final in-memory candidates that weren't persisted yet.
+    # Each per-source stage above already flushes as it goes, so this loop is
+    # a belt-and-suspenders no-op on the happy path.
     for c in new_candidates:
-        _append_jsonl(CANDIDATES_PATH, c)
+        if not c.get('_persisted'):
+            _append_jsonl(CANDIDATES_PATH, c)
+            c['_persisted'] = True
 
     # Update state
     state = _load_json(STATE_PATH)
