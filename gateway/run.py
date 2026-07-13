@@ -12709,17 +12709,70 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _nl_command_router_specs(self, allowed_commands: list[str]) -> str:
         specs = {
-            "paper": "Research Copilot. Use /paper topics, /paper history [n], /paper health, /paper now, /paper save <id>, /paper skip <id> [reason], /paper read <id>, /paper feedback <id> <text>.",
-            "s": "Timed reminders. Use /s status, /s list, /s add \"title\" --when \"time expression\" [--notes \"...\"], /s done <id>, /s rm <id>, /s pause <id>, /s resume <id>.",
-            "th": "Thought incubation. Use /th status, /th list, /th show <id>, /th done <id>, /th rm <id>, /th pause <id>, /th resume <id>.",
+            "paper": (
+                "Research Copilot for research papers and the user's science profile.\n"
+                "  Structured subcommands:\n"
+                "    /paper topics — list active research topics.\n"
+                "    /paper history [n] — recent recommendations.\n"
+                "    /paper health — weekly feedback summary.\n"
+                "    /paper now — trigger today's paper pick and deliver it.\n"
+                "    /paper save <id> — save recommendation.\n"
+                "    /paper skip <id> [reason] — skip recommendation.\n"
+                "    /paper read <id> — mark read.\n"
+                "    /paper feedback <id> <text> — free-text feedback on a paper.\n"
+                "  Open-ended question about the user's paper/research data:\n"
+                "    /paper ask <question> — one-shot Q&A grounded in research_profile / topics / recommendations / saves / interactions.\n"
+                "    /paper discuss [<paper_id>] [<question>] — open a sticky Q&A session (30 min).\n"
+                "  Chinese cue words that route to /paper ask: 查询/查看/看看/告诉我 + '科研画像'/'research profile'/'我的方向'/'关注的主题'/'为什么推荐'/'保存的论文' etc."
+            ),
+            "s": (
+                "Timed reminders (schedules).\n"
+                "  Structured subcommands:\n"
+                "    /s status — active reminders overview.\n"
+                "    /s list [active|paused|done] — list reminders.\n"
+                "    /s add \"title\" --when \"time expression\" [--notes \"...\"] — new reminder.\n"
+                "    /s done <id> — mark done.\n"
+                "    /s rm <id> — delete.\n"
+                "    /s pause <id> / /s resume <id>.\n"
+                "  Open-ended question about the user's schedule data:\n"
+                "    /s ask <question> — one-shot Q&A grounded in current + recent tasks.\n"
+                "    /s discuss [<task_id>] [<question>] — sticky Q&A about a task.\n"
+                "  Chinese cue words that route to /s ask: 我的日程/我最近的提醒/查看我的任务/最近还有什么要做."
+            ),
+            "th": (
+                "Thought incubation / ideas.\n"
+                "  Structured subcommands:\n"
+                "    /th status — active thoughts overview.\n"
+                "    /th list [active|dormant|archived] — list thoughts.\n"
+                "    /th show <id> — show a thought.\n"
+                "    /th done <id> — archive.\n"
+                "    /th rm <id> — delete.\n"
+                "    /th pause <id> / /th resume <id>.\n"
+                "  Open-ended discussion about the user's thoughts:\n"
+                "    /th ask <question> — one-shot Q&A grounded in the user's thoughts.\n"
+                "    /th discuss [<thought_id>] [<question>] — sticky discussion, deep-dive on an idea.\n"
+                "  Chinese cue words that route to /th ask or /th discuss: 我的想法/我的灵感/最近的思考/帮我聊聊这个想法/展开这个 idea."
+            ),
             "status": "Gateway/session status. Use /status.",
             "help": "Help. Use /help.",
             "whoami": "Show caller access tier and allowed commands. Use /whoami.",
+            "end": "End the current sticky domain discussion (opened by /paper|s|th discuss or /paper|s|th ask). Use /end. Prefer /end for phrases like '结束', '算了', '不聊了', 'stop', 'exit'.",
         }
         lines = []
         for cmd in allowed_commands:
             if cmd in specs:
                 lines.append(f"/{cmd}: {specs[cmd]}")
+        # Global routing guidance: if in doubt, prefer /paper ask, /s ask, /th ask
+        # for open-ended questions rather than deny — the ask handler is
+        # sandboxed and safe.
+        lines.append(
+            "\nRouting guidance:\n"
+            "- If the user asks an open-ended question about their research data (profile/topics/recommendations/saves), route to /paper ask.\n"
+            "- If about their schedule/tasks/reminders, route to /s ask.\n"
+            "- If about their thoughts/ideas/incubation, route to /th ask.\n"
+            "- If the user wants to STOP an ongoing discussion (结束/算了/退出/不聊了/stop/exit), route to /end.\n"
+            "- Only return deny for messages that are unrelated to paper/schedule/thought data (small talk, weather, general knowledge, coding help, model-config changes, etc.)."
+        )
         return "\n".join(lines)
 
     def _validated_routed_command(self, route: object, policy: object, source: SessionSource) -> Optional[str]:
