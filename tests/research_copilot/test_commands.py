@@ -118,21 +118,30 @@ def test_paper_now_triggers_daily_paper_pick_cron(tmp_path, monkeypatch):
     home = tmp_path / "profile-a"
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    from cron.jobs import create_job, get_job
+    # cron.jobs captures HERMES_DIR at module import time (see the frozen
+    # module-level CRON_DIR/JOBS_FILE constants). Whichever test imports it
+    # first pins the path for the whole session, so tests relying only on
+    # monkeypatch.setenv silently write to the previous test's tmpdir or the
+    # real ~/.hermes. Mirror the production code path in _trigger_daily_pick
+    # and wrap create_job in use_cron_store(home) so writes land where reads
+    # will look.
+    from cron.jobs import create_job, get_job, use_cron_store
 
-    job = create_job(
-        prompt="pick a paper",
-        schedule="0 8 * * *",
-        name="daily-paper-pick",
-        deliver="weixin",
-    )
+    with use_cron_store(home):
+        job = create_job(
+            prompt="pick a paper",
+            schedule="0 8 * * *",
+            name="daily-paper-pick",
+            deliver="weixin",
+        )
 
     from research_copilot.commands import handle_paper_command
 
     output = handle_paper_command("now")
 
     assert "Triggered daily-paper-pick" in output
-    updated = get_job(job["id"])
+    with use_cron_store(home):
+        updated = get_job(job["id"])
     assert updated is not None
     assert updated["next_run_at"] is not None
 
