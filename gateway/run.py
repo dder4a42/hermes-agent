@@ -12512,6 +12512,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not text:
             return None
 
+        # Preempt: if this user has an active /s draft session, route their
+        # message to /s continue so the LLM slot-filler picks it up. This
+        # runs before the domain_discussion check so a mid-draft user can
+        # finish their reminder even if a /paper or /s discussion is also
+        # active in some other channel.
+        try:
+            from gateway.task_draft import has_active as _has_active_draft
+        except ImportError:
+            _has_active_draft = None  # type: ignore
+        if _has_active_draft is not None and _has_active_draft(source.user_id or ""):
+            from dataclasses import replace
+            return replace(
+                event,
+                text=f"/s continue {text}",
+                metadata={
+                    **(event.metadata or {}),
+                    "nl_command_router": {
+                        "decision": "continue_task_draft",
+                        "original_text": text,
+                    },
+                },
+            )
+
         # Phase B: if a discussion is active in some domain, continue plain
         # text in that domain's ``ask`` handler instead of routing via the LLM.
         # End-intent phrases still fall through to /end so the sticky session
@@ -12730,14 +12753,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "  Structured subcommands:\n"
                 "    /s status — active reminders overview.\n"
                 "    /s list [active|paused|done] — list reminders.\n"
-                "    /s add \"title\" --when \"time expression\" [--notes \"...\"] — new reminder.\n"
+                "    /s add <free text> — create a reminder. Prefer passing the whole\n"
+                "      user phrase VERBATIM after 'add' (no --when quoting) so the\n"
+                "      downstream LLM extractor can pull title + time + attendees +\n"
+                "      url + checklist in one shot and ask any follow-up itself. Only\n"
+                "      use the flag form (--when / --url / --where / --attendees /\n"
+                "      --tags / --remind-before / --checklist) if the user's phrasing\n"
+                "      is genuinely structured. Example: user says '明天下午3点跟 Bob\n"
+                "      开设计评审' -> emit /s add 明天下午3点跟 Bob 开设计评审.\n"
                 "    /s done <id> — mark done.\n"
                 "    /s rm <id> — delete.\n"
                 "    /s pause <id> / /s resume <id>.\n"
+                "    /s check <id> <item> — tick a checklist item done.\n"
+                "    /s uncheck <id> <item> — untick a checklist item.\n"
+                "    /s item add <id> \"text\" / /s item rm <id> <ref> — edit checklist.\n"
+                "    /s cancel — abort the current /s draft session (if any).\n"
                 "  Open-ended question about the user's schedule data:\n"
                 "    /s ask <question> — one-shot Q&A grounded in current + recent tasks.\n"
                 "    /s discuss [<task_id>] [<question>] — sticky Q&A about a task.\n"
-                "  Chinese cue words that route to /s ask: 我的日程/我最近的提醒/查看我的任务/最近还有什么要做."
+                "  Chinese cue words that route to /s ask: 我的日程/我最近的提醒/查看我的任务/最近还有什么要做.\n"
+                "  Chinese cue words that route to /s add: 提醒我/加个提醒/加个日程/明天X点.../记一下要做..."
             ),
             "th": (
                 "Thought incubation / ideas.\n"

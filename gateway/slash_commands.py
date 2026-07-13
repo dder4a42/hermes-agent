@@ -4715,40 +4715,56 @@ class GatewaySlashCommandsMixin:
 
         if subcmd == "add":
             from tools.thought_tools import parse_s_add_args
+            from gateway.task_draft import start_or_advance
             rest = args[3:].strip() if len(args) > 3 else ""
             parsed = parse_s_add_args(rest)
-            if not parsed["schedule_raw"]:
+
+            # Fully-specified via flags -> commit directly, no draft session.
+            if parsed["title"] and parsed["schedule_raw"]:
+                task = add_task(
+                    title=parsed["title"],
+                    schedule_raw=parsed["schedule_raw"],
+                    notes=parsed["notes"],
+                    url=parsed["url"],
+                    location=parsed["location"],
+                    attendees=parsed["attendees"],
+                    tags=parsed["tags"],
+                    remind_before_min=parsed["remind_before"],
+                    checklist=parsed["checklist"],
+                )
+                perr = (task.get("parse") or {}).get("error")
+                lines = [f"✅ Reminder set! **{parsed['title']}** — {parsed['schedule_raw']} (`{task['id']}`)"]
+                if task.get("scheduled_at"):
+                    lines.append(f"⏰ {task['scheduled_at']}")
+                if perr:
+                    lines.append(f"⚠ 时间解析失败: {perr}")
+                if task.get("remind_before_min"):
+                    lines.append(f"🔔 会前 {task['remind_before_min']} 分钟提醒准备")
+                if task.get("checklist"):
+                    lines.append("📋 checklist:")
+                    for it in task["checklist"]:
+                        lines.append(f"  [ ] {it['text']}")
+                return "\n".join(lines)
+
+            if not rest.strip():
                 return (
                     'Usage: `/s add "title" --when "tomorrow 2pm"`\n'
-                    'Optional: --notes / --url / --where / --attendees a,b / --tags t1,t2 '
-                    '/ --remind-before 30m / --checklist "a;b;c"'
+                    'Or just say what you want ("明天下午3点跟 Bob 开会") and I will follow up.'
                 )
-            if not parsed["title"]:
-                return "Missing title. Put the reminder text before the flags."
-            task = add_task(
-                title=parsed["title"],
-                schedule_raw=parsed["schedule_raw"],
-                notes=parsed["notes"],
-                url=parsed["url"],
-                location=parsed["location"],
-                attendees=parsed["attendees"],
-                tags=parsed["tags"],
-                remind_before_min=parsed["remind_before"],
-                checklist=parsed["checklist"],
-            )
-            perr = (task.get("parse") or {}).get("error")
-            lines = [f"✅ Reminder set! **{parsed['title']}** — {parsed['schedule_raw']} (`{task['id']}`)"]
-            if task.get("scheduled_at"):
-                lines.append(f"⏰ {task['scheduled_at']}")
-            if perr:
-                lines.append(f"⚠ 时间解析失败: {perr}")
-            if task.get("remind_before_min"):
-                lines.append(f"🔔 会前 {task['remind_before_min']} 分钟提醒准备")
-            if task.get("checklist"):
-                lines.append("📋 checklist:")
-                for it in task["checklist"]:
-                    lines.append(f"  [ ] {it['text']}")
-            return "\n".join(lines)
+
+            # Partial input -> open a draft; extractor + LLM decide next question.
+            user_id = getattr(getattr(event, "source", None), "user_id", "") or ""
+            if not user_id:
+                return "Missing user context; cannot start interactive draft."
+            seed = {}
+            for k in ("title", "schedule_raw", "notes", "url", "location",
+                     "attendees", "tags", "checklist"):
+                if parsed.get(k):
+                    seed[k] = parsed[k]
+            if parsed.get("remind_before"):
+                seed["remind_before_min"] = parsed["remind_before"]
+            reply = start_or_advance(user_id, rest, seed=seed)
+            return reply.text
 
         if subcmd in ("done", "finish"):
             tid = tokens[1].strip() if len(tokens) > 1 else ""
@@ -4827,7 +4843,26 @@ class GatewaySlashCommandsMixin:
                 return f"Item {ref!r} not found on `{tid}`"
             return "Usage: `/s item [add|rm] <task_id> ...`"
 
-        return "Usage: `/s [status|add|list|done|rm|pause|resume|check|uncheck|item]`"
+        if subcmd in ("cancel", "abort", "取消"):
+            from gateway.task_draft import cancel as _cancel_draft
+            user_id = getattr(getattr(event, "source", None), "user_id", "") or ""
+            if user_id and _cancel_draft(user_id):
+                return "已取消当前草稿。"
+            return "（没有进行中的草稿。）"
+
+        if subcmd == "continue":
+            # Internal subcommand used by the free-text router when a user
+            # has an active draft. Passes the raw message back into the
+            # slot-filler.
+            from gateway.task_draft import start_or_advance
+            user_id = getattr(getattr(event, "source", None), "user_id", "") or ""
+            if not user_id:
+                return "Missing user context; cannot continue draft."
+            text = args[len("continue"):].strip() if args.lower().startswith("continue") else args
+            reply = start_or_advance(user_id, text)
+            return reply.text
+
+        return "Usage: `/s [status|add|list|done|rm|pause|resume|check|uncheck|item|cancel]`"
 
     async def _handle_paper_command(self, event: MessageEvent) -> str:
         """Handle /paper in the gateway — Research Copilot controls."""
