@@ -34,7 +34,7 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "deepseek-chat"
+_DEFAULT_MODEL = "deepseek-v4-flash"
 _DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 _DEFAULT_TIMEOUT_S = 20.0
 _DEFAULT_MAX_FUTURE_YEARS = 1
