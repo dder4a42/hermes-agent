@@ -12608,6 +12608,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_db=None, skip_memory=True, skip_context_files=True, and
         enabled_toolsets=[] so router inputs/outputs don't pollute the user's
         conversation and the model cannot take side effects.
+
+        The router's model/provider defaults to the profile's default model, but
+        can be pinned via ``platforms.<platform>.extra.nl_command_router_model``
+        (and ``nl_command_router_provider`` / ``nl_command_router_base_url``) so
+        the router stays fast and isolated from the main model's rate limits or
+        drift.
         """
         import json
         from run_agent import AIAgent
@@ -12615,9 +12621,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         cfg = load_config() or {}
         model_cfg = cfg.get("model") or {}
-        model = str(model_cfg.get("default") or "")
-        provider = model_cfg.get("provider")
-        base_url = model_cfg.get("base_url")
+        default_model = str(model_cfg.get("default") or "")
+        default_provider = model_cfg.get("provider")
+        default_base_url = model_cfg.get("base_url")
+
+        extra = self._platform_extra_for_source(source)
+        model = str(extra.get("nl_command_router_model") or "").strip() or default_model
+        provider = extra.get("nl_command_router_provider") or default_provider
+        base_url = extra.get("nl_command_router_base_url") or default_base_url
 
         specs = self._nl_command_router_specs(allowed_commands)
         system = (
@@ -12635,35 +12646,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             f"Allowed command names: {', '.join('/' + c for c in allowed_commands)}\n"
             f"User message: {text!r}\n"
         )
-        agent = AIAgent(
-            model=model,
-            provider=provider,
-            base_url=base_url,
-            max_iterations=1,
-            enabled_toolsets=[],
-            disabled_toolsets=[],
-            quiet_mode=True,
-            skip_memory=True,
-            skip_context_files=True,
-            session_db=None,
-            max_tokens=512,
-            ephemeral_system_prompt=system,
-            platform=getattr(source.platform, "value", None) if source else None,
-            user_id=getattr(source, "user_id", None) if source else None,
-            chat_id=getattr(source, "chat_id", None) if source else None,
-            chat_type=getattr(source, "chat_type", None) if source else None,
-        )
-        result = agent.run_conversation(prompt, conversation_history=[])
+        try:
+            agent = AIAgent(
+                model=model,
+                provider=provider,
+                base_url=base_url,
+                max_iterations=1,
+                enabled_toolsets=[],
+                disabled_toolsets=[],
+                quiet_mode=True,
+                skip_memory=True,
+                skip_context_files=True,
+                session_db=None,
+                max_tokens=512,
+                ephemeral_system_prompt=system,
+                platform=getattr(source.platform, "value", None) if source else None,
+                user_id=getattr(source, "user_id", None) if source else None,
+                chat_id=getattr(source, "chat_id", None) if source else None,
+                chat_type=getattr(source, "chat_type", None) if source else None,
+            )
+        except Exception:
+            logger.warning(
+                "NL router: agent init failed (provider=%s model=%s); denying",
+                provider, model, exc_info=True,
+            )
+            return {"decision": "deny", "reason": "router agent init failed"}
+        try:
+            result = agent.run_conversation(prompt, conversation_history=[])
+        except Exception as exc:
+            # Router failures should be visible in gateway logs so we can tell
+            # them apart from safety denials.
+            logger.warning(
+                "NL router: model call failed (provider=%s model=%s): %s",
+                provider, model, exc,
+            )
+            return {"decision": "deny", "reason": f"router call failed: {type(exc).__name__}"}
         raw = str((result or {}).get("final_response") or "").strip()
+        if not raw:
+            logger.warning(
+                "NL router: empty response (provider=%s model=%s); denying",
+                provider, model,
+            )
+            return {"decision": "deny", "reason": "router returned empty response"}
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
             match = re.search(r"\{.*\}", raw, flags=re.S)
             if not match:
+                logger.warning(
+                    "NL router: non-json response (provider=%s model=%s): %r",
+                    provider, model, raw[:200],
+                )
                 return {"decision": "deny", "reason": "router returned non-json"}
             try:
                 return json.loads(match.group(0))
             except json.JSONDecodeError:
+                logger.warning(
+                    "NL router: invalid embedded json (provider=%s model=%s)",
+                    provider, model,
+                )
                 return {"decision": "deny", "reason": "router returned invalid json"}
 
     def _nl_command_router_specs(self, allowed_commands: list[str]) -> str:

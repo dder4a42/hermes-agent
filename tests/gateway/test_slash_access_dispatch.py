@@ -975,3 +975,128 @@ async def test_expired_discussion_does_not_route(tmp_path, monkeypatch):
     # With router off and no valid active discussion, plain text is denied.
     assert result is not None
     assert "功能限定模式" in result
+
+
+# ---------------------------------------------------------------------------
+# NL router model/provider pinning via platform extra
+# ---------------------------------------------------------------------------
+
+
+def test_llm_router_uses_pinned_model_and_provider(monkeypatch):
+    """Router must respect nl_command_router_model / _provider platform extras."""
+    from gateway.run import GatewayRunner
+    from types import SimpleNamespace
+
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+            "nl_command_router_model": "gpt-5.4-mini",
+            "nl_command_router_provider": "openai-codex",
+        },
+    )
+
+    captured = {}
+
+    def fake_agent(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            run_conversation=lambda *a, **kw: {
+                "final_response": '{"decision":"allow","command":"/paper now"}'
+            }
+        )
+
+    monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+    # Ensure hermes_cli.config.load_config returns a benign default so the
+    # code that reads model_cfg doesn't override.
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {"default": "some-other-default", "provider": "some-other-provider"}},
+    )
+
+    source = _make_source(platform=Platform.WEIXIN, user_id="user")
+    route = runner._llm_route_free_text_to_command(
+        "推荐一篇论文",
+        ["paper", "s", "th", "status", "help", "whoami", "end"],
+        source,
+    )
+
+    assert route == {"decision": "allow", "command": "/paper now"}
+    assert captured["model"] == "gpt-5.4-mini"
+    assert captured["provider"] == "openai-codex"
+
+
+def test_llm_router_falls_back_to_profile_default_when_no_pin(monkeypatch):
+    from gateway.run import GatewayRunner
+    from types import SimpleNamespace
+
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+            # no *_model / *_provider extras
+        },
+    )
+
+    captured = {}
+
+    def fake_agent(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            run_conversation=lambda *a, **kw: {
+                "final_response": '{"decision":"allow","command":"/status"}'
+            }
+        )
+
+    monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {"default": "profile-default-model", "provider": "profile-provider"}},
+    )
+
+    source = _make_source(platform=Platform.WEIXIN, user_id="user")
+    runner._llm_route_free_text_to_command(
+        "运行状态",
+        ["paper", "s", "th", "status", "help", "whoami", "end"],
+        source,
+    )
+    assert captured["model"] == "profile-default-model"
+    assert captured["provider"] == "profile-provider"
+
+
+def test_llm_router_returns_deny_on_call_failure(monkeypatch):
+    from gateway.run import GatewayRunner
+    from types import SimpleNamespace
+
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+        },
+    )
+
+    def raising_agent(**kwargs):
+        def _raise(*a, **kw):
+            raise TimeoutError("simulated 90s timeout")
+        return SimpleNamespace(run_conversation=_raise)
+
+    monkeypatch.setattr("run_agent.AIAgent", raising_agent)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {"default": "gpt-5.6-luna", "provider": "openai-codex"}},
+    )
+
+    source = _make_source(platform=Platform.WEIXIN, user_id="user")
+    route = runner._llm_route_free_text_to_command(
+        "推送论文",
+        ["paper", "s", "th", "status", "help", "whoami", "end"],
+        source,
+    )
+    assert route["decision"] == "deny"
+    assert "router call failed" in route["reason"]
