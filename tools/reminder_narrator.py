@@ -57,6 +57,13 @@ def _default_llm_call(system: str, user: str, model: str, base_url: str,
         ],
         max_tokens=800,
         temperature=0.5,
+        # deepseek-v4-flash defaults to thinking mode, which reliably
+        # over-thinks this one-sentence rewrite and burns through max_tokens
+        # before emitting any visible text (see the pre-mode note below).
+        # Narration has no reasoning to do, so switch to non-thinking mode.
+        # Passed via extra_body because the OpenAI-compatible SDK has no
+        # first-class "thinking" field.
+        extra_body={"thinking": {"type": "disabled"}},
     )
     return resp.choices[0].message.content or ""
 
