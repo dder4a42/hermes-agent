@@ -158,22 +158,41 @@ class _RateLimitedError(RuntimeError):
     rather than continuing to hammer the endpoint."""
 
 
-def _fetch_via_proxy(url: str, timeout: int = 20) -> str:
-    """Fetch a URL through the Mihomo proxy for GFW-blocked sources."""
+def _fetch_via_proxy(url: str, timeout: int = 20, max_attempts: int = 3) -> str:
+    """Fetch a URL through the Mihomo proxy for GFW-blocked sources.
+
+    Retries up to ``max_attempts`` times on transient SSL / connection
+    errors — Mihomo's AUTO proxy-group rotates between upstream nodes
+    of varying reliability, so a single SSL_ERROR_SYSCALL / EOF is
+    often just a bad-node hit that will succeed on retry through a
+    different node.
+    """
     if not PROXY_URL:
         return _fetch(url, timeout)
-    try:
-        proxy_handler = ProxyHandler({
-            "http": PROXY_URL,
-            "https": PROXY_URL,
-        })
-        opener = build_opener(proxy_handler)
-        req = Request(url, headers=HTTP_HEADERS)
-        resp = opener.open(req, timeout=timeout)
-        return resp.read().decode("utf-8", errors="replace")
-    except (URLError, HTTPError, OSError) as e:
-        print(f"  proxy fetch failed: {url[:60]} — {e}", file=sys.stderr)
-        return ""
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            proxy_handler = ProxyHandler({
+                "http": PROXY_URL,
+                "https": PROXY_URL,
+            })
+            opener = build_opener(proxy_handler)
+            req = Request(url, headers=HTTP_HEADERS)
+            resp = opener.open(req, timeout=timeout)
+            return resp.read().decode("utf-8", errors="replace")
+        except HTTPError as e:
+            # HTTP status errors (404 / 403) — no point retrying.
+            print(f"  proxy fetch failed: {url[:60]} — {e}", file=sys.stderr)
+            return ""
+        except (URLError, OSError) as e:
+            last_err = e
+            if attempt < max_attempts:
+                time.sleep(3)
+                continue
+            print(f"  proxy fetch failed after {max_attempts} attempts: "
+                  f"{url[:60]} — {e}", file=sys.stderr)
+            return ""
+    return ""
 
 
 def _clean_html_text(text: str) -> str:
@@ -589,9 +608,35 @@ def fetch_newsletters() -> list:
     if not GMAIL_PW:
         return []
     try:
-        import imaplib, email as eml
-        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
-        mail.login(GMAIL_ADDR, GMAIL_PW)
+        import imaplib, email as eml, socket
+        # Route Gmail IMAP through mihomo SOCKS5. imaplib.IMAP4_SSL uses raw
+        # TCP + SSL and normally ignores HTTP_PROXY, so half of Gmail's DNS-
+        # resolved IPs get blocked by the GFW on this host. Wrap the socket
+        # in PySocks to force every connection through the local Mihomo
+        # SOCKS listener, whose upstream nodes handle Gmail reliably.
+        _orig_socket = socket.socket
+        _use_socks = False
+        try:
+            import socks
+            proxy_url = PROXY_URL or os.environ.get("RESEARCH_COPILOT_HTTP_PROXY")
+            if proxy_url:
+                from urllib.parse import urlparse
+                pu = urlparse(proxy_url)
+                proxy_host = pu.hostname or "127.0.0.1"
+                proxy_port = int(pu.port or 7890)
+                socks.set_default_proxy(socks.SOCKS5, proxy_host, proxy_port)
+                socket.socket = socks.socksocket
+                _use_socks = True
+        except Exception as _e:
+            print(f"  IMAP socks setup skipped: {_e}", file=sys.stderr)
+        try:
+            mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+            mail.login(GMAIL_ADDR, GMAIL_PW)
+        finally:
+            if _use_socks:
+                # Restore module-level socket.socket so we do not affect
+                # any downstream code that expects the plain socket type.
+                socket.socket = _orig_socket
     except Exception as e:
         print(f"Gmail IMAP login failed: {e}", file=sys.stderr)
         return []
