@@ -996,6 +996,9 @@ def main():
     _S2_KW_LIMIT = int(os.environ.get("RESEARCH_COPILOT_S2_KEYWORDS_PER_TOPIC", "5") or "5")
     _s2_rate_limited = False
     _s2_added = 0
+    if os.environ.get("RESEARCH_COPILOT_S2_ENABLED", "1").strip() in ("0", "false", "no", "off"):
+        print("  semantic_scholar disabled via RESEARCH_COPILOT_S2_ENABLED=0", file=sys.stderr)
+        _s2_rate_limited = True  # short-circuits the for-loop below
     for topic in active_topics:
         if _s2_rate_limited:
             break

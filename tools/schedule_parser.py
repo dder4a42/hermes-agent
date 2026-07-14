@@ -93,6 +93,11 @@ def _default_llm_call(system: str, user: str, model: str, base_url: str,
         response_format={"type": "json_object"},
         max_tokens=500,
         temperature=0.1,
+        # deepseek-v4-flash defaults to thinking mode; disable it — the JSON
+        # extraction / slot-filling here has no reasoning to do, and thinking
+        # tokens eat into max_tokens before any visible content is emitted.
+        # extra_body because the OpenAI SDK has no first-class field for it.
+        extra_body={"thinking": {"type": "disabled"}},
     )
     return resp.choices[0].message.content or ""
 
