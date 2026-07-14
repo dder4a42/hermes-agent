@@ -4,7 +4,7 @@ The Research Copilot (`/paper`) is one of three related systems built for WeChat
 
 ## `/s` — Schedule / Timed Reminders (core)
 
-Concrete timed reminders with natural language input. Data in `~/.hermes/thoughts.json[".tasks"]`.
+Concrete timed reminders with natural language input. Data in `${HERMES_HOME}/thoughts.json[".tasks"]`.
 
 Examples:
 - "remind me to try Mixue's new drink tomorrow" → `/s add "Try new drink" --when "tomorrow 2pm"`
@@ -16,7 +16,7 @@ Surfacer: `task-surfacer.py` (no_agent, every 5 min) checks for due tasks, sends
 
 ## `/th` — Thought Incubation (core)
 
-Fuzzy ideas that need incubation. Data in `~/.hermes/thoughts.json[".thoughts"]`.
+Fuzzy ideas that need incubation. Data in `${HERMES_HOME}/thoughts.json[".thoughts"]`.
 
 Examples:
 - "we should invest in GUI agents" → agent asks "want me to save that as a thought?"

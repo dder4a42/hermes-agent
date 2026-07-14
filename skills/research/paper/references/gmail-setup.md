@@ -5,7 +5,7 @@ Fetch pipeline reads newsletters from Gmail ResearchFeeds label via IMAP.
 ## One-Time Setup
 
 1. Enable 2FA → generate App Password at myaccount.google.com/apppasswords (Mail + "hermes")
-2. Store in `~/.hermes/.env`: `GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx`
+2. Store in `${HERMES_HOME}/.env`: `GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx`
 3. Gmail: create label "ResearchFeeds" (sidebar → scroll → Create label)
 4. Gmail Settings → Labels → ResearchFeeds → Show in IMAP
 5. Settings → Filters → For each newsletter, create filter applying ResearchFeeds label

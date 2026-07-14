@@ -24,7 +24,7 @@ Each dimension 0.0–1.0. Threshold: 0.65.
 
 When source_tier is missing from a candidate (legacy data), default to 0.5.
 
-**⚠ Runtime override:** The formula above is the historical default. The active scoring weights are always read from `~/.hermes/research-copilot/config.json` at the start of each daily run. If config.json omits a dimension (e.g. no `source_tier` in current config), use only the dimensions present — the config is authoritative.
+**⚠ Runtime override:** The formula above is the historical default. The active scoring weights are always read from `${HERMES_HOME}/research-copilot/config.json` at the start of each daily run. If config.json omits a dimension (e.g. no `source_tier` in current config), use only the dimensions present — the config is authoritative.
 
 Current config.json weights (as of July 2026): relevance=0.4, novelty=0.3, open_question_match=0.3 (no source_tier — all arXiv candidates share tier 0.5, making it non-discriminative at the scoring stage).
 

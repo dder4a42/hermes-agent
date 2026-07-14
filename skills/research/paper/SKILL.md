@@ -57,11 +57,19 @@ Each candidate gets 0.0-1.0 on weighted dimensions. Default weights (see `refere
 - open_question_match (0.25): connects to user's open questions
 - novelty (0.15): not recommended in last 30 days
 
-**However, the runtime config.json (`~/.hermes/research-copilot/config.json`) is AUTHORITATIVE.** Its `score_weights` override the defaults above. Current config.json is profile-aware and includes relevance, open_question_match, novelty, source_tier, profile_role, and actionability. Always read config.json at the start of scoring and use its weights and threshold.
+**However, the runtime config.json (`${HERMES_HOME}/research-copilot/config.json`) is AUTHORITATIVE.** Its `score_weights` override the defaults above. Current config.json is profile-aware and includes relevance, open_question_match, novelty, source_tier, profile_role, and actionability. Always read config.json at the start of scoring and use its weights and threshold.
 
 ## Data Files
 
-All under ~/.hermes/research-copilot/:
+**⚠ PROFILE ISOLATION**: All paths below use ${HERMES_HOME}/, NOT ~/.hermes/.
+The current Hermes profile is set by the HERMES_HOME environment variable
+(default: ~/.hermes; when running as \`hermes -p <profile>\`, it points at
+~/.hermes/profiles/<profile>/). NEVER read/write ~/.hermes/... directly — that
+resolves to the OWNER's home and leaks into the default profile even when the
+agent is invoked under a different profile. If read_file/write_file receives a
+\`~\` prefix it will NOT be re-scoped.
+
+All under ${HERMES_HOME}/research-copilot/:
 - topics.json — interests with open questions
 - source_registry.json — curated lab/company/researcher/community sources for RSS and directed search
 - research_profile.json — long-term academic stance profile: agenda, beliefs, open questions, knowledge gaps, evidence ledger
@@ -86,7 +94,7 @@ All under ~/.hermes/research-copilot/:
    - source_tier/actionability/profile role should break ties even if not in config.json
 8. Assign one or more signal roles: Evidence update, Belief challenge, Gap filler, Trend signal, Tool useful
 9. Pick highest >= threshold from config.json, or NO_RECOMMENDATION
-10. Generate brief per references/format.md (at ~/.hermes/skills/research/paper/references/format.md — NOT under the data dir) — separate claims from interpretation, and explicitly state why this signal matters to the user's academic profile
+10. Generate brief per references/format.md (at ${HERMES_HOME}/skills/research/paper/references/format.md — NOT under the data dir) — separate claims from interpretation, and explicitly state why this signal matters to the user's academic profile
 11. Write to recommendations.jsonl, update candidate status (status=recommended, scored=true), reset health in state.json
 12. Output ONLY the brief text, or NO_RECOMMENDATION
 

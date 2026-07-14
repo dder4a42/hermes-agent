@@ -12,7 +12,7 @@ Daily output should usually be one topic/signal, interpreted through the user's 
 
 ## Data model additions
 
-Expected files under `~/.hermes/research-copilot/`:
+Expected files under `${HERMES_HOME}/research-copilot/`:
 - `research_profile.json`: long-term agenda, current beliefs, open questions, knowledge gaps, evidence ledger.
 - `source_registry.json`: curated lab/company/researcher/community sources with source type, tier, domains, feeds, topics, and bias notes.
 - `config.json`: profile-aware scoring weights and source policy.
