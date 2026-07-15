@@ -81,22 +81,63 @@ All under ${HERMES_HOME}/research-copilot/:
 
 ## Procedure (agent cron)
 
-1. Read topics.json → active interests + open questions
-2. Read research_profile.json → long-term agenda, current beliefs, knowledge gaps, evidence ledger
-3. Read source_registry.json → understand source type/tier/bias for candidates when present
-4. Read candidates.jsonl → unscored items (status=candidate, scored=false)
-5. Read config.json → active weights and threshold (override SKILL.md defaults)
-6. Read recommendations.jsonl → avoid 30-day repeats
-7. Score each candidate per config.json weights, but reason profile-aware:
-   - relevance: topic and source text match
-   - novelty: not recommended recently
-   - open_question_match: direct connection to topic/profile open questions
-   - source_tier/actionability/profile role should break ties even if not in config.json
-8. Assign one or more signal roles: Evidence update, Belief challenge, Gap filler, Trend signal, Tool useful
-9. Pick highest >= threshold from config.json, or NO_RECOMMENDATION
-10. Generate brief per references/format.md (at ${HERMES_HOME}/skills/research/paper/references/format.md — NOT under the data dir) — separate claims from interpretation, and explicitly state why this signal matters to the user's academic profile
-11. Write to recommendations.jsonl, update candidate status (status=recommended, scored=true), reset health in state.json
-12. Output ONLY the brief text, or NO_RECOMMENDATION
+**Use the ``paper`` toolset. Do NOT manually read candidates.jsonl or
+config.json — Python has already scored every candidate against your
+config weights and filtered anything recommended in the last 30 days.**
+
+1. Call ``paper_top_candidates(k=20)``. Response includes:
+    * ``threshold`` (from config.json) and ``weights`` (score dimensions).
+    * ``items``: ranked list, each with ``{score, dims, reasons,
+      candidate: {id, title, authors, url, arxiv_id, published,
+      summary, sources, topics}}``. Summary is truncated to 400 chars.
+    * ``total_ranked``: how many candidates cleared the novelty
+      filter (before threshold).
+2. Inspect ``items[0].score``:
+    * If ``items`` is empty OR the top score is below ``threshold``,
+      respond with exactly ``[SILENT]`` — nothing to report.
+    * Otherwise proceed.
+3. (Optional) Call ``paper_recent_recommendations(days=30)`` as a
+   sanity check that nothing already-pushed appears in your candidate
+   analysis narrative.
+4. Read ``${HERMES_HOME}/skills/research/paper/references/format.md``
+   for the brief style contract, and — if you need profile
+   references beyond the ``reasons`` string — ``${HERMES_HOME}/research-copilot/research_profile.json``.
+5. Semantic judgment: usually pick ``items[0]``. Prefer a lower-ranked
+   item ONLY when there is a clear reason: (a) two adjacent items are
+   near-duplicates on the same technique and a newer one exists, or
+   (b) the top item is very off-profile despite scoring well. State
+   the reason briefly in the brief.
+6. Write the brief per references/format.md. Rules:
+    * Chinese narrative, English technical terms kept.
+    * Separate "authors claim" from "your analysis / meta-trend".
+    * Reference specific ``open_questions`` / ``current_beliefs`` from
+      the profile — quote the exact wording so the user can spot
+      hallucinated references. Do NOT invent history.
+7. Call ``paper_write_recommendation(item_id=<the id you picked>,
+   brief_text=<your full brief>, signal_roles=[...], score=<items[i].score>)``.
+   Python validates the id exists in candidates.jsonl, is still
+   ``status=candidate``, and has not been recommended in the last 30
+   days; then appends to recommendations.jsonl, flips
+   candidates.jsonl status → ``recommended``, and updates state.json.
+   If the response is ``{"success": false}``, DO NOT retry with a
+   different brief — the failure is a data-state issue, not a
+   phrasing one.
+8. Output ONLY the brief text (it will be delivered to WeChat).
+   Never output the tool responses.
+
+**Do not read candidates.jsonl / recommendations.jsonl / config.json
+directly with read_file. Everything you need is already in
+paper_top_candidates response.**
+
+### Fallback (only if paper_* tools are NOT available)
+
+If the tools throw ``tool not found`` (agent lacks the paper toolset),
+fall back to the manual procedure — read topics.json, research_
+profile.json, config.json, candidates.jsonl, recommendations.jsonl,
+compute scores per config.json weights, and write recommendations.
+jsonl yourself. This path is error-prone (LLM manually summing
+weighted floats over hundreds of candidates); prefer to fix the
+enabled_toolsets on the cron job.
 
 See `references/gfw-setup.md` for CN-network proxy config, Gmail IMAP newsletter reader, and source connectivity table.
 

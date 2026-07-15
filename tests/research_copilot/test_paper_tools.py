@@ -98,7 +98,7 @@ def test_top_candidates_returns_ranked_items(isolated_profile):
             ]
         },
     )
-    from research_copilot.paper_tools import _handler_paper_top_candidates
+    from tools.paper_tools import _handler_paper_top_candidates
 
     resp = json.loads(_handler_paper_top_candidates({"k": 5}))
     assert resp["success"] is True
@@ -127,7 +127,7 @@ def test_top_candidates_excludes_status_recommended(isolated_profile):
         ],
         topics={"topics": []},
     )
-    from research_copilot.paper_tools import _handler_paper_top_candidates
+    from tools.paper_tools import _handler_paper_top_candidates
 
     resp = json.loads(_handler_paper_top_candidates({}))
     assert resp["success"] is True
@@ -151,7 +151,7 @@ def test_top_candidates_hard_excludes_30d_history(isolated_profile):
             {"id": "p_repeat", "title": "already", "recommended_at": now_stamp}
         ],
     )
-    from research_copilot.paper_tools import _handler_paper_top_candidates
+    from tools.paper_tools import _handler_paper_top_candidates
 
     resp = json.loads(_handler_paper_top_candidates({}))
     assert resp["success"] is True
@@ -173,7 +173,7 @@ def test_top_candidates_summary_truncated(isolated_profile):
             }
         ],
     )
-    from research_copilot.paper_tools import _handler_paper_top_candidates
+    from tools.paper_tools import _handler_paper_top_candidates
 
     resp = json.loads(_handler_paper_top_candidates({}))
     assert len(resp["items"][0]["candidate"]["summary"]) < 500
@@ -193,7 +193,7 @@ def test_recent_recommendations_filters_by_window(isolated_profile):
             {"id": "new", "title": "recent", "recommended_at": new_stamp},
         ],
     )
-    from research_copilot.paper_tools import _handler_paper_recent_recommendations
+    from tools.paper_tools import _handler_paper_recent_recommendations
 
     resp = json.loads(_handler_paper_recent_recommendations({"days": 30}))
     ids = [r["id"] for r in resp["items"]]
@@ -211,7 +211,7 @@ def test_recent_recommendations_wider_window(isolated_profile):
             {"id": "old", "title": "way old", "recommended_at": old_stamp}
         ],
     )
-    from research_copilot.paper_tools import _handler_paper_recent_recommendations
+    from tools.paper_tools import _handler_paper_recent_recommendations
 
     resp = json.loads(_handler_paper_recent_recommendations({"days": 120}))
     assert len(resp["items"]) == 1
@@ -236,7 +236,7 @@ def test_write_recommendation_happy_path(isolated_profile):
             }
         ],
     )
-    from research_copilot.paper_tools import _handler_paper_write_recommendation
+    from tools.paper_tools import _handler_paper_write_recommendation
 
     resp = json.loads(
         _handler_paper_write_recommendation(
@@ -280,7 +280,7 @@ def test_write_recommendation_rejects_unknown_id(isolated_profile):
             {"id": "known", "status": "candidate", "topics": []}
         ],
     )
-    from research_copilot.paper_tools import _handler_paper_write_recommendation
+    from tools.paper_tools import _handler_paper_write_recommendation
 
     resp = json.loads(
         _handler_paper_write_recommendation(
@@ -298,7 +298,7 @@ def test_write_recommendation_rejects_already_actioned(isolated_profile):
             {"id": "done", "status": "recommended", "topics": []}
         ],
     )
-    from research_copilot.paper_tools import _handler_paper_write_recommendation
+    from tools.paper_tools import _handler_paper_write_recommendation
 
     resp = json.loads(
         _handler_paper_write_recommendation({"item_id": "done", "brief_text": "b"})
@@ -318,7 +318,7 @@ def test_write_recommendation_rejects_recent_duplicate(isolated_profile):
             {"id": "repeat", "recommended_at": now_stamp}
         ],
     )
-    from research_copilot.paper_tools import _handler_paper_write_recommendation
+    from tools.paper_tools import _handler_paper_write_recommendation
 
     resp = json.loads(
         _handler_paper_write_recommendation({"item_id": "repeat", "brief_text": "b"})
@@ -329,7 +329,7 @@ def test_write_recommendation_rejects_recent_duplicate(isolated_profile):
 
 def test_write_recommendation_requires_fields(isolated_profile):
     _setup(isolated_profile, candidates=[])
-    from research_copilot.paper_tools import _handler_paper_write_recommendation
+    from tools.paper_tools import _handler_paper_write_recommendation
 
     r1 = json.loads(_handler_paper_write_recommendation({}))
     assert r1["success"] is False
@@ -344,7 +344,7 @@ def test_write_recommendation_requires_fields(isolated_profile):
 def test_all_three_tools_registered():
     from tools.registry import registry
     # import triggers registration
-    from research_copilot import paper_tools  # noqa: F401
+    from tools import paper_tools  # noqa: F401
 
     names = [
         "paper_top_candidates",
