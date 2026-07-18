@@ -4,18 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from .storage import (
-    append_interaction,
-    find_recommendation,
-    load_config,
-    load_topics,
-    read_recommendations,
-    update_candidate_status,
-)
 
+def _open_library():
+    from .runtime import open_library, runtime_paths
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return open_library(runtime_paths()["database"])
 
 
 def _usage() -> str:
@@ -37,7 +30,12 @@ def _usage() -> str:
 
 
 def _format_topics() -> str:
-    data = load_topics()
+    from .runtime import load_yaml, runtime_paths
+
+    try:
+        data = load_yaml(runtime_paths()["topics"])
+    except (FileNotFoundError, ValueError) as exc:
+        return f"Research Copilot Topics\n\n(unavailable: {exc})"
     topics = data.get("topics") if isinstance(data, dict) else []
     if not topics:
         return "Research Copilot Topics\n\n(no topics configured)"
@@ -67,12 +65,37 @@ def _format_history(args: list[str]) -> str:
             limit = max(1, min(20, int(args[0])))
         except ValueError:
             return "Usage: /paper history [n]"
-    recs = read_recommendations(limit=limit)
+    connection, _repository = _open_library()
+    try:
+        rows = connection.execute(
+            """
+            SELECT recommendations.id AS recommendation_id,
+                   recommendations.item_id, recommendations.recommended_at,
+                   recommendations.score, research_items.title
+            FROM recommendations
+            JOIN research_items ON research_items.id = recommendations.item_id
+            ORDER BY recommendations.recommended_at DESC, recommendations.id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        recs = []
+        for row in rows:
+            topics = [
+                value["topic_id"] for value in connection.execute(
+                    "SELECT topic_id FROM item_topics WHERE item_id=? "
+                    "ORDER BY confidence DESC, topic_id",
+                    (row["item_id"],),
+                )
+            ]
+            recs.append({**dict(row), "topic_matches": topics})
+    finally:
+        connection.close()
     if not recs:
         return "Recent Research Picks\n\n(no recommendations yet)"
     lines = ["Recent Research Picks"]
     for idx, rec in enumerate(recs, start=1):
-        rid = rec.get("id", "?")
+        rid = rec.get("item_id", "?")
         title = rec.get("title", "Untitled")
         matches = rec.get("topic_matches") or []
         if isinstance(matches, list):
@@ -82,28 +105,30 @@ def _format_history(args: list[str]) -> str:
         lines.append("")
         lines.append(f"{idx}. {rid}")
         lines.append(str(title))
+        lines.append(f"Score: {float(rec.get('score') or 0):.4f}")
         if match_text:
             lines.append(f"Matches: {match_text}")
     return "\n".join(lines)
 
 
-def _record_action(action: str, item_id: str, *, status: str | None = None, **extra) -> str:
+def _record_action(action: str, item_id: str, **extra) -> str:
     item_id = item_id.strip()
     if not item_id:
         return f"Usage: /paper {action} <id>"
-    rec = find_recommendation(item_id)
-    if rec is None:
-        return f"Recommendation {item_id} not found. Use /paper history to see recent ids."
-    record = {
-        "type": action,
-        "item_id": item_id,
-        "title": rec.get("title"),
-        "created_at": _now_iso(),
-    }
-    record.update({k: v for k, v in extra.items() if v not in (None, "")})
-    append_interaction(record)
-    if status:
-        update_candidate_status(item_id, status)
+    connection, repository = _open_library()
+    try:
+        rec = connection.execute(
+            "SELECT 1 FROM recommendations WHERE item_id=?", (item_id,)
+        ).fetchone()
+        if rec is None:
+            return f"Recommendation {item_id} not found. Use /paper history to see recent ids."
+        kind = "note" if action == "feedback" else action
+        payload = {k: v for k, v in extra.items() if v not in (None, "")}
+        repository.record_feedback(
+            item_id, kind=kind, created_at=datetime.now(timezone.utc), payload=payload,
+        )
+    finally:
+        connection.close()
     verb = {
         "save": "Saved",
         "skip": "Skipped",
@@ -114,41 +139,43 @@ def _record_action(action: str, item_id: str, *, status: str | None = None, **ex
 
 
 def _format_health() -> str:
-    """Return the weekly Research Copilot health report."""
+    """Return SourceRun-based Research Library health."""
+    from .health import build_health_report, render_health_report
+
+    connection, _repository = _open_library()
     try:
-        from .scripts.paper_health import build_report
-    except ImportError:
-        cfg = load_config()
-        pipeline = cfg.get("pipeline", "unknown") if isinstance(cfg, dict) else "unknown"
-        return (
-            "Research Copilot Health\n"
-            f"Pipeline: {pipeline}\n"
-            "(detailed report unavailable — paper_health module not importable)"
-        )
-    return build_report(window_days=7).rstrip()
+        return render_health_report(build_health_report(connection)).rstrip()
+    finally:
+        connection.close()
 
 
 def _trigger_daily_pick() -> str:
-    """Trigger the profile-local daily-paper-pick cron job on the next tick."""
+    """Trigger the profile-local Library recommender on the next cron tick."""
     from hermes_constants import get_hermes_home
     from cron.jobs import AmbiguousJobReference, trigger_job, use_cron_store
 
     with use_cron_store(get_hermes_home()):
-        try:
-            job = trigger_job("daily-paper-pick")
-        except AmbiguousJobReference as exc:
-            matches = ", ".join(j.get("id", "?") for j in exc.matches)
-            return (
-                "Multiple daily-paper-pick cron jobs match this profile. "
-                f"Use hermes cron run <job_id> with one of: {matches}"
-            )
+        job = None
+        selected_name = "research-library-recommend"
+        for candidate in (selected_name, "daily-paper-pick"):
+            try:
+                job = trigger_job(candidate)
+            except AmbiguousJobReference as exc:
+                matches = ", ".join(j.get("id", "?") for j in exc.matches)
+                return (
+                    f"Multiple {candidate} cron jobs match this profile. "
+                    f"Use hermes cron run <job_id> with one of: {matches}"
+                )
+            if job:
+                selected_name = candidate
+                break
     if not job:
         return (
-            "daily-paper-pick cron job was not found in this Hermes profile.\n"
+            "Research Library recommendation cron job was not found in this Hermes profile.\n"
             "Create it with hermes cron create, or initialize this profile's Research Copilot cron jobs."
         )
     return (
-        f"Triggered daily-paper-pick ({job.get('id')}).\n"
+        f"Triggered {selected_name} ({job.get('id')}).\n"
         "It will run on the next cron scheduler tick and deliver through its configured target."
     )
 
@@ -178,13 +205,13 @@ def handle_paper_command(args: str = "") -> str:
     if subcmd == "history":
         return _format_history(rest)
     if subcmd == "save":
-        return _record_action("save", rest[0] if rest else "", status="saved")
+        return _record_action("save", rest[0] if rest else "")
     if subcmd == "read":
-        return _record_action("read", rest[0] if rest else "", status="read")
+        return _record_action("read", rest[0] if rest else "")
     if subcmd == "skip":
         item_id = rest[0] if rest else ""
         reason = " ".join(rest[1:]).strip()
-        return _record_action("skip", item_id, status="skipped", reason=reason)
+        return _record_action("skip", item_id, reason=reason)
     if subcmd == "feedback":
         item_id = rest[0] if rest else ""
         text = " ".join(rest[1:]).strip()

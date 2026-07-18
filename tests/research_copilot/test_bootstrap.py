@@ -3,7 +3,7 @@ import json
 import pytest
 
 
-def test_initialize_research_copilot_home_copies_profile_files_and_scripts(tmp_path):
+def test_initialize_research_copilot_home_copies_profile_files_without_legacy_scripts(tmp_path):
     source = tmp_path / "source"
     target = tmp_path / "profiles" / "alice"
     (source / "research-copilot").mkdir(parents=True)
@@ -23,8 +23,8 @@ def test_initialize_research_copilot_home_copies_profile_files_and_scripts(tmp_p
     assert (target / "research-copilot" / "candidates.jsonl").exists()
     assert (target / "research-copilot" / "recommendations.jsonl").exists()
     assert (target / "research-copilot" / "interactions.jsonl").exists()
-    assert (target / "scripts" / "paper-fetch.py").read_text() == "print('fetch')\n"
-    assert (target / "scripts" / "paper-health.py").read_text() == "print('health')\n"
+    assert not (target / "scripts" / "paper-fetch.py").exists()
+    assert not (target / "scripts" / "paper-health.py").exists()
 
 
 def test_install_research_copilot_cron_is_profile_scoped_and_idempotent(tmp_path, monkeypatch):
@@ -41,22 +41,27 @@ def test_install_research_copilot_cron_is_profile_scoped_and_idempotent(tmp_path
     first = install_research_copilot_cron(profile_home, deliver="weixin")
     second = install_research_copilot_cron(profile_home, deliver="weixin")
 
-    assert first["created"] == ["paper-fetcher", "daily-paper-pick", "paper-health-report"]
+    expected = ["paper-fetcher", "research-library-recommend", "paper-health-report", "task-surfacer", "thought-surfacer"]
+    assert first["created"] == expected
     assert second["created"] == []
-    assert second["existing"] == ["paper-fetcher", "daily-paper-pick", "paper-health-report"]
+    assert second["existing"] == expected
 
     with use_cron_store(profile_home):
         jobs = list_jobs(include_disabled=True)
-    assert [job["name"] for job in jobs] == ["paper-fetcher", "daily-paper-pick", "paper-health-report"]
+    assert [job["name"] for job in jobs] == expected
     assert {job["deliver"] for job in jobs} == {"weixin"}
+    scripts = {job["name"]: job.get("script") for job in jobs}
+    assert scripts["paper-fetcher"] == "module:research_copilot.scripts.library_collect"
+    assert scripts["paper-health-report"] == "module:research_copilot.scripts.library_health"
+    assert not (profile_home / "scripts" / "paper-fetch.py").exists()
+    assert not (profile_home / "scripts" / "paper-health.py").exists()
 
     with use_cron_store(active_home):
         assert list_jobs(include_disabled=True) == []
 
 
-def test_repo_fallback_installs_scripts_and_skill_when_no_source(tmp_path):
-    """With no source_home, bootstrap should still install repo-owned scripts
-    and skill assets so a first-time profile is functional."""
+def test_repo_fallback_installs_skill_without_legacy_paper_scripts(tmp_path):
+    """Bundled modules replace copied Research Copilot implementation files."""
     target = tmp_path / "profiles" / "bob"
 
     from research_copilot.bootstrap import initialize_research_copilot_home
@@ -67,15 +72,13 @@ def test_repo_fallback_installs_scripts_and_skill_when_no_source(tmp_path):
     assert (target / "research-copilot" / "config.json").exists()
     assert (target / "research-copilot" / "topics.json").exists()
 
-    # Scripts land from repo (paper_fetch.py / paper_health.py copied to
-    # dashed paper-fetch.py / paper-health.py names).
+    # Research business logic stays in the installed package.
     fetch_dst = target / "scripts" / "paper-fetch.py"
     health_dst = target / "scripts" / "paper-health.py"
-    assert fetch_dst.exists()
-    assert health_dst.exists()
-    # And they came from the repo, not from an empty file.
-    assert fetch_dst.read_text().strip() != ""
-    assert health_dst.read_text().strip() != ""
+    assert not fetch_dst.exists()
+    assert not health_dst.exists()
+    assert (target / "scripts" / "task-surfacer.py").exists()
+    assert (target / "scripts" / "thought-surfacer.py").exists()
 
     # Skill assets present.
     skill_root = target / "skills" / "research" / "paper"
@@ -86,9 +89,9 @@ def test_repo_fallback_installs_scripts_and_skill_when_no_source(tmp_path):
 
     # Reported keys present.
     assert result["profile_home"] == str(target.resolve())
-    # scripts + skill assets show up in "copied" (first run, they didn't exist).
+    # Only still-managed assets show up in "copied".
     joined = " ".join(result["copied"])
-    assert "scripts/paper-fetch.py" in joined
+    assert "scripts/paper-fetch.py" not in joined
     assert "SKILL.md" in joined
 
 
@@ -142,9 +145,8 @@ def test_force_never_deletes_jsonl_history(tmp_path):
     assert json.loads(lines[0])["item_id"] == "p1"
 
 
-def test_scripts_refresh_on_second_run_from_source(tmp_path):
-    """When source_home is supplied, scripts should be refreshed even if the
-    target already has them — they are code, not user state."""
+def test_legacy_paper_scripts_are_not_restored_from_source(tmp_path):
+    """A template profile cannot reintroduce removed bundled business code."""
     source = tmp_path / "source"
     target = tmp_path / "profiles" / "frank"
     (source / "scripts").mkdir(parents=True)
@@ -155,12 +157,29 @@ def test_scripts_refresh_on_second_run_from_source(tmp_path):
     from research_copilot.bootstrap import initialize_research_copilot_home
 
     initialize_research_copilot_home(target, source_home=source)
-    assert (target / "scripts" / "paper-fetch.py").read_text() == "v1\n"
+    assert not (target / "scripts" / "paper-fetch.py").exists()
+    assert not (target / "scripts" / "paper-health.py").exists()
 
-    # Source updates.
+    # A later source update must not copy the retired implementation back.
     (source / "scripts" / "paper-fetch.py").write_text("v2\n")
     initialize_research_copilot_home(target, source_home=source)
-    assert (target / "scripts" / "paper-fetch.py").read_text() == "v2\n"
+    assert not (target / "scripts" / "paper-fetch.py").exists()
+
+
+def test_bootstrap_accepts_managed_script_symlinked_to_repo(tmp_path):
+    target = tmp_path / "profiles" / "linked"
+    scripts = target / "scripts"
+    scripts.mkdir(parents=True)
+
+    from research_copilot import bootstrap
+
+    source = bootstrap._REPO_ROOT / "scripts" / "task_surfacer.py"
+    (scripts / "task-surfacer.py").symlink_to(source)
+
+    result = bootstrap.initialize_research_copilot_home(target)
+
+    assert (scripts / "task-surfacer.py").samefile(source)
+    assert "scripts/task-surfacer.py" not in result["refreshed"]
 
 
 def test_bootstrap_never_touches_a_sibling_profile(tmp_path):

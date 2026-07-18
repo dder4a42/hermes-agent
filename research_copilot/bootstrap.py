@@ -23,11 +23,12 @@ _DEFAULT_JSON_FILES = {
     "state.json": '{\n  "last_fetch_at": null,\n  "last_recommendation_at": null\n}\n',
 }
 _JSONL_FILES = ("candidates.jsonl", "recommendations.jsonl", "interactions.jsonl")
-_SCRIPT_FILES = ("paper-fetch.py", "paper-health.py")
+_SCRIPT_FILES: tuple[str, ...] = ()
+_LEGACY_SCRIPT_FILES = ("paper-fetch.py", "paper-health.py")
 _OPTIONAL_SCRIPT_FILES = ("task-surfacer.py", "thought-surfacer.py")
 
 # Skill assets installed into the profile's ~/.hermes/skills/research/paper/
-# tree so the daily-paper-pick agent skill is available under the profile.
+# tree so interactive paper commands remain available under the profile.
 _SKILL_ROOT = "skills/research/paper"
 _SKILL_FILES = (
     "SKILL.md",
@@ -43,7 +44,10 @@ _SKILL_FILES = (
     "references/world-model-inference-optimization.md",
 )
 
-_CRON_NAMES = ("paper-fetcher", "daily-paper-pick", "paper-health-report")
+_CRON_NAMES = (
+    "paper-fetcher", "research-library-recommend", "paper-health-report",
+    "task-surfacer", "thought-surfacer",
+)
 
 # Repository asset roots. Bootstrap prefers ``source_home`` (a live profile
 # used as a template) when supplied, then falls back to these repo-owned
@@ -64,6 +68,14 @@ def _copy_if_missing_or_force(src: Path, dst: Path, *, force: bool) -> bool:
     """Copy ``src`` to ``dst``. Returns True if the file was written."""
     if not src.exists():
         return False
+    # A profile may link managed assets back to their repository-owned source.
+    # copy2() raises SameFileError in that already-up-to-date state, breaking
+    # otherwise-idempotent bootstrap runs.
+    try:
+        if dst.exists() and src.samefile(dst):
+            return False
+    except OSError:
+        pass
     if dst.exists() and not force:
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -83,6 +95,9 @@ def _script_source(filename: str, source: Path | None) -> Path | None:
         if candidate.exists():
             return candidate
     repo = _REPO_SCRIPTS_ROOT / _script_repo_name(filename)
+    if repo.exists():
+        return repo
+    repo = _REPO_ROOT / "scripts" / _script_repo_name(filename)
     if repo.exists():
         return repo
     return None
@@ -136,7 +151,17 @@ def initialize_research_copilot_home(
     copied: list[str] = []
     created: list[str] = []
     refreshed: list[str] = []
+    removed: list[str] = []
     skipped: list[str] = []
+
+    # These were versioned Research Copilot implementation files copied into
+    # every profile.  Bundled cron modules now own the implementation, so the
+    # profile contains state and job definitions only.
+    for filename in _LEGACY_SCRIPT_FILES:
+        legacy = scripts_dir / filename
+        if legacy.is_file():
+            legacy.unlink()
+            removed.append(f"scripts/{filename}")
 
     for filename, default_content in _DEFAULT_JSON_FILES.items():
         dst = data_dir / filename
@@ -172,17 +197,14 @@ def initialize_research_copilot_home(
         if _copy_if_missing_or_force(src, dst, force=True):
             (refreshed if existed else copied).append(f"scripts/{filename}")
 
-    # Optional scripts (task-surfacer / thought-surfacer) — only when a
-    # source profile is provided.
-    if source is not None:
-        for filename in optional_scripts:
-            src = source / "scripts" / filename
-            if not src.exists():
-                continue
-            dst = scripts_dir / filename
-            existed = dst.exists()
-            if _copy_if_missing_or_force(src, dst, force=True):
-                (refreshed if existed else copied).append(f"scripts/{filename}")
+    for filename in optional_scripts:
+        src = _script_source(filename, source)
+        if src is None:
+            continue
+        dst = scripts_dir / filename
+        existed = dst.exists()
+        if _copy_if_missing_or_force(src, dst, force=True):
+            (refreshed if existed else copied).append(f"scripts/{filename}")
 
     # Skill assets — refreshed idempotently.
     for rel in _SKILL_FILES:
@@ -200,6 +222,7 @@ def initialize_research_copilot_home(
         "created": created,
         "copied": copied,
         "refreshed": refreshed,
+        "removed": removed,
         "skipped": skipped,
     }
 
@@ -222,7 +245,7 @@ def install_research_copilot_cron(
     untouched. Bootstrap of the underlying profile files uses the same
     ``force`` semantics as ``initialize_research_copilot_home``.
     """
-    from cron.jobs import create_job, use_cron_store
+    from cron.jobs import create_job, list_jobs, update_job, use_cron_store
 
     profile_home = Path(profile_home).expanduser().resolve()
     initialize_research_copilot_home(profile_home, force=force)
@@ -234,45 +257,76 @@ def install_research_copilot_cron(
         names = _existing_job_names()
         if "paper-fetcher" in names:
             existing.append("paper-fetcher")
+            job = next(
+                j for j in list_jobs(include_disabled=True)
+                if j.get("name") == "paper-fetcher"
+            )
+            update_job(job["id"], {
+                "script": "module:research_copilot.scripts.library_collect",
+                "no_agent": True,
+            })
         else:
             create_job(
                 prompt=None,
                 schedule="0 6,18 * * *",
                 name="paper-fetcher",
                 deliver=deliver,
-                script="paper-fetch.py",
+                script="module:research_copilot.scripts.library_collect",
                 no_agent=True,
             )
             created.append("paper-fetcher")
 
-        if "daily-paper-pick" in names:
-            existing.append("daily-paper-pick")
+        if "research-library-recommend" in names:
+            existing.append("research-library-recommend")
         else:
             create_job(
-                prompt=(
-                    "Select at most one high-signal Research Copilot paper/research signal "
-                    "from the profile-local candidate pool. If nothing clears the threshold, stay silent."
-                ),
+                prompt=None,
                 schedule="30 8 * * *",
-                name="daily-paper-pick",
+                name="research-library-recommend",
                 deliver=deliver,
-                skills=["paper"],
-                enabled_toolsets=["file"],
+                script="module:research_copilot.scripts.library_recommend",
+                no_agent=True,
             )
-            created.append("daily-paper-pick")
+            created.append("research-library-recommend")
 
         if "paper-health-report" in names:
             existing.append("paper-health-report")
+            job = next(
+                j for j in list_jobs(include_disabled=True)
+                if j.get("name") == "paper-health-report"
+            )
+            update_job(job["id"], {
+                "script": "module:research_copilot.scripts.library_health",
+                "no_agent": True,
+            })
         else:
             create_job(
                 prompt=None,
                 schedule="0 9 * * 6",
                 name="paper-health-report",
                 deliver=deliver,
-                script="paper-health.py",
+                script="module:research_copilot.scripts.library_health",
                 no_agent=True,
             )
             created.append("paper-health-report")
+
+        if "task-surfacer" in names:
+            existing.append("task-surfacer")
+        else:
+            create_job(
+                prompt=None, schedule="every 5m", name="task-surfacer",
+                deliver=deliver, script="task-surfacer.py", no_agent=True,
+            )
+            created.append("task-surfacer")
+
+        if "thought-surfacer" in names:
+            existing.append("thought-surfacer")
+        else:
+            create_job(
+                prompt=None, schedule="every 30m", name="thought-surfacer",
+                deliver=deliver, script="thought-surfacer.py", no_agent=True,
+            )
+            created.append("thought-surfacer")
 
     return {
         "profile_home": str(profile_home),

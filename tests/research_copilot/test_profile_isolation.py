@@ -106,7 +106,10 @@ def test_cron_bootstrap_is_scoped_per_profile(tmp_path, monkeypatch):
     with use_cron_store(active):
         active_names = {j["name"] for j in list_jobs(include_disabled=True)}
 
-    assert alice_names == {"paper-fetcher", "daily-paper-pick", "paper-health-report"}
+    assert alice_names == {
+        "paper-fetcher", "research-library-recommend", "paper-health-report",
+        "task-surfacer", "thought-surfacer",
+    }
     assert bob_names == set(), "installing cron in alice must not touch bob"
     assert active_names == set(), "installing cron in alice must not touch active profile"
 

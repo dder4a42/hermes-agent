@@ -193,3 +193,28 @@ def test_accepts_legacy_type_created_at_fields(data_dir):
 
     report = build_report(data_dir=data_dir, window_days=7, now=now)
     assert "2 save · 0 read · 1 skip · 0 note" in report
+
+
+@pytest.mark.parametrize(
+    "recommended_at",
+    [
+        "2026-07-16",
+        "2026-07-16T08:30:00",
+        "2026-07-16T08:30:00Z",
+        "2026-07-16T16:30:00+08:00",
+    ],
+)
+def test_recommendation_dates_are_normalized_to_utc(data_dir, recommended_at):
+    """Historical recommendation records mix dates and timezone formats."""
+    now = datetime(2026, 7, 17, 0, 0, tzinfo=timezone.utc)
+    _write_jsonl(
+        data_dir / "recommendations.jsonl",
+        [{"id": "p1", "recommended_at": recommended_at, "title": "T1"}],
+    )
+    _write_jsonl(data_dir / "interactions.jsonl", [])
+    _write_jsonl(data_dir / "candidates.jsonl", [])
+    _write_json(data_dir / "state.json", {})
+    _write_json(data_dir / "topics.json", {"topics": []})
+
+    report = build_report(data_dir=data_dir, window_days=7, now=now)
+    assert "Recommendations delivered: 1" in report

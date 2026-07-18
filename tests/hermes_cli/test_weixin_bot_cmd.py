@@ -110,7 +110,7 @@ def test_cmd_weixin_bot_create_initializes_profile_research_copilot(tmp_path, mo
 
     profile_home = default_home / "profiles" / "alice"
     assert json.loads((profile_home / "research-copilot" / "config.json").read_text())["pipeline"] == "weixin"
-    assert (profile_home / "scripts" / "paper-fetch.py").exists()
+    assert not (profile_home / "scripts" / "paper-fetch.py").exists()
     assert (profile_home / "cron" / "jobs.json").exists()
     output = capsys.readouterr().out
     assert "Weixin bot profile 'alice' is ready" in output

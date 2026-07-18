@@ -1977,6 +1977,19 @@ _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 
+# Repository-owned cron entry points.  Keep this an explicit allowlist: a
+# ``module:`` job bypasses the profile scripts sandbox, so accepting arbitrary
+# import paths would turn a hand-edited jobs.json into a general module runner.
+_BUNDLED_CRON_MODULES = frozenset({
+    "research_copilot.scripts.library_collect",
+    "research_copilot.scripts.library_daily_report",
+    "research_copilot.scripts.library_enrich",
+    "research_copilot.scripts.library_health",
+    "research_copilot.scripts.library_promote",
+    "research_copilot.scripts.library_recommend",
+    "research_copilot.scripts.library_scout",
+})
+
 
 def _get_script_timeout() -> int:
     """Resolve cron pre-run script timeout from module/env/config with a safe default."""
@@ -2021,12 +2034,14 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     Supported interpreters (chosen by file extension):
 
+    * registered ``module:package.entrypoint`` — run with ``python -m``
     * ``.sh`` / ``.bash`` — run with ``/bin/bash``
     * anything else — run with the current Python interpreter
       (``sys.executable``), preserving the original behaviour for
       Python-based pre-check and data-collection scripts.
 
-    Shell support lets ``no_agent=True`` jobs ship classic bash watchdogs
+    Bundled module entry points keep repository-owned implementation code out
+    of profile homes. Shell support lets ``no_agent=True`` jobs ship classic bash watchdogs
     (the `memory-watchdog.sh` pattern) without wrapping them in Python.
 
     Subprocess environment is passed through ``_sanitize_subprocess_env`` so
@@ -2042,6 +2057,12 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         (success, output) — on failure *output* contains the error message so the
         LLM can report the problem to the user.
     """
+    module_name = None
+    if script_path.startswith("module:"):
+        module_name = script_path.removeprefix("module:").strip()
+        if module_name not in _BUNDLED_CRON_MODULES:
+            return False, f"Blocked: unregistered bundled cron module: {module_name!r}"
+
     scripts_dir = _get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir_resolved = scripts_dir.resolve()
@@ -2057,11 +2078,14 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         (_repo_root / "research_copilot" / "scripts").resolve(),
     ]
 
-    raw = Path(script_path).expanduser()
-    if raw.is_absolute():
-        path = raw.resolve()
+    if module_name is not None:
+        path = None
     else:
-        path = (scripts_dir / raw).resolve()
+        raw = Path(script_path).expanduser()
+        if raw.is_absolute():
+            path = raw.resolve()
+        else:
+            path = (scripts_dir / raw).resolve()
 
     # Guard against path traversal, absolute path injection, and symlink
     # escape — scripts MUST resolve into HERMES_HOME/scripts/ OR a
@@ -2075,15 +2099,15 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                 continue
         return False
 
-    if not _inside_any(path, _allowed_roots):
+    if path is not None and not _inside_any(path, _allowed_roots):
         return False, (
             f"Blocked: script path resolves outside the allowed scripts directories "
             f"({[str(r) for r in _allowed_roots]}): {script_path!r}"
         )
 
-    if not path.exists():
+    if path is not None and not path.exists():
         return False, f"Script not found: {path}"
-    if not path.is_file():
+    if path is not None and not path.is_file():
         return False, f"Script path is not a file: {path}"
 
     script_timeout = _get_script_timeout()
@@ -2092,8 +2116,11 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     # everything else.  We deliberately do NOT honour the file's own
     # shebang: the scripts dir is trusted, but keeping the interpreter
     # choice explicit here keeps the allowed surface small and auditable.
-    suffix = path.suffix.lower()
-    if suffix in {".sh", ".bash"}:
+    suffix = path.suffix.lower() if path is not None else ""
+    if module_name is not None:
+        argv = [sys.executable, "-m", module_name]
+        subprocess_cwd = str(_repo_root)
+    elif suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
         # all work.  On native Windows without Git for Windows installed
         # shutil.which returns None — fall back to a clear error rather
@@ -2109,8 +2136,10 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                 "or rewrite the script as Python (.py)."
             )
         argv = [_bash, str(path)]
+        subprocess_cwd = str(path.parent)
     else:
         argv = [sys.executable, str(path)]
+        subprocess_cwd = str(path.parent)
 
     try:
         from tools.environments.local import _sanitize_subprocess_env
@@ -2121,7 +2150,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             capture_output=True,
             text=True,
             timeout=script_timeout,
-            cwd=str(path.parent),
+            cwd=subprocess_cwd,
             env=_sanitize_subprocess_env(os.environ.copy()),
             **popen_kwargs,
         )
@@ -2149,7 +2178,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         return True, stdout
 
     except subprocess.TimeoutExpired:
-        return False, f"Script timed out after {script_timeout}s: {path}"
+        target = module_name or str(path)
+        return False, f"Script timed out after {script_timeout}s: {target}"
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
 

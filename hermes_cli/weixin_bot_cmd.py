@@ -178,7 +178,7 @@ def _profile_status(name: str, home: Path) -> dict[str, Any]:
     has_account = _env_key_present(env_path, "WEIXIN_ACCOUNT_ID")
     rc_initialized = (data_dir / "config.json").exists()
     cron_names = _cron_names(home)
-    expected_cron = {"paper-fetcher", "daily-paper-pick", "paper-health-report"}
+    expected_cron = {"paper-fetcher", "research-library-recommend", "paper-health-report"}
     return {
         "profile": name,
         "profile_home": str(home),
