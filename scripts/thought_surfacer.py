@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Thought Surfacer — picks one active thought daily and sends it to WeChat.
+"""Thought incubator — surfaces one due idea with a useful next step.
 
 Reads ``$HERMES_HOME/thoughts.json`` (defaults to ``~/.hermes/thoughts.json``),
 selects an active thought (prioritising oldest that hasn't been surfaced
@@ -41,6 +41,62 @@ def _save_store(store: dict) -> None:
     tmp.replace(path)
 
 
+def _parse_iso(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _settings() -> dict:
+    defaults = {
+        "active_hours": {"start": "09:00", "end": "21:30"},
+        "max_nudges_per_day": 2,
+        "unanswered_backoff": ["3d", "7d", "30d"],
+    }
+    path = _hermes_home() / "config.yaml"
+    if not path.exists():
+        return defaults
+    try:
+        import yaml
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        custom = ((cfg.get("thoughts") or {}).get("incubation") or {})
+        return {**defaults, **custom}
+    except Exception:
+        return defaults
+
+
+def _inside_active_hours(settings: dict, now: datetime) -> bool:
+    hours = settings.get("active_hours") or {}
+    try:
+        start_h, start_m = map(int, str(hours.get("start", "09:00")).split(":"))
+        end_h, end_m = map(int, str(hours.get("end", "21:30")).split(":"))
+    except (TypeError, ValueError):
+        return True
+    minute = now.hour * 60 + now.minute
+    start = start_h * 60 + start_m
+    end = end_h * 60 + end_m
+    return start <= minute < end if start <= end else minute >= start or minute < end
+
+
+def _action_line(thought: dict) -> str:
+    action = thought.get("next_action") or {}
+    kind = action.get("kind") or "clarify"
+    prompt = str(action.get("prompt") or "").strip()
+    if prompt:
+        return prompt
+    return {
+        "clarify": "这件事现在最需要澄清的一个问题是什么？回复我，我们一起把它说清楚。",
+        "research": "要不要先确定一个具体调研问题？你确认后我再开始查资料。",
+        "learn": "你想先补哪一块知识？我可以帮你把它变成一个小型学习计划。",
+        "track": "这件事最近有新进展、阻碍或方向变化吗？",
+        "defer": "这个想法还值得保留吗？你可以回复继续、暂停或归档。",
+    }.get(kind, "回复我，我们继续把这个想法推进一步。")
+
+
 def main() -> None:
     path = _store_path()
     if not path.exists():
@@ -51,7 +107,34 @@ def main() -> None:
     except (json.JSONDecodeError, OSError):
         return
 
-    active = [th for th in store.get("thoughts", []) if th.get("state") == "active"]
+    if store.get("schema_version") != 1:
+        return
+    now = datetime.now().astimezone()
+    settings = _settings()
+    if settings.get("enabled", True) is False or not _inside_active_hours(settings, now):
+        return
+    today = now.date()
+    nudges_today = 0
+    for th in store.get("thoughts", []):
+        surfaced = _parse_iso(th.get("surfaced_at"))
+        if surfaced and surfaced.astimezone().date() == today:
+            nudges_today += 1
+    if nudges_today >= int(settings.get("max_nudges_per_day") or 2):
+        return
+
+    now_utc = datetime.now(timezone.utc)
+    active = []
+    for th in store.get("thoughts", []):
+        if th.get("state") != "active":
+            continue
+        review = th.get("review") or {}
+        due = _parse_iso(review.get("next_review_at"))
+        snoozed = _parse_iso(review.get("snoozed_until"))
+        if snoozed and snoozed > now_utc:
+            continue
+        if due and due > now_utc:
+            continue
+        active.append(th)
     if not active:
         return
 
@@ -80,11 +163,30 @@ def main() -> None:
         lines.append("")
         lines.append(f"*Origin: {source}*")
     lines.append("")
-    lines.append("Reply to discuss, or `/th done` to archive.")
+    lines.append(_action_line(chosen))
+    lines.append("")
+    lines.append(
+        f"Use `/th discuss {chosen.get('id')}` to continue, "
+        f"or `/th pause {chosen.get('id')}` / `/th done {chosen.get('id')}`."
+    )
 
     # Mark surfaced
-    chosen["surfaced_at"] = datetime.now(timezone.utc).isoformat()
+    chosen["surfaced_at"] = now_utc.isoformat()
     chosen["surface_count"] = (chosen.get("surface_count", 0) or 0) + 1
+    review = chosen.setdefault("review", {})
+    unanswered = int(review.get("unanswered_count") or 0) + 1
+    review["unanswered_count"] = unanswered
+    backoff = settings.get("unanswered_backoff") or ["3d", "7d", "30d"]
+    spec = str(backoff[min(unanswered - 1, len(backoff) - 1)]) if backoff else "30d"
+    try:
+        days = max(1, int(spec.rstrip("d")))
+    except ValueError:
+        days = 30
+    from datetime import timedelta
+    review["next_review_at"] = (now_utc + timedelta(days=days)).isoformat()
+    review["snoozed_until"] = None
+    chosen["updated_at"] = now_utc.isoformat()
+    chosen.setdefault("history", []).append({"at": now_utc.isoformat(), "event": "surfaced"})
     _save_store(store)
 
     sys.stdout.write("\n".join(lines))

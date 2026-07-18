@@ -199,7 +199,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("status", "add", "list", "done", "rm", "pause", "resume", "ask", "discuss", "end")),
     CommandDef("th", "Manage thought incubation (capture, list, done, pause, resume)", "Tools & Skills",
                aliases=("thought", "thoughts"), args_hint="[subcommand]",
-               subcommands=("status", "list", "show", "done", "rm", "pause", "resume", "ask", "discuss", "end")),
+               subcommands=("status", "capture", "list", "show", "done", "rm", "pause", "resume", "snooze", "next", "ask", "discuss", "end")),
     CommandDef("paper", "Manage Research Copilot topics, history, and feedback", "Tools & Skills",
                args_hint="[now|topics|history|save|skip|read|feedback|health|ask|discuss|end]",
                subcommands=("now", "topics", "history", "save", "skip", "read", "feedback", "health", "ask", "discuss", "end")),

@@ -4875,8 +4875,9 @@ class GatewaySlashCommandsMixin:
     async def _handle_th_command(self, event: MessageEvent) -> str:
         """Handle /th in the gateway — manage thought incubation."""
         from tools.thought_tools import (
-            capture_thought, list_thoughts, archive_thought,
-            remove_thought, pause_thought, resume_thought,
+            capture_thought_text, list_thoughts, archive_thought,
+            remove_thought, pause_thought, resume_thought, snooze_thought,
+            update_thought_action,
         )
 
         args = (event.get_command_args() or "").strip()
@@ -4892,6 +4893,13 @@ class GatewaySlashCommandsMixin:
                 return response
         tokens = args.split()
         subcmd = tokens[0].lower() if tokens else "status"
+
+        if subcmd == "capture":
+            text = args[len("capture"):].strip()
+            if not text:
+                return "Usage: `/th capture <idea>`"
+            thought = capture_thought_text(text, source="gateway")
+            return f"💭 Thought saved: **{thought['title']}** (`{thought['id']}`)"
 
         if subcmd == "status":
             active = list_thoughts(state="active")
@@ -4978,5 +4986,19 @@ class GatewaySlashCommandsMixin:
                 return f"▶️ Thought `{tid}` reactivated!"
             return f"Thought `{tid}` not found."
 
-        return "Usage: `/th [status|list|show|done|rm|pause|resume]`"
+        if subcmd == "snooze":
+            tid = tokens[1].strip() if len(tokens) > 1 else ""
+            until = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid or not until:
+                return "Usage: `/th snooze <thought_id> <3d|12h|ISO time>`"
+            return f"⏳ Thought `{tid}` snoozed." if snooze_thought(tid, until) else f"Could not snooze `{tid}`."
 
+        if subcmd == "next":
+            tid = tokens[1].strip() if len(tokens) > 1 else ""
+            kind = tokens[2].strip().lower() if len(tokens) > 2 else ""
+            prompt = " ".join(tokens[3:])
+            if not tid or not kind:
+                return "Usage: `/th next <id> <clarify|research|learn|track|defer> [prompt]`"
+            return f"✅ Next action for `{tid}`: **{kind}**" if update_thought_action(tid, kind, prompt) else f"Could not update `{tid}`."
+
+        return "Usage: `/th [status|list|show|done|rm|pause|resume]`"

@@ -88,3 +88,28 @@ class TestCheckListOps:
         st = tt._load_store()
         remaining = [it["text"] for it in st["tasks"][0]["checklist"]]
         assert remaining == ["a", "c"]
+
+
+class TestThoughtIncubation:
+    @pytest.fixture(autouse=True)
+    def isolated_store(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import tools.thought_tools as tt
+        self.tt = tt
+
+    def test_capture_text_creates_reviewable_thought(self):
+        thought = self.tt.capture_thought_text("也许可以用本地模型分析日记", source="test")
+        assert thought["stage"] == "fuzzy"
+        assert thought["next_action"]["kind"] == "clarify"
+        assert thought["review"]["next_review_at"]
+        assert self.tt._load_store()["schema_version"] == 1
+
+    def test_snooze_and_response_reset_backoff(self):
+        thought = self.tt.capture_thought("Idea", "Try it")
+        assert self.tt.snooze_thought(thought["id"], "3d") is True
+        assert self.tt.record_thought_response(thought["id"], "先做一个原型") is True
+        saved = self.tt.list_thoughts()[0]
+        assert saved["stage"] == "exploring"
+        assert saved["review"]["unanswered_count"] == 0
+        assert saved["progress"]["status"] == "engaged"
+        assert saved["history"][-1]["event"] == "user_response"

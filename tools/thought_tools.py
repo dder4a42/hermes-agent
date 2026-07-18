@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -28,6 +28,9 @@ except ImportError:
 
 logger = logging.getLogger("thought_tools")
 
+SCHEMA_VERSION = 1
+DEFAULT_REVIEW_DAYS = 7
+
 
 # ── Storage helpers ───────────────────────────────────────────────────────────
 
@@ -38,12 +41,18 @@ def _store_path() -> Path:
 def _load_store() -> dict:
     path = _store_path()
     if not path.exists():
-        return {"thoughts": [], "tasks": []}
+        return {"schema_version": SCHEMA_VERSION, "thoughts": [], "tasks": []}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        store = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(store, dict) or store.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError(
+                "Unsupported thoughts.json schema. Run "
+                "`python scripts/migrate_thoughts.py` before starting Hermes."
+            )
+        return store
     except (json.JSONDecodeError, OSError):
         logger.warning("Corrupt thoughts.json, resetting")
-        return {"thoughts": [], "tasks": []}
+        return {"schema_version": SCHEMA_VERSION, "thoughts": [], "tasks": []}
 
 
 def _save_store(store: dict) -> None:
@@ -380,9 +389,34 @@ def list_tasks(state: str = "") -> List[dict]:
     return tasks
 
 
-def capture_thought(title: str, summary: str, source: str = "", tags: Optional[List[str]] = None) -> dict:
+def capture_thought(
+    title: str,
+    summary: str,
+    source: str = "",
+    tags: Optional[List[str]] = None,
+    *,
+    next_action_kind: str = "clarify",
+    next_action_prompt: str = "",
+    next_review_at: Optional[str] = None,
+    priority: str = "normal",
+) -> dict:
     """Save a fuzzy idea for later incubation. Returns the saved thought dict."""
     store = _load_store()
+    now = datetime.now(timezone.utc)
+    if next_review_at:
+        try:
+            parsed_review = datetime.fromisoformat(str(next_review_at).replace("Z", "+00:00"))
+            if parsed_review.tzinfo is None:
+                parsed_review = parsed_review.replace(tzinfo=timezone.utc)
+            next_review_at = parsed_review.isoformat()
+        except ValueError:
+            next_review_at = None
+    if not next_review_at:
+        next_review_at = (now + timedelta(days=DEFAULT_REVIEW_DAYS)).isoformat()
+    if next_action_kind not in {"clarify", "research", "learn", "track", "defer"}:
+        next_action_kind = "clarify"
+    if priority not in {"low", "normal", "high"}:
+        priority = "normal"
     thought = {
         "id": _new_id("th"),
         "title": title,
@@ -390,13 +424,121 @@ def capture_thought(title: str, summary: str, source: str = "", tags: Optional[L
         "source": source or "",
         "tags": tags or [],
         "state": "active",
-        "created_at": _now_iso(),
+        "stage": "fuzzy",
+        "priority": priority,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
         "surfaced_at": None,
         "surface_count": 0,
+        "open_questions": [],
+        "next_action": {
+            "kind": next_action_kind,
+            "prompt": (next_action_prompt or "").strip(),
+        },
+        "review": {
+            "next_review_at": next_review_at,
+            "cadence": f"{DEFAULT_REVIEW_DAYS}d",
+            "snoozed_until": None,
+            "unanswered_count": 0,
+        },
+        "progress": {
+            "status": "unexplored",
+            "last_update_at": None,
+        },
+        "history": [{"at": now.isoformat(), "event": "captured"}],
     }
     store.setdefault("thoughts", []).append(thought)
     _save_store(store)
     return thought
+
+
+def capture_thought_text(text: str, *, source: str = "command") -> dict:
+    """Capture free text without a second model call.
+
+    The full text remains the summary; the first non-empty line becomes a
+    compact title. Normal agent turns can still call ``thought_capture`` with
+    a model-written title/summary, while command-only gateways get a reliable
+    capture path that never drops the user's wording.
+    """
+    summary = (text or "").strip()
+    if not summary:
+        raise ValueError("thought text is required")
+    first_line = next((line.strip() for line in summary.splitlines() if line.strip()), summary)
+    title = first_line[:60].rstrip("，。,.!?！？;； ")
+    if len(first_line) > 60:
+        title += "…"
+    return capture_thought(title=title, summary=summary, source=source)
+
+
+def _find_thought(store: dict, thought_id: str) -> Optional[dict]:
+    return next((th for th in store.get("thoughts", []) if th.get("id") == thought_id), None)
+
+
+def update_thought_action(thought_id: str, kind: str, prompt: str = "") -> bool:
+    """Set the next incubation action without executing it."""
+    if kind not in {"clarify", "research", "learn", "track", "defer"}:
+        return False
+    store = _load_store()
+    thought = _find_thought(store, thought_id)
+    if thought is None:
+        return False
+    now = _now_iso()
+    thought["next_action"] = {"kind": kind, "prompt": (prompt or "").strip()}
+    thought["updated_at"] = now
+    thought.setdefault("history", []).append({"at": now, "event": "next_action", "kind": kind})
+    _save_store(store)
+    return True
+
+
+def snooze_thought(thought_id: str, until: str) -> bool:
+    """Defer a thought until an ISO timestamp or a compact duration (3d/12h)."""
+    text = (until or "").strip().lower()
+    now = datetime.now(timezone.utc)
+    import re as _re
+    match = _re.fullmatch(r"(\d+)\s*([hd])", text)
+    if match:
+        amount = int(match.group(1))
+        target = now + (timedelta(hours=amount) if match.group(2) == "h" else timedelta(days=amount))
+    else:
+        try:
+            target = datetime.fromisoformat(text.replace("z", "+00:00"))
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return False
+    store = _load_store()
+    thought = _find_thought(store, thought_id)
+    if thought is None:
+        return False
+    target_iso = target.isoformat()
+    thought.setdefault("review", {})["snoozed_until"] = target_iso
+    thought["review"]["next_review_at"] = target_iso
+    thought["updated_at"] = now.isoformat()
+    thought.setdefault("history", []).append({"at": now.isoformat(), "event": "snoozed", "until": target_iso})
+    _save_store(store)
+    return True
+
+
+def record_thought_response(thought_id: str, text: str) -> bool:
+    """Record that the user engaged with a surfaced thought."""
+    store = _load_store()
+    thought = _find_thought(store, thought_id)
+    if thought is None:
+        return False
+    now = datetime.now(timezone.utc)
+    thought["stage"] = "exploring"
+    thought["updated_at"] = now.isoformat()
+    thought.setdefault("progress", {})["status"] = "engaged"
+    thought["progress"]["last_update_at"] = now.isoformat()
+    review = thought.setdefault("review", {})
+    review["unanswered_count"] = 0
+    review["snoozed_until"] = None
+    review["next_review_at"] = (now + timedelta(days=DEFAULT_REVIEW_DAYS)).isoformat()
+    thought.setdefault("history", []).append({
+        "at": now.isoformat(), "event": "user_response", "text": (text or "").strip()[:1000],
+    })
+    _save_store(store)
+    return True
 
 
 def archive_thought(thought_id: str) -> bool:
@@ -454,6 +596,17 @@ def mark_surfaced(thought_id: str) -> None:
         if th["id"] == thought_id:
             th["surfaced_at"] = _now_iso()
             th["surface_count"] = (th.get("surface_count", 0) or 0) + 1
+            review = th.setdefault("review", {})
+            unanswered = int(review.get("unanswered_count") or 0) + 1
+            review["unanswered_count"] = unanswered
+            # Gentle exponential backoff: 3d, 7d, then 30d.
+            delay_days = (3, 7, 30)[min(unanswered - 1, 2)]
+            review["next_review_at"] = (
+                datetime.now(timezone.utc) + timedelta(days=delay_days)
+            ).isoformat()
+            review["snoozed_until"] = None
+            th["updated_at"] = _now_iso()
+            th.setdefault("history", []).append({"at": _now_iso(), "event": "surfaced"})
             _save_store(store)
             return
 
@@ -606,6 +759,10 @@ def _handler_thought_capture(args: dict, task_id: str = None) -> str:
         summary=args.get("summary", ""),
         source=args.get("source", ""),
         tags=args.get("tags"),
+        next_action_kind=args.get("next_action_kind", "clarify"),
+        next_action_prompt=args.get("next_action_prompt", ""),
+        next_review_at=args.get("next_review_at"),
+        priority=args.get("priority", "normal"),
     )
     return json.dumps({"success": True, "thought": thought})
 
@@ -663,6 +820,10 @@ _thought_schema = {
         "source": {"type": "string", "description": "Where this idea came from (conversation topic, reading, etc.)"},
         "tags": {"type": "array", "items": {"type": "string"}, "description": "Optional tags for organization"},
         "state": {"type": "string", "enum": ["active", "dormant", "archived"], "description": "Filter by state"},
+        "next_action_kind": {"type": "string", "enum": ["clarify", "research", "learn", "track", "defer"], "description": "How to advance the idea at its next review"},
+        "next_action_prompt": {"type": "string", "description": "Optional specific question to ask at the next review"},
+        "next_review_at": {"type": "string", "description": "Optional ISO-8601 review time; defaults to seven days from capture"},
+        "priority": {"type": "string", "enum": ["low", "normal", "high"]},
     },
 }
 
@@ -772,7 +933,7 @@ registry.register(
         "description": "Save a fuzzy idea or plan for future incubation. Call this when the user discusses future plans, interesting directions, or vague intentions like 'we should invest in X', 'maybe we try Y'.",
         "parameters": {
             "type": "object",
-            "properties": {k: v for k, v in _thought_schema["properties"].items() if k in ("title", "summary", "source", "tags")},
+            "properties": {k: v for k, v in _thought_schema["properties"].items() if k in ("title", "summary", "source", "tags", "next_action_kind", "next_action_prompt", "next_review_at", "priority")},
             "required": ["title", "summary"],
         },
     },

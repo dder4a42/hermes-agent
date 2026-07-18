@@ -38,6 +38,7 @@ def stub_agent(monkeypatch):
 
 
 def _write_thoughts_store(home: Path, data: dict) -> None:
+    data.setdefault("schema_version", 1)
     (home / "thoughts.json").write_text(json.dumps(data), encoding="utf-8")
 
 
@@ -197,6 +198,10 @@ def test_discuss_with_subject_and_followup(profile_home, stub_agent):
     # First turn from the initial follow-up got logged.
     assert len(stub_agent) == 1
     assert disc["turns"][-1]["user"].startswith("帮我")
+    saved = json.loads((profile_home / "thoughts.json").read_text())["thoughts"][0]
+    assert saved["stage"] == "exploring"
+    assert saved["review"]["unanswered_count"] == 0
+    assert saved["history"][-1]["event"] == "user_response"
 
 
 def test_discuss_without_subject(profile_home, stub_agent):

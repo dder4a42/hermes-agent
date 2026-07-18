@@ -192,6 +192,8 @@ def main() -> None:
         store = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return
+    if store.get("schema_version") != 1:
+        return
 
     now = _now_local()
     now_utc = datetime.now(timezone.utc)
@@ -223,10 +225,9 @@ def main() -> None:
             # Main reminder: now >= scheduled and not yet fired.
             if not already_main and now >= scheduled:
                 fired_main = True
-        else:
-            cron = t.get("schedule_cron", "") or ""
-            if cron and not already_main and _cron_matches(cron, now):
-                fired_main = True
+        # schema_version=1 requires an absolute scheduled_at. Recurrence is
+        # advanced from that timestamp after firing; there is no legacy cron
+        # fallback to create a second source of scheduling truth.
 
         if fired_pre and not fired_main:
             minutes_left = int((scheduled - now).total_seconds() // 60) if scheduled else remind_before

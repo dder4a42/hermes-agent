@@ -565,6 +565,9 @@ def handle_domain_subcommand(domain: str, args: str) -> Optional[str]:
         if not followup:
             return header + "\n请说出你想讨论的内容。"
         answer = run_domain_ask(domain, followup, subject_id=subject_id)
+        if domain == "th" and subject_id:
+            from tools.thought_tools import record_thought_response
+            record_thought_response(subject_id, followup)
         append_active_discussion_turn(disc, followup, answer)
         return f"{header}\n\n{answer}"
 
@@ -600,6 +603,9 @@ def continue_active_discussion(text: str) -> Optional[str]:
         subject_id=active.get("subject_id"),
         prior_turns=active.get("turns"),
     )
+    if domain == "th" and active.get("subject_id"):
+        from tools.thought_tools import record_thought_response
+        record_thought_response(str(active["subject_id"]), text)
     append_active_discussion_turn(active, text, answer)
     return answer
 

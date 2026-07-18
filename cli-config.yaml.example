@@ -139,6 +139,20 @@ model:
 #         stale_timeout_seconds: 1800  # Longer non-stream stale timeout for slow large-context turns
 
 # =============================================================================
+# Thought incubation / low-interruption follow-up
+# =============================================================================
+# thoughts:
+#   incubation:
+#     enabled: true
+#     # The worker may check frequently, but sends only when a thought's
+#     # next_review_at is due and all interruption limits allow it.
+#     active_hours:
+#       start: "09:00"
+#       end: "21:30"
+#     max_nudges_per_day: 2
+#     unanswered_backoff: ["3d", "7d", "30d"]
+
+# =============================================================================
 # OpenRouter Provider Routing (only applies when using OpenRouter)
 # =============================================================================
 # Control how requests are routed across providers on OpenRouter.

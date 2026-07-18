@@ -23,7 +23,7 @@ def hermes_home(tmp_path):
 
 def _write_store(hermes_home: Path, tasks: list) -> Path:
     path = hermes_home / "thoughts.json"
-    path.write_text(json.dumps({"thoughts": [], "tasks": tasks}, ensure_ascii=False))
+    path.write_text(json.dumps({"schema_version": 1, "thoughts": [], "tasks": tasks}, ensure_ascii=False))
     return path
 
 
@@ -125,10 +125,8 @@ def test_missing_store_is_silent(hermes_home):
     assert stdout.stdout == ""
 
 
-def test_legacy_cron_fallback_still_matches(hermes_home):
-    """Pre-M0 tasks that never got scheduled_at but do have schedule_cron
-    (unlikely but possible if user tinkered) should still fire via the
-    legacy _cron_matches path."""
+def test_task_without_absolute_schedule_never_fires(hermes_home):
+    """The v1 schema has one source of truth: scheduled_at."""
     now = datetime.now(CST)
     cron = f"{now.minute} {now.hour} * * *"
     _write_store(hermes_home, [{
@@ -138,8 +136,8 @@ def test_legacy_cron_fallback_still_matches(hermes_home):
         "last_reminded": None, "lead_reminded_at": None, "remind_count": 0,
     }])
     stdout, store = _run_surfacer(hermes_home)
-    assert "cron legacy" in stdout
-    assert store["tasks"][0]["state"] == "done"
+    assert stdout == ""
+    assert store["tasks"][0]["state"] == "active"
 
 
 def test_pre_reminder_fires_once_and_renders_checklist(hermes_home):

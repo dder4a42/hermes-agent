@@ -1403,8 +1403,9 @@ class CLICommandsMixin:
         """Handle /th (thought) — manage thought incubation."""
         import shlex
         from tools.thought_tools import (
-            capture_thought, list_thoughts, archive_thought,
-            remove_thought, pause_thought, resume_thought,
+            capture_thought_text, list_thoughts, archive_thought,
+            remove_thought, pause_thought, resume_thought, snooze_thought,
+            update_thought_action,
         )
 
         tokens = shlex.split(cmd)
@@ -1440,7 +1441,15 @@ class CLICommandsMixin:
                 for th in active[:5]:
                     print(f"    [{th['id']}] {th['title']}")
             print()
-            print("  Commands: /th list, /th show <id>, /th done <id>")
+            print("  Commands: /th capture <idea>, /th list, /th show <id>, /th done <id>")
+
+        elif subcmd == "capture":
+            text = cmd[len("th capture"):].strip() if cmd.lower().startswith("th capture") else " ".join(tokens[2:])
+            if not text:
+                print("(._.) Usage: /th capture <idea>")
+                return
+            thought = capture_thought_text(text, source="cli")
+            print(f"(^_^) Thought saved! [{thought['id']}] {thought['title']}")
 
         elif subcmd == "list":
             sf = tokens[2].strip().lower() if len(tokens) > 2 else "active"
@@ -1514,9 +1523,26 @@ class CLICommandsMixin:
             else:
                 print(f"(._.) Thought {tid} not found.")
 
+        elif subcmd == "snooze":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            until = tokens[3].strip() if len(tokens) > 3 else ""
+            if not tid or not until:
+                print("(._.) Usage: /th snooze <thought_id> <3d|12h|ISO time>")
+                return
+            print(f"(^_^) Thought {tid} snoozed." if snooze_thought(tid, until) else f"(._.) Could not snooze {tid}.")
+
+        elif subcmd == "next":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            kind = tokens[3].strip().lower() if len(tokens) > 3 else ""
+            prompt = " ".join(tokens[4:])
+            if not tid or not kind:
+                print("(._.) Usage: /th next <id> <clarify|research|learn|track|defer> [prompt]")
+                return
+            print(f"(^_^) Next action for {tid}: {kind}" if update_thought_action(tid, kind, prompt) else f"(._.) Could not update {tid}.")
+
         else:
             print(f"(._.) Unknown subcommand: {subcmd}")
-            print("  Usage: /th [status|list|show|done|rm|pause|resume]")
+            print("  Usage: /th [status|capture|list|show|done|rm|pause|resume|snooze|next]")
 
     def _handle_cron_command(self, cmd: str):
         """Handle the /cron command to manage scheduled tasks."""
