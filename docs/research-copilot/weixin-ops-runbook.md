@@ -1,5 +1,11 @@
 # Weixin Research Copilot — ops runbook
 
+> **Legacy operational notes.** Cron names, storage files, and profile-local
+> script behavior below predate the SQLite Research Library. Start with
+> [`research_copilot/README.md`](../../research_copilot/README.md) and verify
+> the live job list with `hermes -p <profile> cron list` before applying these
+> recipes.
+
 Recipes for common day-2 operations on a host running one or more Weixin bots
 backed by Research Copilot. Every command runs on the host that owns the
 profile — no cross-host coordination is required.

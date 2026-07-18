@@ -1,5 +1,10 @@
 # Research Copilot data contract
 
+> **Legacy document.** This describes the pre-Library JSON/JSONL pipeline.
+> The current SQLite/YAML runtime contract and operator commands are documented
+> in [`research_copilot/README.md`](../../research_copilot/README.md). Keep this
+> file only as migration context.
+
 Research Copilot state lives entirely under `<HERMES_HOME>/research-copilot/`.
 Every profile has its own tree — Research Copilot never reads or writes another
 profile's data. `HERMES_HOME` defaults to `~/.hermes` for the primary profile
