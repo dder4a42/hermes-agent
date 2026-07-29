@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""JSON CLI for the personal English learning SQLite service."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+from learning_core import LearningDatabase, LearningService, VocabularyEntry
+
+
+def default_database_path() -> Path:
+    hermes_home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+    return hermes_home / "personal-english-learning" / "learning.db"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", type=Path, default=default_database_path())
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    commands.add_parser("init", help="Initialize the SQLite database")
+
+    import_parser = commands.add_parser("import-jsonl", help="Import word senses")
+    import_parser.add_argument("path", type=Path)
+
+    add = commands.add_parser("add-sense", help="Add or update one word sense")
+    add.add_argument("--lemma", required=True)
+    add.add_argument("--part-of-speech", required=True)
+    add.add_argument("--definition-en", required=True)
+    add.add_argument("--definition-zh")
+    add.add_argument("--frequency-rank", type=int)
+    add.add_argument("--source", required=True)
+    add.add_argument("--source-sense-id")
+
+    sample = commands.add_parser("assessment-sample", help="Sample frequency bands")
+    sample.add_argument("--per-band", type=int, default=10)
+    sample.add_argument("--seed", type=int, default=0)
+
+    assessment = commands.add_parser("assessment-record", help="Record one assessment")
+    assessment.add_argument("--sense-id", required=True)
+    assessment.add_argument("--response", choices=("known", "unsure", "unknown"), required=True)
+    assessment.add_argument("--frequency-band", required=True)
+    assessment.add_argument("--event-id")
+
+    plan = commands.add_parser("daily-plan", help="Return due reviews and new senses")
+    plan.add_argument("--review-limit", type=int, default=30)
+    plan.add_argument("--new-limit", type=int, default=8)
+    plan.add_argument("--backlog-reduce-at", type=int, default=30)
+    plan.add_argument("--backlog-stop-at", type=int, default=60)
+
+    review = commands.add_parser("review", help="Record and schedule one review")
+    review.add_argument("--card-id", required=True)
+    review.add_argument("--rating", choices=("again", "hard", "good", "easy"), required=True)
+    review.add_argument("--idempotency-key", required=True)
+    review.add_argument("--response-time-ms", type=int)
+    review.add_argument("--hint-count", type=int, default=0)
+    review.add_argument("--answer-text")
+
+    commands.add_parser("stats", help="Show learning progress statistics")
+    return parser
+
+
+def run(args: argparse.Namespace) -> dict:
+    service = LearningService(LearningDatabase(args.db))
+    if args.command == "init":
+        return {"ok": True, "database": str(args.db)}
+    if args.command == "import-jsonl":
+        return service.import_jsonl(args.path)
+    if args.command == "add-sense":
+        return service.upsert_vocabulary(
+            VocabularyEntry(
+                lemma=args.lemma,
+                part_of_speech=args.part_of_speech,
+                definition_en=args.definition_en,
+                definition_zh=args.definition_zh,
+                frequency_rank=args.frequency_rank,
+                source=args.source,
+                source_sense_id=args.source_sense_id,
+            )
+        )
+    if args.command == "assessment-sample":
+        return service.assessment_sample(per_band=args.per_band, seed=args.seed)
+    if args.command == "assessment-record":
+        return service.record_assessment(
+            args.sense_id,
+            args.response,
+            args.frequency_band,
+            event_id=args.event_id,
+        )
+    if args.command == "daily-plan":
+        return service.daily_plan(
+            review_limit=args.review_limit,
+            new_limit=args.new_limit,
+            backlog_reduce_at=args.backlog_reduce_at,
+            backlog_stop_at=args.backlog_stop_at,
+        )
+    if args.command == "review":
+        return service.record_review(
+            args.card_id,
+            args.rating,
+            args.idempotency_key,
+            response_time_ms=args.response_time_ms,
+            hint_count=args.hint_count,
+            answer_text=args.answer_text,
+        )
+    if args.command == "stats":
+        return service.stats()
+    raise AssertionError(f"unhandled command: {args.command}")
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        result = run(args)
+    except (OSError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False), file=sys.stderr)
+        return 2
+    print(json.dumps({"ok": True, **result}, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
