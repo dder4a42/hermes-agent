@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 
 SCHEMA = """
@@ -98,6 +98,63 @@ CREATE TABLE IF NOT EXISTS review_events (
 
 CREATE INDEX IF NOT EXISTS idx_review_events_card
     ON review_events(card_id, reviewed_at);
+
+CREATE TABLE IF NOT EXISTS documents (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    source TEXT NOT NULL,
+    content TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (source, content_hash)
+);
+
+CREATE TABLE IF NOT EXISTS document_tokens (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    token_index INTEGER NOT NULL CHECK (token_index >= 0),
+    surface TEXT NOT NULL,
+    normalized TEXT NOT NULL,
+    start_offset INTEGER NOT NULL CHECK (start_offset >= 0),
+    end_offset INTEGER NOT NULL CHECK (end_offset > start_offset),
+    match_status TEXT NOT NULL
+        CHECK (match_status IN ('unmatched', 'unique', 'ambiguous')),
+    UNIQUE (document_id, token_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_tokens_document
+    ON document_tokens(document_id, token_index);
+
+CREATE TABLE IF NOT EXISTS document_token_senses (
+    token_id TEXT NOT NULL REFERENCES document_tokens(id) ON DELETE CASCADE,
+    sense_id TEXT NOT NULL REFERENCES word_senses(id) ON DELETE CASCADE,
+    matched_lemma TEXT NOT NULL,
+    PRIMARY KEY (token_id, sense_id)
+);
+
+CREATE TABLE IF NOT EXISTS reading_targets (
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    sense_id TEXT NOT NULL REFERENCES word_senses(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'candidate'
+        CHECK (status IN ('candidate', 'accepted', 'rejected')),
+    priority_score REAL NOT NULL,
+    selection_reason TEXT NOT NULL,
+    decided_at TEXT,
+    PRIMARY KEY (document_id, sense_id)
+);
+
+CREATE TABLE IF NOT EXISTS encounters (
+    id TEXT PRIMARY KEY,
+    sense_id TEXT NOT NULL REFERENCES word_senses(id) ON DELETE CASCADE,
+    document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    token_id TEXT NOT NULL REFERENCES document_tokens(id) ON DELETE CASCADE,
+    encounter_type TEXT NOT NULL CHECK (encounter_type IN ('reading')),
+    created_at TEXT NOT NULL,
+    UNIQUE (sense_id, document_id, token_id, encounter_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_encounters_sense
+    ON encounters(sense_id, created_at);
 """
 
 

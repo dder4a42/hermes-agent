@@ -46,6 +46,7 @@ Use this skill when the user asks to:
 - assess their current English vocabulary;
 - learn high-frequency words or concrete word senses;
 - review due English vocabulary;
+- analyze a short English text for lexical coverage and learning targets;
 - record whether a word is known, uncertain, or unknown;
 - inspect vocabulary-learning progress;
 - create a small daily English vocabulary plan.
@@ -179,6 +180,48 @@ python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_
 Describe recognition and recall separately. Do not interpret the values as an
 official vocabulary size, CEFR level, or TOEFL score.
 
+### 7. Analyze a short reading
+
+Analyze pasted text or a UTF-8 text file:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  reading-analyze \
+  --file /path/to/short-reading.txt \
+  --title "Agent systems" \
+  --source "user_text" \
+  --target-limit 5
+```
+
+Interpret the result conservatively:
+
+- `catalog_coverage` is the share of tokens matched by the imported vocabulary;
+- `known_coverage` counts only unambiguous matches with recognition at or above
+  the learning threshold;
+- `targets` contains high-value unambiguous senses, ordered by assessed gaps,
+  repetition and frequency;
+- `ambiguous_matches` requires a learner or reliable contextual analysis to
+  choose a sense.
+
+Never present low catalog coverage as poor learner ability: it may only mean the
+local vocabulary source is incomplete. Never automatically accept a sense from
+`ambiguous_matches` based on spelling alone.
+
+After showing three to five candidates, ask the learner which ones to save.
+Record all decisions in one command:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  reading-confirm \
+  --document-id DOCUMENT_ID \
+  --decision SENSE_ID_1=accepted \
+  --decision SENSE_ID_2=rejected
+```
+
+An accepted target creates source-linked encounters and, when needed, one
+recognition card. Repeating the same confirmation is safe and does not duplicate
+encounters or cards.
+
 ## Teaching Style for a Basic Learner
 
 - Keep the initial daily load at five to ten new senses.
@@ -210,6 +253,8 @@ official vocabulary size, CEFR level, or TOEFL score.
    idempotency key.
 5. Adding conversational bonus words. The deterministic daily plan owns the
    workload limit.
+6. Treating a spelling match as word-sense disambiguation. Require an explicit
+   choice whenever the analysis returns multiple senses.
 
 ## Verification Checklist
 
@@ -219,3 +264,4 @@ official vocabulary size, CEFR level, or TOEFL score.
 - [ ] Due reviews were presented before new items
 - [ ] One learner answer produced exactly one idempotent review event
 - [ ] Feedback did not claim an official vocabulary, CEFR, or TOEFL score
+- [ ] Ambiguous reading matches were confirmed before entering the learning set

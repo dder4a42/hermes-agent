@@ -21,7 +21,8 @@ SCRIPTS_DIR = SKILL_DIR / "scripts"
 CLI_PATH = SCRIPTS_DIR / "english_learning.py"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from learning_core import LearningDatabase, LearningService, VocabularyEntry
+from learning_core import LearningDatabase, LearningService, ReadingService, VocabularyEntry
+from learning_core.reading import lemma_candidates
 
 
 NOW = datetime(2026, 7, 30, 8, 0, tzinfo=timezone.utc)
@@ -275,6 +276,121 @@ def test_stable_recognition_unlocks_one_recall_card(service: LearningService) ->
     assert recall_cards[0]["state"] == "new"
 
 
+def test_conservative_lemma_candidates_cover_common_inflections() -> None:
+    assert lemma_candidates("agents")[:2] == ["agents", "agent"]
+    assert "study" in lemma_candidates("studied")
+    assert "run" in lemma_candidates("running")
+    assert lemma_candidates("address") == ["address"]
+
+
+def test_reading_analysis_reports_coverage_targets_and_ambiguity(
+    service: LearningService,
+) -> None:
+    research = service.upsert_vocabulary(
+        VocabularyEntry(
+            "research", "noun", "systematic study", "研究", 400, "fixture", "research.n"
+        ),
+        now=NOW,
+    )["sense_id"]
+    agent = service.upsert_vocabulary(
+        VocabularyEntry(
+            "agent", "noun", "a person or system that acts", "智能体", 900, "fixture", "agent.n"
+        ),
+        now=NOW,
+    )["sense_id"]
+    address_problem = service.upsert_vocabulary(
+        VocabularyEntry(
+            "address", "verb", "to deal with a problem", "处理", 800, "fixture", "address.v"
+        ),
+        now=NOW,
+    )["sense_id"]
+    service.upsert_vocabulary(
+        VocabularyEntry(
+            "address", "noun", "location details", "地址", 800, "fixture", "address.n"
+        ),
+        now=NOW,
+    )
+    service.record_assessment(
+        research, "known", "1-1000", event_id="research-known", now=NOW
+    )
+    service.record_assessment(
+        agent, "unknown", "1-1000", event_id="agent-gap", now=NOW
+    )
+    reading = ReadingService(service.database)
+
+    result = reading.analyze_text(
+        "Research agents address problems. Agents improve research.",
+        title="Agent systems",
+        target_limit=3,
+        now=NOW,
+    )
+
+    assert result["token_count"] == 7
+    assert result["catalog_matched_tokens"] == 5
+    assert result["unambiguous_known_tokens"] == 2
+    assert result["catalog_coverage"] == pytest.approx(5 / 7, abs=0.0001)
+    assert result["known_coverage"] == pytest.approx(2 / 7, abs=0.0001)
+    assert [target["sense_id"] for target in result["targets"]] == [agent]
+    assert result["targets"][0]["occurrence_count"] == 2
+    assert "assessed_gap" in result["targets"][0]["selection_reason"]
+    assert len(result["ambiguous_matches"]) == 1
+    ambiguous_sense_ids = {
+        sense["sense_id"] for sense in result["ambiguous_matches"][0]["senses"]
+    }
+    assert address_problem in ambiguous_sense_ids
+    assert len(ambiguous_sense_ids) == 2
+
+    manual = reading.confirm_targets(
+        result["document_id"],
+        [{"sense_id": address_problem, "status": "accepted"}],
+        now=NOW,
+    )
+    assert manual["encounters_created"] == 1
+
+    repeated = reading.analyze_text(
+        "Research agents address problems. Agents improve research.",
+        title="A different title does not duplicate content",
+        target_limit=3,
+        now=NOW,
+    )
+    assert repeated["document_id"] == result["document_id"]
+    with service.database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM document_tokens").fetchone()[0] == 7
+
+
+def test_reading_confirmation_creates_idempotent_encounters_and_card(
+    service: LearningService,
+) -> None:
+    sense_id = service.upsert_vocabulary(
+        VocabularyEntry(
+            "agent", "noun", "a system that acts", "智能体", 900, "fixture", "agent.n"
+        ),
+        now=NOW,
+    )["sense_id"]
+    reading = ReadingService(service.database)
+    analysis = reading.analyze_text("An agent helps another agent.", now=NOW)
+
+    first = reading.confirm_targets(
+        analysis["document_id"],
+        [{"sense_id": sense_id, "status": "accepted"}],
+        now=NOW,
+    )
+    repeated = reading.confirm_targets(
+        analysis["document_id"],
+        [{"sense_id": sense_id, "status": "accepted"}],
+        now=NOW,
+    )
+
+    assert first["encounters_created"] == 2
+    assert first["cards_created"] == 1
+    assert repeated["encounters_created"] == 0
+    assert repeated["cards_created"] == 0
+    with service.database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM encounters").fetchone()[0] == 2
+        assert connection.execute("SELECT COUNT(*) FROM review_cards").fetchone()[0] == 1
+
+
 def test_cli_real_sqlite_end_to_end(tmp_path: Path) -> None:
     database = tmp_path / "profile" / "learning.db"
     vocabulary = tmp_path / "words.jsonl"
@@ -330,12 +446,45 @@ def test_cli_real_sqlite_end_to_end(tmp_path: Path) -> None:
         "--idempotency-key",
         "e2e-review",
     )
+    added = invoke(
+        "add-sense",
+        "--lemma",
+        "agent",
+        "--part-of-speech",
+        "noun",
+        "--definition-en",
+        "a system that acts",
+        "--definition-zh",
+        "智能体",
+        "--frequency-rank",
+        "900",
+        "--source",
+        "e2e",
+        "--source-sense-id",
+        "agent.n",
+    )
+    reading = invoke(
+        "reading-analyze",
+        "--text",
+        "An agent can help another agent.",
+        "--title",
+        "Agents",
+    )
+    confirmed = invoke(
+        "reading-confirm",
+        "--document-id",
+        reading["document_id"],
+        "--decision",
+        f"{added['sense_id']}=accepted",
+    )
     stats = invoke("stats")
 
     assert imported["created"] == 4
     assert sampled["count"] == 4
     assert assessed["duplicate"] is False
     assert reviewed["interval_seconds"] > 0
-    assert stats["vocabulary_senses"] == 4
+    assert reading["targets"][0]["sense_id"] == added["sense_id"]
+    assert confirmed["encounters_created"] == 2
+    assert stats["vocabulary_senses"] == 5
     assert stats["assessed_senses"] == 1
     assert database.exists()

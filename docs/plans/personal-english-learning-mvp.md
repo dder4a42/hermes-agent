@@ -10,6 +10,7 @@ Build a local, vocabulary-first English learning loop for one Hermes profile:
 frequency-band assessment
   -> daily new word senses
   -> recognition and recall reviews
+  -> graded short-text coverage and target confirmation
   -> immutable learning evidence
   -> deterministic scheduling
   -> weekly progress data
@@ -33,12 +34,13 @@ Included:
 - recognition and recall cards;
 - daily review and new-item capacity limits;
 - immutable review and assessment events;
+- deterministic short-text coverage and target-sense confirmation;
 - JSON CLI responses suitable for Hermes skills and cron jobs.
 
 Deferred:
 
 - bundled dictionary dumps;
-- article ingestion and word-sense disambiguation;
+- LLM-assisted word-sense disambiguation;
 - writing correction;
 - pronunciation audio;
 - FSRS parameter fitting;
@@ -134,6 +136,11 @@ Deliver short-text ingestion, lexical coverage calculation, contextual sense
 selection, and three-to-five target senses per text. This phase starts only
 after Phase 1 evidence and scheduling contracts are stable.
 
+Status: deterministic foundation complete. Unique lexical matches are ranked
+using assessment gaps, frequency and repetition. Ambiguous matches are returned
+with their candidate senses and require an explicit decision; the MVP does not
+pretend that spelling alone is contextual disambiguation.
+
 ### Phase 3: lightweight production
 
 Add sentence completion, short sentence production, error evidence, and
@@ -163,7 +170,8 @@ and writing come before listening and speaking.
 
 ## Next decision gates
 
-Before Phase 2, choose the first vocabulary source and validate its import
-quality on at least 500 common word senses. Before FSRS adoption, collect enough
-real review history to compare the new scheduler against the deterministic MVP
-baseline.
+Before rolling Phase 2 out for daily use, choose the first vocabulary source and
+validate its import quality on at least 500 common word senses; fixture-backed
+development of the deterministic reading path does not waive that data-quality
+gate. Before FSRS adoption, collect enough real review history to compare the
+new scheduler against the deterministic MVP baseline.

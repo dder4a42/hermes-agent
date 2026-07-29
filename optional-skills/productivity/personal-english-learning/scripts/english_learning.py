@@ -10,7 +10,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from learning_core import LearningDatabase, LearningService, VocabularyEntry
+from learning_core import LearningDatabase, LearningService, ReadingService, VocabularyEntry
 
 
 def default_database_path() -> Path:
@@ -61,6 +61,25 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--hint-count", type=int, default=0)
     review.add_argument("--answer-text")
 
+    reading = commands.add_parser("reading-analyze", help="Analyze a short reading")
+    reading_input = reading.add_mutually_exclusive_group(required=True)
+    reading_input.add_argument("--file", type=Path)
+    reading_input.add_argument("--text")
+    reading.add_argument("--title", default="Untitled reading")
+    reading.add_argument("--source", default="user_text")
+    reading.add_argument("--target-limit", type=int, default=5)
+
+    confirm = commands.add_parser(
+        "reading-confirm", help="Accept or reject reading target senses"
+    )
+    confirm.add_argument("--document-id", required=True)
+    confirm.add_argument(
+        "--decision",
+        action="append",
+        required=True,
+        metavar="SENSE_ID=accepted|rejected",
+    )
+
     commands.add_parser("stats", help="Show learning progress statistics")
     return parser
 
@@ -107,6 +126,28 @@ def run(args: argparse.Namespace) -> dict:
             response_time_ms=args.response_time_ms,
             hint_count=args.hint_count,
             answer_text=args.answer_text,
+        )
+    if args.command == "reading-analyze":
+        content = args.text
+        if args.file is not None:
+            content = args.file.expanduser().read_text(encoding="utf-8")
+        return ReadingService(service.database).analyze_text(
+            content,
+            title=args.title,
+            source=args.source,
+            target_limit=args.target_limit,
+        )
+    if args.command == "reading-confirm":
+        decisions = []
+        for raw in args.decision:
+            sense_id, separator, status = raw.partition("=")
+            if not separator:
+                raise ValueError(
+                    "decision must use SENSE_ID=accepted or SENSE_ID=rejected"
+                )
+            decisions.append({"sense_id": sense_id, "status": status})
+        return ReadingService(service.database).confirm_targets(
+            args.document_id, decisions
         )
     if args.command == "stats":
         return service.stats()
