@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from typing import Callable
 
 
@@ -66,6 +67,7 @@ def build_research_copilot_parser(subparsers, *, cmd_research_copilot: Callable)
     recommend = command_subparsers.add_parser("recommend", help="Rank and recommend the top Library item")
     recommend.add_argument("--dry-run", action="store_true", help="Rank without writing a recommendation")
     recommend.add_argument("--threshold", type=float, default=0.72, help="Minimum score (default: 0.72)")
+    recommend.add_argument("--delivery-context", action="store_true", help=argparse.SUPPRESS)
     enrich = command_subparsers.add_parser("enrich-newsletters", help="Resolve and inspect staged newsletter links")
     enrich.add_argument("--dry-run", action="store_true", help="Resolve without updating Library state")
     enrich.add_argument("--limit", type=int, default=50, help="Maximum staged entries (default: 50)")

@@ -190,17 +190,17 @@ def _scout(args: Any) -> int:
         return 1
     print(result.payload["summary"])
     for candidate in result.payload["candidates"]:
-        topics = ", ".join(candidate["topic_ids"]) or "unclassified"
-        print(f"- {candidate['title']} [{topics}; confidence={candidate['confidence']:.2f}]")
+        topics = ", ".join(candidate["topic_ids"]) or "未分类"
+        print(f"- {candidate['title']} [{topics}；置信度={candidate['confidence']:.2f}]")
         print(f"  {candidate['url']}")
         print(f"  {candidate['why_relevant']}")
     if result.payload["term_suggestions"]:
-        print("Term suggestions: " + ", ".join(result.payload["term_suggestions"]))
+        print("术语建议：" + ", ".join(result.payload["term_suggestions"]))
     if result.payload["source_suggestions"]:
-        print("Source suggestions: " + ", ".join(result.payload["source_suggestions"]))
+        print("来源建议：" + ", ".join(result.payload["source_suggestions"]))
     if not bool(getattr(args, "dry_run", False)):
         destination = save_scout_result(paths["data"], result.payload)
-        print(f"Staged: {destination}")
+        print(f"已暂存：{destination}")
     return 0
 
 
@@ -224,9 +224,10 @@ def _doctor(_args: Any) -> int:
 
 
 def _recommend(args: Any) -> int:
+    import json
     from datetime import datetime, timezone
     from research_copilot.ranking import RankingService, TopicPolicy
-    from research_copilot.runtime import open_library
+    from research_copilot.runtime import load_yaml, open_library
 
     try:
         paths, _registry, topics, _catalog = _load_catalog_and_topics()
@@ -248,13 +249,57 @@ def _recommend(args: Any) -> int:
                 winner = service.recommend_top(
                     topics=policies, recommended_at=now, threshold=args.threshold,
                 )
+            item = None
+            topic_matches = []
+            if winner is not None:
+                row = connection.execute(
+                    "SELECT id,title,summary,url,item_type,published_at "
+                    "FROM research_items WHERE id=?", (winner.item_id,),
+                ).fetchone()
+                item = dict(row) if row is not None else None
+                configured_topics = {str(topic.get("id")): topic for topic in topics}
+                for matched in connection.execute(
+                    "SELECT topic_id,confidence FROM item_topics WHERE item_id=? "
+                    "ORDER BY confidence DESC,topic_id", (winner.item_id,),
+                ):
+                    configured = configured_topics.get(str(matched["topic_id"]), {})
+                    topic_matches.append({
+                        "id": str(matched["topic_id"]),
+                        "name": str(configured.get("name") or matched["topic_id"]),
+                        "confidence": float(matched["confidence"]),
+                        "priority": float(configured.get("priority", 0.5)),
+                        "description": str(configured.get("description") or ""),
+                        "open_questions": [str(value) for value in configured.get("open_questions", [])],
+                    })
         finally:
             connection.close()
     except Exception as exc:
         print(f"Recommendation failed: {exc}")
         return 1
     if winner is None:
+        if bool(getattr(args, "delivery_context", False)):
+            return 0
         print("No Research Item cleared the recommendation threshold.")
+        return 0
+    if bool(getattr(args, "delivery_context", False)):
+        try:
+            profile = load_yaml(paths["profile"])
+        except (FileNotFoundError, ValueError):
+            profile = {}
+        print(json.dumps({
+            "kind": "research_recommendation_context",
+            "item": item or {"id": winner.item_id},
+            "ranking": {
+                "score": winner.score,
+                "dimensions": dict(winner.dimensions),
+                "reasons": list(winner.reasons),
+            },
+            "matched_topics": topic_matches,
+            "research_profile": {
+                "positioning": str(profile.get("positioning") or ""),
+                "long_term_agenda": profile.get("long_term_agenda") or [],
+            },
+        }, ensure_ascii=False, sort_keys=True))
         return 0
     mode = "dry-run" if args.dry_run else "recommended"
     print(f"{mode}: {winner.item_id} score={winner.score:.4f}")

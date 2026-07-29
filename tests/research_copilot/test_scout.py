@@ -56,6 +56,8 @@ def test_codex_scout_uses_read_only_ephemeral_structured_execution(tmp_path, mon
     assert "--ephemeral" in command
     assert "--output-schema" in command
     assert "software engineering tasks" in command[-1]
+    assert "natural Chinese" in command[-1]
+    assert "current beliefs" in command[-1]
     assert kwargs["timeout"] == 120
     assert result.payload == payload
 

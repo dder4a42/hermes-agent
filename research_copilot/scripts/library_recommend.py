@@ -10,6 +10,7 @@ def main() -> int:
 
     return cmd_research_copilot(argparse.Namespace(
         research_copilot_command="recommend", dry_run=False, threshold=0.72,
+        delivery_context=True,
     ))
 
 

@@ -25,6 +25,8 @@ def test_cron_shims_only_dispatch_repository_cli(monkeypatch, module_name, comma
     assert len(calls) == 1
     assert isinstance(calls[0], argparse.Namespace)
     assert calls[0].research_copilot_command == command
+    if command == "recommend":
+        assert calls[0].delivery_context is True
 
 
 def test_bundled_cron_module_runs_through_real_scheduler_subprocess(monkeypatch, tmp_path):

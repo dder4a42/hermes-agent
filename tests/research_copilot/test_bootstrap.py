@@ -53,6 +53,11 @@ def test_install_research_copilot_cron_is_profile_scoped_and_idempotent(tmp_path
     scripts = {job["name"]: job.get("script") for job in jobs}
     assert scripts["paper-fetcher"] == "module:research_copilot.scripts.library_collect"
     assert scripts["paper-health-report"] == "module:research_copilot.scripts.library_health"
+    recommend = next(job for job in jobs if job["name"] == "research-library-recommend")
+    assert recommend["script"] == "module:research_copilot.scripts.library_recommend"
+    assert recommend["no_agent"] is False
+    assert "主体叙述" in recommend["prompt"]
+    assert "current_beliefs" in recommend["prompt"]
     assert not (profile_home / "scripts" / "paper-fetch.py").exists()
     assert not (profile_home / "scripts" / "paper-health.py").exists()
 

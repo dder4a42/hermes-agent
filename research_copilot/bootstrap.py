@@ -49,6 +49,31 @@ _CRON_NAMES = (
     "task-surfacer", "thought-surfacer",
 )
 
+_RESEARCH_RECOMMEND_PROMPT = """你是用户的科研资讯编辑。预运行脚本会提供一条 JSON 格式的候选文章、匹配话题、排序依据和科研画像。
+
+请只根据这些材料写一条适合微信阅读的中文推荐，要求：
+1. 主体叙述和所有栏目标题使用中文；论文或项目的原始标题可以保留原文。
+2. 先用 2—3 句话准确概述工作，不要把摘要中没有的内容写成事实。
+3. 明确说明它对应用户的哪些兴趣、开放问题或知识缺口。
+4. 结合 current_beliefs 给出有立场的点评：它支持、挑战还是补充了什么观点；若材料不足，明确说“仅凭当前摘要尚不能判断”。
+5. 区分论文主张、证据和你的推断；指出一个最值得关注之处和一个局限或验证问题。
+6. 不展示 JSON、内部评分维度或英文模板字段，不调用工具，不自行搜索网络。
+
+固定格式：
+🔬 今日科研推荐
+《原始标题》
+
+内容概述：……
+
+与你的研究的关系：……
+
+我的点评：……
+
+值得继续追问：……
+
+原文：URL
+"""
+
 # Repository asset roots. Bootstrap prefers ``source_home`` (a live profile
 # used as a template) when supplied, then falls back to these repo-owned
 # copies so a first-time install always works even without a template.
@@ -278,14 +303,23 @@ def install_research_copilot_cron(
 
         if "research-library-recommend" in names:
             existing.append("research-library-recommend")
+            job = next(
+                j for j in list_jobs(include_disabled=True)
+                if j.get("name") == "research-library-recommend"
+            )
+            update_job(job["id"], {
+                "prompt": _RESEARCH_RECOMMEND_PROMPT,
+                "script": "module:research_copilot.scripts.library_recommend",
+                "no_agent": False,
+            })
         else:
             create_job(
-                prompt=None,
+                prompt=_RESEARCH_RECOMMEND_PROMPT,
                 schedule="30 8 * * *",
                 name="research-library-recommend",
                 deliver=deliver,
                 script="module:research_copilot.scripts.library_recommend",
-                no_agent=True,
+                no_agent=False,
             )
             created.append("research-library-recommend")
 
