@@ -47,6 +47,8 @@ Use this skill when the user asks to:
 - inspect vocabulary-learning progress;
 - create a small daily English vocabulary plan.
 - practice target words through contextual gaps and short original sentences.
+- inspect the versioned 2026 TOEFL profile, calculate practice bands, or plan
+  a small Reading/Writing practice block.
 
 Do not use it for general translation, complete essay generation, or an
 official TOEFL score prediction.
@@ -321,6 +323,46 @@ Automation rules:
 - Return `[SILENT]` only when there are no due reviews, no new items, and no
   Monday report to deliver.
 
+### 10. Use the TOEFL 2026 practice profile
+
+Inspect the bundled, versioned profile before discussing the current exam:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  toefl-profile
+```
+
+The profile records its effective date and ETS sources. Reading and Listening
+are marked as two-stage adaptive; Writing and Speaking are linear. The MVP only
+plans independently authored Reading and Writing practice. It does not simulate
+adaptive routing, ship an ETS question bank, or implement Listening/Speaking
+practice yet.
+
+When four valid section bands are already available, calculate the overall
+practice band deterministically:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  toefl-score \
+  --reading 4.0 --listening 3.5 --speaking 3.5 --writing 4.0
+```
+
+Section inputs must use the 1.0–6.0 scale in 0.5 increments. Present
+`legacy_comparable_total_range` only as a comparison range, never as an exact
+0–120 conversion. Always preserve the returned disclaimer: this calculation is
+personal learning feedback, not an official ETS score prediction.
+
+Build a bounded practice block with the current Reading/Writing task labels:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  toefl-practice-plan --minutes 30 --section reading --section writing
+```
+
+Follow the returned order and minute budget. Generate original prompts suitable
+for a basic learner; never reproduce or imply access to official test items.
+`adaptive_simulation: false` is a deliberate boundary, not a missing score.
+
 ## Teaching Style for a Basic Learner
 
 - Keep the initial daily load at five to ten new senses.
@@ -362,6 +404,8 @@ Automation rules:
    acceptance before Hermes creates the cron job.
 10. Computing weekly progress from chat memory. Always call the read-only report
     command so the summary reflects SQLite evidence.
+11. Treating a practice band or legacy comparison range as an official score.
+    Preserve the disclaimer and describe it as learning feedback.
 
 ## Verification Checklist
 
@@ -376,3 +420,4 @@ Automation rules:
 - [ ] Revisions linked to the original attempt instead of replacing it
 - [ ] Automation used the active profile and respected the returned plan limits
 - [ ] Weekly summaries came from `weekly-report`, not conversational memory
+- [ ] TOEFL guidance used the bundled profile version and preserved its disclaimer

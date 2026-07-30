@@ -1,0 +1,87 @@
+{
+  "exam_id": "toefl_ibt",
+  "profile_version": "2026.1",
+  "effective_from": "2026-01-21",
+  "status": "active",
+  "official": false,
+  "disclaimer": "Practice planning and score calculations are for personal learning feedback, not an official ETS score prediction.",
+  "sources": [
+    {
+      "title": "TOEFL iBT Test: 2026 Update — Test Blueprint and Specifications",
+      "publisher": "ETS",
+      "url": "https://www.tr.ets.org/pdfs/toefl/toefl-ibt-test-specifications-2026.pdf",
+      "retrieved_at": "2026-07-30"
+    },
+    {
+      "title": "TOEFL Score Scale Update",
+      "publisher": "ETS",
+      "url": "https://www.ets.org/toefl/china/toefl/score-scale-update.html",
+      "retrieved_at": "2026-07-30"
+    }
+  ],
+  "score_scale": {
+    "minimum": "1.0",
+    "maximum": "6.0",
+    "step": "0.5",
+    "overall_method": "mean_then_round_to_nearest_half_band_half_up",
+    "contract_examples": [
+      {"section_mean": "5.125", "overall": "5.0"},
+      {"section_mean": "5.25", "overall": "5.5"}
+    ]
+  },
+  "legacy_total_comparison": [
+    {"band": "6.0", "minimum": 114, "maximum": 120},
+    {"band": "5.5", "minimum": 107, "maximum": 113},
+    {"band": "5.0", "minimum": 95, "maximum": 106},
+    {"band": "4.5", "minimum": 86, "maximum": 94},
+    {"band": "4.0", "minimum": 72, "maximum": 85},
+    {"band": "3.5", "minimum": 58, "maximum": 71},
+    {"band": "3.0", "minimum": 44, "maximum": 57},
+    {"band": "2.5", "minimum": 34, "maximum": 43},
+    {"band": "2.0", "minimum": 24, "maximum": 33},
+    {"band": "1.5", "minimum": 12, "maximum": 23},
+    {"band": "1.0", "minimum": 0, "maximum": 11}
+  ],
+  "sections": {
+    "reading": {
+      "delivery": "two_stage_adaptive",
+      "estimated_minutes": {"minimum": 27, "maximum": 30},
+      "practice_supported": true,
+      "task_types": [
+        {"id": "complete_the_words", "name": "Complete the Words", "practice_minutes": 6, "response_mode": "machine_scored"},
+        {"id": "read_in_daily_life", "name": "Read in Daily Life", "practice_minutes": 8, "response_mode": "machine_scored"},
+        {"id": "read_an_academic_passage", "name": "Read an Academic Passage", "practice_minutes": 12, "response_mode": "machine_scored"}
+      ]
+    },
+    "listening": {
+      "delivery": "two_stage_adaptive",
+      "estimated_minutes": {"minimum": 25, "maximum": 29},
+      "practice_supported": false,
+      "task_types": [
+        {"id": "listen_and_choose_a_response", "name": "Listen and Choose a Response"},
+        {"id": "listen_to_a_conversation", "name": "Listen to a Conversation"},
+        {"id": "listen_to_an_announcement", "name": "Listen to an Announcement"},
+        {"id": "listen_to_an_academic_talk", "name": "Listen to an Academic Talk"}
+      ]
+    },
+    "writing": {
+      "delivery": "linear",
+      "estimated_minutes": {"minimum": 23, "maximum": 23},
+      "practice_supported": true,
+      "task_types": [
+        {"id": "build_a_sentence", "name": "Build a Sentence", "practice_minutes": 5, "response_mode": "machine_scored"},
+        {"id": "write_an_email", "name": "Write an Email", "practice_minutes": 8, "response_mode": "ai_assisted_feedback"},
+        {"id": "write_for_an_academic_discussion", "name": "Write for an Academic Discussion", "practice_minutes": 10, "response_mode": "ai_assisted_feedback"}
+      ]
+    },
+    "speaking": {
+      "delivery": "linear",
+      "estimated_minutes": {"minimum": 8, "maximum": 8},
+      "practice_supported": false,
+      "task_types": [
+        {"id": "listen_and_repeat", "name": "Listen and Repeat"},
+        {"id": "take_an_interview", "name": "Take an Interview"}
+      ]
+    }
+  }
+}

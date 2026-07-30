@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from learning_core import (
+    ExamService,
     LearningDatabase,
     LearningService,
     ProductionService,
@@ -108,11 +109,47 @@ def build_parser() -> argparse.ArgumentParser:
     )
     weekly.add_argument("--days", type=int, default=7)
 
+    commands.add_parser(
+        "toefl-profile", help="Show the versioned TOEFL 2026 practice profile"
+    )
+
+    score = commands.add_parser(
+        "toefl-score", help="Calculate a 1-6 practice score from section bands"
+    )
+    for section in ("reading", "listening", "speaking", "writing"):
+        score.add_argument(f"--{section}", required=True)
+
+    toefl_plan = commands.add_parser(
+        "toefl-practice-plan", help="Build a deterministic Reading/Writing plan"
+    )
+    toefl_plan.add_argument("--minutes", type=int, default=30)
+    toefl_plan.add_argument(
+        "--section",
+        action="append",
+        choices=("reading", "listening", "speaking", "writing"),
+        dest="sections",
+    )
+
     commands.add_parser("stats", help="Show learning progress statistics")
     return parser
 
 
 def run(args: argparse.Namespace) -> dict:
+    if args.command == "toefl-profile":
+        return {"profile": ExamService().profile()}
+    if args.command == "toefl-score":
+        return ExamService().calculate_score(
+            {
+                "reading": args.reading,
+                "listening": args.listening,
+                "speaking": args.speaking,
+                "writing": args.writing,
+            }
+        )
+    if args.command == "toefl-practice-plan":
+        sections = args.sections or ["reading", "writing"]
+        return ExamService().practice_plan(minutes=args.minutes, sections=sections)
+
     service = LearningService(LearningDatabase(args.db))
     if args.command == "init":
         return {"ok": True, "database": str(args.db)}

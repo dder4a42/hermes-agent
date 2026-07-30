@@ -23,6 +23,7 @@ CLI_PATH = SCRIPTS_DIR / "english_learning.py"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from learning_core import (
+    ExamService,
     LearningDatabase,
     LearningService,
     ProductionService,
@@ -690,6 +691,129 @@ def test_skill_blueprint_is_daily_profile_local_terminal_automation() -> None:
     job = blueprint_to_job_spec(spec)
     assert job["skills"] == ["personal-english-learning"]
     assert job["enabled_toolsets"] == ["terminal"]
+
+
+def test_toefl_2026_profile_preserves_version_sources_and_task_contract() -> None:
+    profile = ExamService().profile()
+
+    assert profile["exam_id"] == "toefl_ibt"
+    assert profile["profile_version"] == "2026.1"
+    assert profile["effective_from"] == "2026-01-21"
+    assert profile["status"] == "active"
+    assert profile["official"] is False
+    assert {source["publisher"] for source in profile["sources"]} == {"ETS"}
+    assert profile["sections"]["reading"]["delivery"] == "two_stage_adaptive"
+    assert profile["sections"]["listening"]["delivery"] == "two_stage_adaptive"
+    assert profile["sections"]["writing"]["delivery"] == "linear"
+    assert profile["sections"]["speaking"]["delivery"] == "linear"
+    assert [
+        task["id"] for task in profile["sections"]["reading"]["task_types"]
+    ] == [
+        "complete_the_words",
+        "read_in_daily_life",
+        "read_an_academic_passage",
+    ]
+
+
+def test_toefl_score_uses_decimal_half_up_contract_and_comparison_range() -> None:
+    exam = ExamService()
+
+    rounds_down = exam.calculate_score(
+        {"reading": "5.0", "listening": "5.0", "speaking": "5.0", "writing": "5.5"}
+    )
+    rounds_up = exam.calculate_score(
+        {"reading": "5.0", "listening": "5.0", "speaking": "5.5", "writing": "5.5"}
+    )
+
+    assert rounds_down["section_mean"] == "5.125"
+    assert rounds_down["overall"] == "5.0"
+    assert rounds_down["legacy_comparable_total_range"] == {
+        "minimum": 95,
+        "maximum": 106,
+    }
+    assert rounds_down["legacy_mapping_kind"] == "comparison_range_not_exact_conversion"
+    assert rounds_up["section_mean"] == "5.25"
+    assert rounds_up["overall"] == "5.5"
+    assert "not an official ETS score prediction" in rounds_up["disclaimer"]
+
+
+@pytest.mark.parametrize(
+    "scores, message",
+    [
+        ({"reading": "5.0"}, "must contain"),
+        (
+            {"reading": "4.2", "listening": "4.0", "speaking": "4.0", "writing": "4.0"},
+            "increments",
+        ),
+        (
+            {"reading": "6.5", "listening": "4.0", "speaking": "4.0", "writing": "4.0"},
+            "between",
+        ),
+    ],
+)
+def test_toefl_score_rejects_invalid_section_bands(
+    scores: dict[str, str], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        ExamService().calculate_score(scores)
+
+
+def test_toefl_practice_plan_is_bounded_balanced_and_not_adaptive_simulation() -> None:
+    plan = ExamService().practice_plan(minutes=30)
+
+    assert plan["scheduled_minutes"] <= plan["requested_minutes"]
+    assert plan["remaining_minutes"] == 3
+    assert plan["sections"] == ["reading", "writing"]
+    assert {task["section"] for task in plan["tasks"]} == {"reading", "writing"}
+    assert [task["task_type"] for task in plan["tasks"]] == [
+        "complete_the_words",
+        "build_a_sentence",
+        "read_in_daily_life",
+        "write_an_email",
+    ]
+    assert plan["adaptive_simulation"] is False
+
+    with pytest.raises(ValueError, match="not implemented"):
+        ExamService().practice_plan(minutes=30, sections=["listening"])
+
+
+def test_toefl_cli_works_without_creating_learning_database(tmp_path: Path) -> None:
+    database = tmp_path / "unused" / "learning.db"
+
+    def invoke(*arguments: str) -> dict:
+        completed = subprocess.run(
+            [sys.executable, str(CLI_PATH), "--db", str(database), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(completed.stdout)
+
+    profile = invoke("toefl-profile")
+    score = invoke(
+        "toefl-score",
+        "--reading",
+        "5.0",
+        "--listening",
+        "5.0",
+        "--speaking",
+        "5.0",
+        "--writing",
+        "5.5",
+    )
+    plan = invoke(
+        "toefl-practice-plan",
+        "--minutes",
+        "20",
+        "--section",
+        "writing",
+    )
+
+    assert profile["profile"]["profile_version"] == "2026.1"
+    assert score["overall"] == "5.0"
+    assert plan["sections"] == ["writing"]
+    assert {task["section"] for task in plan["tasks"]} == {"writing"}
+    assert not database.exists()
 
 
 def test_cli_real_sqlite_end_to_end(tmp_path: Path) -> None:

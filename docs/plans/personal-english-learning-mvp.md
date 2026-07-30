@@ -13,6 +13,7 @@ frequency-band assessment
   -> graded short-text coverage and target confirmation
   -> cloze and short-sentence production with revision
   -> daily plan delivery and weekly evidence summary
+  -> versioned TOEFL 2026 Reading/Writing practice planning
   -> immutable learning evidence
   -> deterministic scheduling
   -> weekly progress data
@@ -39,6 +40,8 @@ Included:
 - deterministic short-text coverage and target-sense confirmation;
 - lightweight production exercises and revision-linked evidence;
 - profile-local daily automation and read-only weekly reporting;
+- versioned TOEFL 2026 rules, deterministic practice-band calculation, and
+  bounded Reading/Writing practice plans;
 - JSON CLI responses suitable for Hermes skills and cron jobs.
 
 Deferred:
@@ -48,7 +51,7 @@ Deferred:
 - writing correction;
 - pronunciation audio;
 - FSRS parameter fitting;
-- TOEFL task simulation;
+- TOEFL adaptive simulation, official questions, Listening, and Speaking;
 - web/mobile UI and multi-device synchronization.
 
 ## Architecture
@@ -171,6 +174,15 @@ only the terminal toolset.
 
 Add versioned exam profiles and independently authored practice tasks. Reading
 and writing come before listening and speaking.
+
+Status: complete for the MVP boundary. The bundled `2026.1` profile records its
+effective date, ETS source URLs, current task labels, delivery modes, 1.0–6.0
+half-band contract, and legacy comparison ranges. Decimal scoring implements
+the published mean-and-round examples without binary floating-point ambiguity.
+The planner interleaves supported Reading and Writing task types inside a fixed
+minute budget and explicitly reports that it is not an adaptive simulation or
+official score prediction. Listening, Speaking, adaptive routing, and actual
+prompt generation remain deferred.
 
 ## Verification
 
