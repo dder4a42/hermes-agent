@@ -348,16 +348,17 @@ class LexicalAnalysisService:
                 if row["source_sense_id"] not in {None, source_sense_id}:
                     continue
                 matching_analyses.append(self._analysis_dict(row))
-            available_types = {
+            resolved_types = {
                 item["analysis_type"]
                 for item in matching_analyses
                 if item["status"] == "available"
+                or item["source_level"] == "llm_inferred"
             }
             result[key] = {
                 "word_family": family[:24],
                 "analyses": matching_analyses,
                 "needs_inference": {
-                    analysis_type: analysis_type not in available_types
+                    analysis_type: analysis_type not in resolved_types
                     for analysis_type in sorted(ANALYSIS_TYPES)
                 },
             }

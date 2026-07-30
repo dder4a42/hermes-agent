@@ -3,6 +3,11 @@
 from .database import LearningDatabase
 from .exam import ExamService
 from .lexical_analysis import LexicalAnalysisService
+from .lexical_inference import (
+    HermesLexicalGenerator,
+    LexicalInferenceJobs,
+    LexicalInferenceService,
+)
 from .production import ProductionService
 from .pronunciation import PronunciationService
 from .reading import ReadingService
@@ -24,6 +29,9 @@ __all__ = [
     "ExamService",
     "LearningService",
     "LexicalAnalysisService",
+    "LexicalInferenceService",
+    "HermesLexicalGenerator",
+    "LexicalInferenceJobs",
     "VocabularyCollection",
     "ProductionService",
     "PronunciationService",

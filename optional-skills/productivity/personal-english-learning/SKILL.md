@@ -1,7 +1,7 @@
 ---
 name: personal-english-learning
 description: Use when a learner wants to assess, expand, or review English vocabulary with a private profile-local SQLite learning history. Prioritize high-frequency concrete word senses, Chinese-supported explanations, small daily loads, and deterministic review scheduling.
-version: 0.4.0
+version: 0.5.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -234,6 +234,13 @@ stored morphology/etymology, and the two `needs_inference` flags. Prefer an
 authoritative source, then a deterministic analysis. When a needed analysis is
 missing or disproportionately expensive to retrieve, the active Hermes model
 may produce one structured inference and cache it with `analysis-upsert PATH`.
+The web UI automates this fallback: opening one new-word card queues at most one
+background job for that concrete sense, while vocabulary search requires an
+explicit `生成构词与词源` click to prevent a broad query from spending many model
+calls. The queue has one worker, so lexical generation never blocks loading the
+daily plan. Successful and terminal (`opaque`, `ambiguous`, `not_found`) results
+are cached in SQLite; malformed output gets one schema-repair attempt and is
+otherwise shown as a retryable failure without writing partial data.
 The JSON file must contain one object like:
 
 ```json
@@ -264,6 +271,13 @@ confidence at least 0.60; describe results below 0.80 as possible analyses.
 For historical etymology, require at least 0.75. Keep `not_found`, `ambiguous`,
 and `opaque` distinct from an empty result. A later authoritative import may
 supersede an LLM record without deleting its provenance.
+
+Automatic results are sense-aware: the worker receives the current English and
+Chinese definitions plus authoritative word-family relations. It must separate
+modern productive morphology from historical origin. A synchronically opaque
+word such as `study` should be stored as `opaque`, not forced into a pedagogical
+prefix/root/suffix split. AI results are labelled `AI 分析` in the UI and never
+replace a later authoritative Kaikki/Wiktionary import.
 
 For a basic learner, draw new items from the general collection first:
 

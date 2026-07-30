@@ -366,7 +366,23 @@ def _parse_json_object(text: str) -> dict:
     if stripped.startswith("```"):
         lines = stripped.splitlines()
         stripped = "\n".join(lines[1:-1]).strip()
-    value = json.loads(stripped)
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        value = None
+        for index, character in enumerate(stripped):
+            if character != "{":
+                continue
+            try:
+                candidate, _end = decoder.raw_decode(stripped[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                value = candidate
+                break
+        if value is None:
+            raise ValueError("model response did not contain a JSON object")
     if not isinstance(value, dict):
         raise ValueError("model response must be a JSON object")
     return value

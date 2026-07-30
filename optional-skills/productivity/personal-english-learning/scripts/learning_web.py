@@ -20,9 +20,12 @@ from pydantic import BaseModel, Field
 
 from learning_core import (
     HermesReadingGenerator,
+    HermesLexicalGenerator,
     HermesWritingGenerator,
     LearningDatabase,
     LearningService,
+    LexicalInferenceJobs,
+    LexicalInferenceService,
     ReadingTutorService,
     ReportService,
     WritingCoachService,
@@ -87,12 +90,17 @@ class WritingReviewRequest(BaseModel):
     parent_submission_id: str | None = None
 
 
+class LexicalInferenceRequest(BaseModel):
+    sense_id: str
+
+
 def create_app(
     database_path: str | Path | None = None,
     *,
     session_token: str | None = None,
     reading_generator: Callable[[dict], dict] | None = None,
     writing_generator: Callable[[dict], dict] | None = None,
+    lexical_generator: Callable[[dict], dict] | None = None,
 ) -> FastAPI:
     database = LearningDatabase(database_path or default_database_path())
     service = LearningService(database)
@@ -104,6 +112,12 @@ def create_app(
         database,
         generator=writing_generator or HermesWritingGenerator(),
     )
+    lexical_jobs = LexicalInferenceJobs(
+        LexicalInferenceService(
+            database,
+            generator=lexical_generator or HermesLexicalGenerator(),
+        )
+    )
     token = session_token or secrets.token_urlsafe(32)
     app = FastAPI(
         title="Personal English Learning",
@@ -114,6 +128,7 @@ def create_app(
     app.state.learning_service = service
     app.state.reading_tutor_service = tutor
     app.state.writing_coach_service = writing_coach
+    app.state.lexical_inference_jobs = lexical_jobs
     app.state.session_token = token
 
     @app.middleware("http")
@@ -260,6 +275,14 @@ def create_app(
                 detail="写作评阅模型暂时不可用，请稍后重试。草稿仍保存在浏览器中。",
             ) from exc
         return {"ok": True, **result}
+
+    @app.post("/api/lexical/inference")
+    async def lexical_inference(body: LexicalInferenceRequest) -> dict:
+        return {"ok": True, **lexical_jobs.enqueue(body.sense_id)}
+
+    @app.get("/api/lexical/inference/{job_id}")
+    async def lexical_inference_status(job_id: str) -> dict:
+        return {"ok": True, **lexical_jobs.status(job_id)}
 
     app.mount("/assets", StaticFiles(directory=WEB_DIR), name="learning-assets")
     return app

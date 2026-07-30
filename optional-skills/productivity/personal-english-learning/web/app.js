@@ -77,7 +77,7 @@ function lexicalAnalysisHtml(item, compact = false) {
   if (!lexical) return "";
   const family = (lexical.word_family || []).slice(0, compact ? 6 : 12);
   const visibleAnalyses = (lexical.analyses || []).filter(analysis => {
-    if (analysis.status !== "available") return false;
+    if (analysis.status !== "available") return true;
     if (analysis.source_level !== "llm_inferred") return true;
     const threshold = analysis.analysis_type === "historical_etymology" ? 0.75 : 0.6;
     return analysis.confidence >= threshold;
@@ -96,8 +96,10 @@ function lexicalAnalysisHtml(item, compact = false) {
     const segments = Array.isArray(analysis.content?.segments) ? analysis.content.segments : [];
     const segmentHtml = segments.length ? `<div class="morpheme-chain">${segments.map(segment => `<span><strong>${escapeHtml(segment.form)}</strong><small>${escapeHtml(segment.meaning || segment.type || "")}</small></span>`).join('<b>+</b>')}</div>` : "";
     const explanation = analysis.explanation_zh || analysis.content?.summary_zh || analysis.content?.summary || "";
+    const statusLabels = {opaque: "不宜强行拆分", ambiguous: "分析不确定", not_found: "暂无可靠资料"};
+    const status = analysis.status === "available" ? "" : `<span class="analysis-status">${escapeHtml(statusLabels[analysis.status] || analysis.status)}</span>`;
     const uncertain = analysis.source_level === "llm_inferred" && analysis.confidence < 0.8 ? " · 可能的分析" : "";
-    sections.push(`<section class="lexical-section"><h4>${title}</h4>${segmentHtml}${explanation ? `<p>${escapeHtml(explanation)}</p>` : ""}<small class="analysis-source">${escapeHtml(analysisSourceLabel(analysis))}${uncertain} · ${escapeHtml(analysis.source)}</small></section>`);
+    sections.push(`<section class="lexical-section"><h4>${title}${status}</h4>${segmentHtml}${explanation ? `<p>${escapeHtml(explanation)}</p>` : ""}<small class="analysis-source">${escapeHtml(analysisSourceLabel(analysis))}${uncertain} · ${escapeHtml(analysis.source)}</small></section>`);
   }
   if (!sections.length && !compact && Object.values(lexical.needs_inference || {}).some(Boolean)) {
     sections.push('<p class="analysis-missing">暂无可靠分析；可在需要时由 AI 辅助补全。</p>');
@@ -220,7 +222,9 @@ function renderLearning() {
   document.querySelector("#learning-pronunciation").innerHTML = pronunciationHtml(item);
   document.querySelector("#learning-definition-en").textContent = item.definition_en;
   document.querySelector("#learning-definition-zh").textContent = item.definition_zh || "暂无中文释义";
-  document.querySelector("#learning-lexical-analysis").innerHTML = lexicalAnalysisHtml(item);
+  const lexicalHolder = document.querySelector("#learning-lexical-analysis");
+  lexicalHolder.innerHTML = lexicalAnalysisHtml(item);
+  if (needsLexicalInference(item)) void enrichLexicalItem(item, lexicalHolder, true);
   document.querySelector("#learning-assess").hidden = false;
   document.querySelector("#learning-ratings").hidden = true;
   learningStartedAt = performance.now();
@@ -306,12 +310,44 @@ async function searchVocabulary(event) {
   if (!data.items.length) { container.innerHTML = '<div class="empty-state">没有匹配词义。</div>'; return; }
   container.replaceChildren(...data.items.map(item => {
     const card = document.createElement("article"); card.className = "result-card";
-    card.innerHTML = `<div><h3>${escapeHtml(item.lemma)}</h3><span>${escapeHtml(item.part_of_speech)}</span></div><div class="result-pronunciation pronunciation">${pronunciationHtml(item)}</div><p>${escapeHtml(item.definition_en)}</p><small>识别 ${Math.round(item.recognition_score * 100)}% · 回忆 ${Math.round(item.recall_score * 100)}% · 来源 ${escapeHtml(item.source)}</small>${lexicalAnalysisHtml(item)}`;
+    card.innerHTML = `<div><h3>${escapeHtml(item.lemma)}</h3><span>${escapeHtml(item.part_of_speech)}</span></div><div class="result-pronunciation pronunciation">${pronunciationHtml(item)}</div><p>${escapeHtml(item.definition_en)}</p><small>识别 ${Math.round(item.recognition_score * 100)}% · 回忆 ${Math.round(item.recall_score * 100)}% · 来源 ${escapeHtml(item.source)}</small><div class="lexical-holder">${lexicalAnalysisHtml(item)}</div>`;
     const add = document.createElement("button"); add.className = "secondary notebook-add"; add.textContent = "加入生词本";
     add.addEventListener("click", () => void addToNotebook(item, add).catch(error => notify(error.message, "error")));
     card.append(add);
+    if (needsLexicalInference(item)) {
+      const analyze = document.createElement("button"); analyze.className = "secondary lexical-generate"; analyze.textContent = "生成构词与词源";
+      analyze.addEventListener("click", () => void enrichLexicalItem(item, card.querySelector(".lexical-holder"), false, analyze));
+      card.append(analyze);
+    }
     return card;
   }));
+}
+
+function needsLexicalInference(item) {
+  return Object.values(item?.lexical_analysis?.needs_inference || {}).some(Boolean);
+}
+
+async function enrichLexicalItem(item, holder, automatic = false, trigger = null) {
+  if (!needsLexicalInference(item)) return;
+  if (trigger) { trigger.disabled = true; trigger.textContent = "正在分析…"; }
+  let state = holder.querySelector(".lexical-job-state");
+  if (!state) { state = document.createElement("p"); state.className = "lexical-job-state"; holder.append(state); }
+  state.textContent = automatic ? "正在后台补全构词与词源，不影响继续学习…" : "正在生成并核验分析…";
+  try {
+    let job = await api("/api/lexical/inference", {method: "POST", body: JSON.stringify({sense_id: item.sense_id})});
+    for (let attempt = 0; attempt < 50 && !["ready", "failed"].includes(job.status); attempt += 1) {
+      await new Promise(resolve => window.setTimeout(resolve, 2000));
+      job = await api(`/api/lexical/inference/${encodeURIComponent(job.job_id)}`);
+    }
+    if (job.status !== "ready") throw new Error("构词与词源分析暂时未完成，请稍后重试。");
+    item.lexical_analysis = job.result.lexical_analysis;
+    holder.innerHTML = lexicalAnalysisHtml(item);
+    if (trigger) { trigger.textContent = "分析已缓存"; trigger.disabled = true; }
+  } catch (error) {
+    state.textContent = error.message || "分析失败，请稍后重试。";
+    state.dataset.kind = "error";
+    if (trigger) { trigger.disabled = false; trigger.textContent = "重试构词与词源"; }
+  }
 }
 
 async function addToNotebook(item, button) {

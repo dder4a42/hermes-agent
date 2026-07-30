@@ -31,6 +31,7 @@ from learning_core import (
     ExamService,
     LearningDatabase,
     LexicalAnalysisService,
+    LexicalInferenceService,
     LearningService,
     PronunciationService,
     ProductionService,
@@ -44,6 +45,7 @@ from learning_core import (
     load_ranked_lemmas,
 )
 from learning_core.reading import lemma_candidates
+from learning_core.reading_tutor import _parse_json_object
 from learning_core.pronunciation import arpabet_to_ipa, arpabet_to_respelling
 from learning_core.vocabulary_builder import normalize_part_of_speech
 from learning_web import SESSION_HEADER, create_app
@@ -51,6 +53,12 @@ from tools.blueprints import blueprint_to_job_spec, parse_blueprint
 
 
 NOW = datetime(2026, 7, 30, 8, 0, tzinfo=timezone.utc)
+
+
+def test_model_json_parser_accepts_explanatory_wrapper() -> None:
+    assert _parse_json_object('Result follows:\n{"analyses": []}\nDone.') == {
+        "analyses": []
+    }
 
 
 @pytest.fixture
@@ -979,6 +987,202 @@ def test_llm_analysis_is_validated_cached_and_identified(
     assert result["analyses"][0]["content"]["segments"][1]["form"] == "predict"
     with pytest.raises(ValueError, match="model_name"):
         lexical.upsert_analysis({**payload, "model_name": None})
+
+
+def test_lexical_inference_generates_both_types_once_and_caches_terminal_results(
+    service: LearningService,
+) -> None:
+    sense_id = service.upsert_vocabulary(
+        VocabularyEntry(
+            "inspection", "noun", "careful examination", "检查", 2100,
+            "fixture", "inspection.n",
+        ),
+        now=NOW,
+    )["sense_id"]
+    calls: list[dict] = []
+
+    def generate(payload: dict) -> dict:
+        calls.append(payload)
+        assert payload["word"]["form"] == "inspection"
+        return {
+            "analyses": [
+                {
+                    "analysis_type": "modern_morphology",
+                    "status": "available",
+                    "content": {
+                        "segments": [
+                            {"form": "in-", "type": "prefix", "meaning": "into"},
+                            {"form": "spect", "type": "root", "meaning": "look"},
+                            {"form": "-ion", "type": "suffix", "meaning": "act or process"},
+                        ],
+                        "compositionality": "partly_transparent",
+                    },
+                    "explanation_zh": "现代学习中可按前缀、词根和名词后缀辅助记忆。",
+                    "confidence": 0.88,
+                },
+                {
+                    "analysis_type": "historical_etymology",
+                    "status": "available",
+                    "content": {
+                        "summary_zh": "经法语进入英语，历史上与拉丁语中“查看”有关。",
+                        "origin_language": "Latin via French",
+                        "semantic_evolution": "查看 → 仔细检查",
+                    },
+                    "explanation_zh": "历史词源用于记忆，不表示现代词义能完全由词根推出。",
+                    "confidence": 0.82,
+                },
+            ]
+        }
+
+    inference = LexicalInferenceService(service.database, generator=generate)
+    first = inference.analyze_sense(sense_id)
+    repeated = inference.analyze_sense(sense_id)
+
+    assert len(calls) == 1
+    assert first["generated_types"] == [
+        "historical_etymology", "modern_morphology"
+    ]
+    assert repeated["generated_types"] == []
+    assert repeated["cached"] is True
+    assert repeated["lexical_analysis"]["needs_inference"] == {
+        "historical_etymology": False,
+        "modern_morphology": False,
+    }
+
+
+def test_low_confidence_etymology_is_cached_as_ambiguous(
+    service: LearningService,
+) -> None:
+    sense_id = service.upsert_vocabulary(
+        VocabularyEntry("study", "noun", "learning activity", "学习", 500,
+                        "fixture", "study.n"),
+        now=NOW,
+    )["sense_id"]
+
+    def generate(_payload: dict) -> dict:
+        return {
+            "analyses": [
+                {
+                    "analysis_type": "modern_morphology", "status": "opaque",
+                    "content": {"summary_zh": "现代英语中不宜强行拆分。"},
+                    "explanation_zh": "作为整体记忆。", "confidence": 0.9,
+                },
+                {
+                    "analysis_type": "historical_etymology", "status": "available",
+                    "content": {"summary_zh": "来源不确定。"},
+                    "explanation_zh": "仅作可能解释。", "confidence": 0.5,
+                },
+            ]
+        }
+
+    result = LexicalInferenceService(
+        service.database, generator=generate
+    ).analyze_sense(sense_id)
+
+    analyses = result["lexical_analysis"]["analyses"]
+    assert {item["status"] for item in analyses} == {"opaque", "ambiguous"}
+    assert all(not needed for needed in result["lexical_analysis"]["needs_inference"].values())
+
+
+def test_lexical_inference_repairs_one_invalid_model_response(
+    service: LearningService,
+) -> None:
+    sense_id = service.upsert_vocabulary(
+        VocabularyEntry("inspect", "verb", "examine carefully", "检查", 1200,
+                        "fixture", "inspect.v"),
+        now=NOW,
+    )["sense_id"]
+    calls = 0
+
+    def generate(payload: dict) -> dict:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"analyses": [{"analysis_type": "modern_morphology"}]}
+        assert "repair" in payload
+        return {
+            "analyses": [
+                {"analysis_type": "historical_etymology", "status": "opaque",
+                 "content": {"summary_zh": "不提供更多历史断言。"},
+                 "explanation_zh": "资料不足。", "confidence": 0.8},
+                {"analysis_type": "modern_morphology", "status": "opaque",
+                 "content": {"summary_zh": "当前作为整体学习。"},
+                 "explanation_zh": "不强行拆分。", "confidence": 0.8},
+            ]
+        }
+
+    result = LexicalInferenceService(
+        service.database, generator=generate
+    ).analyze_sense(sense_id)
+
+    assert calls == 2
+    assert result["lexical_analysis"]["needs_inference"] == {
+        "historical_etymology": False,
+        "modern_morphology": False,
+    }
+
+
+def test_learning_web_runs_lexical_inference_as_background_job(tmp_path: Path) -> None:
+    database = tmp_path / "learning.db"
+    service = LearningService(LearningDatabase(database))
+    sense_id = service.upsert_vocabulary(
+        VocabularyEntry("inspection", "noun", "careful examination", "检查", 2100,
+                        "fixture", "inspection.n"),
+        now=NOW,
+    )["sense_id"]
+
+    def generate(_payload: dict) -> dict:
+        return {
+            "analyses": [
+                {
+                    "analysis_type": "modern_morphology", "status": "available",
+                    "content": {"segments": [
+                        {"form": "inspect", "type": "base", "meaning": "examine"},
+                        {"form": "-ion", "type": "suffix", "meaning": "process"},
+                    ], "compositionality": "transparent"},
+                    "explanation_zh": "inspect 加名词后缀。", "confidence": 0.9,
+                },
+                {
+                    "analysis_type": "historical_etymology", "status": "opaque",
+                    "content": {"summary_zh": "当前不提供未经核实的历史细节。"},
+                    "explanation_zh": "没有足够可靠的细节。", "confidence": 0.8,
+                },
+            ]
+        }
+
+    app = create_app(
+        database,
+        session_token="test-session-token",
+        lexical_generator=generate,
+    )
+
+    async def exercise_app():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1",
+            headers={SESSION_HEADER: "test-session-token"},
+        ) as client:
+            queued = await client.post(
+                "/api/lexical/inference", json={"sense_id": sense_id}
+            )
+            status = queued.json()
+            for _ in range(100):
+                if status["status"] in {"ready", "failed"}:
+                    break
+                await asyncio.sleep(0.01)
+                status = (
+                    await client.get(f"/api/lexical/inference/{status['job_id']}")
+                ).json()
+            return queued, status
+
+    queued, status = asyncio.run(exercise_app())
+
+    assert queued.status_code == 200
+    assert status["status"] == "ready"
+    assert status["result"]["lexical_analysis"]["needs_inference"] == {
+        "historical_etymology": False,
+        "modern_morphology": False,
+    }
 
 
 def test_learning_web_is_session_gated_and_host_restricted(tmp_path: Path) -> None:
