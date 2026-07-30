@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="learning-session" content="__LEARNING_SESSION_TOKEN__">
+  <title>Personal English Learning</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">A·</span>
+        <div><strong>English Lab</strong><small>个人英语学习</small></div>
+      </div>
+      <nav aria-label="学习导航">
+        <button class="nav-item active" data-view="home">今日学习</button>
+        <button class="nav-item" data-view="assessment">基础评估</button>
+        <button class="nav-item" data-view="review">词汇复习</button>
+        <button class="nav-item" data-view="vocabulary">词库查询</button>
+        <button class="nav-item" data-view="progress">学习进度</button>
+      </nav>
+      <div class="connection"><span></span>仅限 SSH 隧道访问</div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div><p class="eyebrow">PERSONAL ENGLISH LEARNING</p><h1 id="page-title">今日学习</h1></div>
+        <label class="collection-picker">学习集合
+          <select id="collection-select"></select>
+        </label>
+      </header>
+
+      <div id="notice" class="notice" role="status" hidden></div>
+
+      <section class="view active" id="view-home">
+        <div class="hero">
+          <div><p class="eyebrow">DAILY FOCUS</p><h2>少量、准确、持续。</h2>
+            <p>先确认认识程度，再开始今天的复习。基础阶段默认每天最多 8 个新词义。</p></div>
+          <button class="primary" data-go="review">开始今日学习</button>
+        </div>
+        <div class="metrics" id="home-metrics">
+          <article><span>待复习</span><strong id="metric-due">—</strong><small>张卡片</small></article>
+          <article><span>已评估</span><strong id="metric-assessed">—</strong><small>个词义</small></article>
+          <article><span>正在学习</span><strong id="metric-tracked">—</strong><small>个词义</small></article>
+          <article><span>词库规模</span><strong id="metric-vocabulary">—</strong><small>个去重词义</small></article>
+        </div>
+        <div class="two-column">
+          <article class="panel"><p class="eyebrow">START HERE</p><h3>还没有基线？</h3>
+            <p>从不同频率区间抽样主词义，用“认识 / 不确定 / 不认识”建立初始能力画像。</p>
+            <button class="secondary" data-go="assessment">开始基础评估</button></article>
+          <article class="panel"><p class="eyebrow">COLLECTIONS</p><h3>已安装词库</h3>
+            <div id="collection-summary" class="collection-summary"></div></article>
+        </div>
+      </section>
+
+      <section class="view" id="view-assessment">
+        <div class="section-intro"><div><h2>基础词汇评估</h2><p>只评估每个 lemma 的主候选义；不确定也是有效数据。</p></div>
+          <button id="assessment-start" class="primary">生成评估样本</button></div>
+        <div id="assessment-empty" class="empty-state">点击生成样本，每个频率区间抽取 5 个词。</div>
+        <article id="assessment-card" class="study-card" hidden>
+          <div class="card-meta"><span id="assessment-band"></span><span id="assessment-progress"></span></div>
+          <h2 id="assessment-lemma"></h2><p id="assessment-pos" class="part-of-speech"></p>
+          <p class="prompt">看到这个词时，你能理解它的常见含义吗？</p>
+          <div class="three-actions">
+            <button data-assessment="unknown">1 · 不认识</button>
+            <button data-assessment="unsure">2 · 不确定</button>
+            <button data-assessment="known">3 · 认识</button>
+          </div>
+        </article>
+      </section>
+
+      <section class="view" id="view-review">
+        <div class="section-intro"><div><h2>今日复习</h2><p>先尝试回忆，再显示答案。评分会确定下一次复习时间。</p></div>
+          <button id="review-start" class="primary">载入今日任务</button></div>
+        <div id="review-empty" class="empty-state">尚未载入任务。载入操作会创建最多 8 张新卡。</div>
+        <article id="review-card" class="study-card" hidden>
+          <div class="card-meta"><span id="review-type"></span><span id="review-progress"></span></div>
+          <p id="review-prompt-label" class="prompt-label"></p><h2 id="review-front"></h2>
+          <button id="reveal-answer" class="secondary wide">显示答案</button>
+          <div id="review-answer" class="answer" hidden><p id="review-answer-main"></p><small id="review-answer-extra"></small></div>
+          <div id="review-ratings" class="four-actions" hidden>
+            <button data-rating="again">Again</button><button data-rating="hard">Hard</button>
+            <button data-rating="good">Good</button><button data-rating="easy">Easy</button>
+          </div>
+        </article>
+      </section>
+
+      <section class="view" id="view-vocabulary">
+        <div class="section-intro"><div><h2>词库查询</h2><p>查询具体词义、来源以及当前掌握状态。</p></div></div>
+        <form id="search-form" class="search-bar"><input id="search-query" autocomplete="off" placeholder="输入 lemma，例如 derive" maxlength="80"><button class="primary">查询</button></form>
+        <div id="search-results" class="results"></div>
+      </section>
+
+      <section class="view" id="view-progress">
+        <div class="section-intro"><div><h2>最近七天</h2><p>关注真实完成量和记忆表现，而不是累计收藏数量。</p></div>
+          <button id="progress-refresh" class="secondary">刷新报告</button></div>
+        <div id="progress-content" class="progress-grid"></div>
+      </section>
+    </main>
+  </div>
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

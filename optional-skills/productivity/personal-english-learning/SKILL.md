@@ -82,6 +82,34 @@ python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_
 
 Completion criterion: the result contains `"ok": true` and a database path.
 
+### Optional local web interface
+
+Run the structured learning UI on the remote Hermes host. The server deliberately
+accepts loopback addresses only; do not open port 9121 in a cloud security group:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/learning_web.py \
+  --host 127.0.0.1 \
+  --port 9121
+```
+
+From the learner's computer, create an SSH **local** port forward (`-L`, not
+`-R`) and leave that process running:
+
+```bash
+ssh -NT \
+  -o ExitOnForwardFailure=yes \
+  -o ServerAliveInterval=60 \
+  -L 127.0.0.1:9121:127.0.0.1:9121 \
+  USER@SERVER_PUBLIC_IP
+```
+
+Open `http://127.0.0.1:9121`. The page supports collection selection, baseline
+assessment, today's deterministic review plan, card grading, vocabulary search,
+and the seven-day report. It uses an in-memory session token injected into the
+page and rejects non-loopback Host headers. The token is not a substitute for
+TLS and must not be used to expose the service directly to the public Internet.
+
 ### 2. Import vocabulary
 
 For a reproducible core library, use the official Open English WordNet 2025

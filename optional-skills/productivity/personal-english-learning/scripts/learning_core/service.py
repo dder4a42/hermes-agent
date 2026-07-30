@@ -710,6 +710,70 @@ class LearningService:
             "collections": [dict(row) for row in collections],
         }
 
+    def search_vocabulary(
+        self,
+        query: str,
+        *,
+        collection_id: str | None = None,
+        limit: int = 50,
+    ) -> dict:
+        normalized = normalize_lemma(query)
+        if not normalized:
+            raise ValueError("query is required")
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        pattern = f"%{normalized}%"
+        with self.database.connect() as connection:
+            if collection_id:
+                self._resolve_collection_id(connection, collection_id)
+                rows = connection.execute(
+                    """
+                    SELECT ws.*, wsc.collection_id,
+                           wsc.priority_rank AS collection_rank,
+                           wsc.sense_rank AS collection_sense_rank,
+                           COALESCE(uks.recognition_score, 0.0) AS recognition_score,
+                           COALESCE(uks.recall_score, 0.0) AS recall_score,
+                           COALESCE(uks.production_score, 0.0) AS production_score
+                    FROM word_senses ws
+                    JOIN word_sense_collections wsc ON wsc.sense_id = ws.id
+                    LEFT JOIN user_knowledge_states uks ON uks.sense_id = ws.id
+                    WHERE wsc.collection_id = ?
+                      AND ws.normalized_lemma LIKE ?
+                    ORDER BY
+                        CASE WHEN ws.normalized_lemma = ? THEN 0 ELSE 1 END,
+                        wsc.priority_rank, wsc.sense_rank, ws.normalized_lemma
+                    LIMIT ?
+                    """,
+                    (collection_id, pattern, normalized, limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    """
+                    SELECT ws.*,
+                           COALESCE(uks.recognition_score, 0.0) AS recognition_score,
+                           COALESCE(uks.recall_score, 0.0) AS recall_score,
+                           COALESCE(uks.production_score, 0.0) AS production_score
+                    FROM word_senses ws
+                    LEFT JOIN user_knowledge_states uks ON uks.sense_id = ws.id
+                    WHERE ws.normalized_lemma LIKE ?
+                    ORDER BY
+                        CASE WHEN ws.normalized_lemma = ? THEN 0 ELSE 1 END,
+                        ws.frequency_rank, ws.normalized_lemma, ws.id
+                    LIMIT ?
+                    """,
+                    (pattern, normalized, limit),
+                ).fetchall()
+        items = []
+        for row in rows:
+            item = self._sense_dict(row)
+            item.update(
+                recognition_score=round(float(row["recognition_score"]), 4),
+                recall_score=round(float(row["recall_score"]), 4),
+                production_score=round(float(row["production_score"]), 4),
+            )
+            items.append(item)
+        return {"query": query, "count": len(items), "items": items}
+
     @staticmethod
     def _resolve_collection_id(
         connection: sqlite3.Connection,

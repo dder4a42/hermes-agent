@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import subprocess
@@ -11,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import httpx
 
 
 SKILL_DIR = (
@@ -38,6 +40,7 @@ from learning_core import (
 )
 from learning_core.reading import lemma_candidates
 from learning_core.vocabulary_builder import normalize_part_of_speech
+from learning_web import SESSION_HEADER, create_app
 from tools.blueprints import blueprint_to_job_spec, parse_blueprint
 
 
@@ -743,6 +746,107 @@ def test_empty_weekly_report_has_stable_zero_categories(
         "partial": 0,
         "correct": 0,
     }
+
+
+def test_vocabulary_search_returns_mastery_and_collection_metadata(
+    service: LearningService,
+) -> None:
+    sense_id = service.upsert_vocabulary(
+        VocabularyEntry.from_mapping(
+            {
+                "lemma": "derive",
+                "part_of_speech": "verb",
+                "definition_en": "obtain from a source",
+                "frequency_rank": 900,
+                "source": "fixture",
+                "source_sense_id": "derive.v.obtain",
+                "collection": {
+                    "id": "general-test",
+                    "title": "General Test",
+                    "kind": "general",
+                    "source": "fixture",
+                    "version": "1",
+                    "license": "test",
+                    "rank": 12,
+                    "sense_rank": 1,
+                    "source_lemma": "derive",
+                },
+            }
+        ),
+        now=NOW,
+    )["sense_id"]
+    service.record_assessment(sense_id, "known", "1-1000", now=NOW)
+
+    result = service.search_vocabulary("der", collection_id="general-test")
+
+    assert result["count"] == 1
+    assert result["items"][0]["lemma"] == "derive"
+    assert result["items"][0]["collection_rank"] == 12
+    assert result["items"][0]["recognition_score"] == 0.9
+
+
+def test_learning_web_is_session_gated_and_host_restricted(tmp_path: Path) -> None:
+    database = tmp_path / "learning.db"
+    service = LearningService(LearningDatabase(database))
+    seed(service, [100, 1100, 2100, 3100])
+    app = create_app(database, session_token="test-session-token")
+
+    async def exercise_app():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1",
+        ) as client:
+            return (
+                await client.get("/"),
+                await client.get("/api/stats"),
+                await client.get(
+                    "/api/stats", headers={SESSION_HEADER: "test-session-token"}
+                ),
+                await client.get(
+                    "/api/health", headers={"Host": "attacker.example"}
+                ),
+                await client.post(
+                    "/api/assessment/sample",
+                    headers={SESSION_HEADER: "test-session-token"},
+                    json={"per_band": 1, "seed": 3},
+                ),
+            )
+
+    page, unauthorized, authorized, hostile_host, sampled = asyncio.run(
+        exercise_app()
+    )
+
+    assert page.status_code == 200
+    assert 'content="test-session-token"' in page.text
+    assert page.headers["content-security-policy"].startswith("default-src 'self'")
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+    assert authorized.json()["vocabulary_senses"] == 4
+    assert hostile_host.status_code == 400
+    assert sampled.status_code == 200
+    assert sampled.json()["count"] == 4
+
+
+def test_learning_web_refuses_public_bind_without_touching_database(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "learning.db"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DIR / "learning_web.py"),
+            "--host",
+            "0.0.0.0",
+            "--db",
+            str(database),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert "Refusing non-loopback bind" in completed.stderr
+    assert not database.exists()
 
 
 def test_skill_blueprint_is_daily_profile_local_terminal_automation() -> None:
