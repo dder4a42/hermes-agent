@@ -306,6 +306,7 @@ class LearningService:
                         JOIN word_sense_collections wsc ON wsc.sense_id = ws.id
                         WHERE wsc.collection_id = ?
                           AND wsc.priority_rank BETWEEN ? AND ?
+                          AND wsc.sense_rank = 1
                           AND NOT EXISTS (
                               SELECT 1 FROM assessment_events ae
                               WHERE ae.sense_id = ws.id

@@ -26,6 +26,26 @@ from learning_core import (
 )
 
 
+# Closed-class words are already structural knowledge, while WordNet may map
+# their spellings to unrelated abbreviations (``a`` the unit, ``it`` the field,
+# ``who`` the organization).  They are therefore not useful vocabulary-growth
+# candidates in the general collection.
+GENERAL_CLOSED_CLASS_LEMMAS = frozenset(
+    """
+    a an the i me my mine myself you your yours yourself yourselves he him his
+    himself she her hers herself it its itself we us our ours ourselves they
+    them their theirs themselves who whom whose what which whoever whatever
+    whichever this that these those am is are was were be been being have has
+    had do does did can could may might must shall should will would ought and
+    or but nor for so yet if because although though while whereas unless until
+    since as than at by from in into of off on onto over under with without
+    within through throughout toward towards against among between before after
+    during to not no here there where when why how some any all each every
+    either neither both few many much more most other another such
+    """.split()
+)
+
+
 def default_database_path() -> Path:
     hermes_home = Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
     return hermes_home / "personal-english-learning" / "learning.db"
@@ -141,7 +161,9 @@ def build_parser() -> argparse.ArgumentParser:
         "vocabulary-build-general",
         help="Build a compact general-English OEWN JSONL collection",
     )
-    _add_builder_arguments(general, default_limit=5000, default_senses=2)
+    _add_builder_arguments(
+        general, default_limit=5000, default_senses=2, default_minimum_tags=1
+    )
     general.add_argument("--frequency-list", type=Path)
     general.add_argument("--collection-id", default="general-core-oewn-2025")
     general.add_argument("--collection-title", default="General English Core")
@@ -155,7 +177,9 @@ def build_parser() -> argparse.ArgumentParser:
         "vocabulary-build-academic",
         help="Build an academic-English OEWN JSONL collection",
     )
-    _add_builder_arguments(academic, default_limit=3000, default_senses=5)
+    _add_builder_arguments(
+        academic, default_limit=3000, default_senses=5, default_minimum_tags=0
+    )
     academic.add_argument("--academic-list", type=Path, required=True)
     academic.add_argument("--frequency-list", type=Path)
     academic.add_argument("--collection-id", default="academic-core-oewn-2025")
@@ -178,6 +202,7 @@ def _add_builder_arguments(
     *,
     default_limit: int,
     default_senses: int,
+    default_minimum_tags: int,
 ) -> None:
     parser.add_argument("--wordnet-zip", type=Path, required=True)
     parser.add_argument("--sense-index-zip", type=Path, required=True)
@@ -185,6 +210,9 @@ def _add_builder_arguments(
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=default_limit)
     parser.add_argument("--max-senses-per-lemma", type=int, default=default_senses)
+    parser.add_argument(
+        "--minimum-sense-tag-count", type=int, default=default_minimum_tags
+    )
     parser.add_argument("--force", action="store_true")
 
 
@@ -303,10 +331,17 @@ def _run_vocabulary_builder(args: argparse.Namespace) -> dict:
     )
     if args.command == "vocabulary-build-general":
         ranked_items = frequency_items or load_wordfreq_lemmas(args.limit * 3)
+        ranked_items = [
+            item
+            for item in ranked_items
+            if len(item.lemma) > 1
+            and item.lemma.casefold() not in GENERAL_CLOSED_CLASS_LEMMAS
+        ]
         kind = "general"
         ranked_source_path = args.frequency_list
     else:
         ranked_items = load_ranked_lemmas(args.academic_list)
+        ranked_items = [item for item in ranked_items if item.rank <= args.limit]
         kind = "academic"
         ranked_source_path = args.academic_list
     if kind == "general":
@@ -335,6 +370,7 @@ def _run_vocabulary_builder(args: argparse.Namespace) -> dict:
         frequency_ranks=ranks,
         lemma_limit=args.limit,
         max_senses_per_lemma=args.max_senses_per_lemma,
+        minimum_sense_tag_count=args.minimum_sense_tag_count,
         force=args.force,
         ranked_source_path=ranked_source_path,
         frequency_source_path=args.frequency_list,

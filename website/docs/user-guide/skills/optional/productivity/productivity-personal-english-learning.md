@@ -88,9 +88,12 @@ Completion criterion: the result contains `"ok": true` and a database path.
 
 ### 2. Import vocabulary
 
-For a reproducible core library, download both official Open English WordNet
-2025 archives: the JSON archive supplies entries and definitions, while the
-WNDB archive supplies `index.sense` ordering. Keep both outside the repository.
+For a reproducible core library, use the official Open English WordNet 2025
+JSON archive for entries and definitions. Use Princeton WordNet 3.0
+`index.sense` (the NLTK data archive is a convenient packaged copy) for tagged
+corpus counts and cross-POS sense ordering. Keep both outside the repository.
+OEWN's own WNDB `index.sense` is structurally valid, but its zero tag counts do
+not provide a useful general-learning priority.
 
 Build a general-English candidate collection from a UTF-8 CSV/TSV/JSONL
 frequency list:
@@ -99,7 +102,7 @@ frequency list:
 python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
   vocabulary-build-general \
   --wordnet-zip /data/english-wordnet-2025-json.zip \
-  --sense-index-zip /data/english-wordnet-2025.zip \
+  --sense-index-zip /data/princeton-wordnet-3.0-nltk.zip \
   --frequency-list /data/english-frequency.csv \
   --output /data/general-core.jsonl \
   --limit 5000
@@ -108,7 +111,9 @@ python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_
 The ranked list accepts headers such as `rank,lemma` or `rank,word`. If
 `--frequency-list` is omitted, the command uses the optional `wordfreq` Python
 package and requests extra candidates because function words do not necessarily
-have OEWN senses.
+have OEWN senses. General builds exclude closed-class spellings that WordNet
+can mistake for abbreviations and, by default, require at least one tagged
+corpus occurrence (`--minimum-sense-tag-count 1`).
 
 Build academic candidates from a lemma list such as the Academic Vocabulary
 List. Its official download is an Excel workbook; export the relevant worksheet
@@ -125,7 +130,7 @@ derive,3,verb
 python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
   vocabulary-build-academic \
   --wordnet-zip /data/english-wordnet-2025-json.zip \
-  --sense-index-zip /data/english-wordnet-2025.zip \
+  --sense-index-zip /data/princeton-wordnet-3.0-nltk.zip \
   --academic-list /data/academic-vocabulary.csv \
   --frequency-list /data/english-frequency.csv \
   --output /data/academic-core.jsonl
@@ -137,11 +142,11 @@ and the output hash. Review unmatched counts before import. Rebuilding refuses
 to replace an existing output unless `--force` is explicit.
 
 These are candidate sense collections, not a claim that every selected OEWN
-sense is pedagogically central. OEWN `index.sense` determines stable sense
-order, but an academic lemma list generally does not identify the academic
-sense. Academic builds therefore retain up to five candidate senses by default;
-actual reading context and explicit learner confirmation decide which sense
-enters active study.
+sense is pedagogically central. Tagged Princeton counts prioritize general
+senses across parts of speech, but an academic lemma list generally does not
+identify the academic sense. Academic builds therefore allow untagged senses
+and retain up to five candidates by default; actual reading context and explicit
+learner confirmation decide which sense enters active study.
 
 Import the generated collections separately:
 
@@ -168,6 +173,8 @@ When `--collection-id` is omitted, assessment and daily planning automatically
 select the lexically first installed `general` collection. If no general
 collection exists, legacy uncollected behavior is retained. The JSON response
 reports `collection_selection` so the caller never has to guess which path ran.
+Collection-based baseline assessment samples only `sense_rank = 1`; secondary
+senses are introduced from real reading context instead of random testing.
 
 Use `academic-core-oewn-2025` explicitly only when the learner requests
 academic work or their general review load is under control. Due reviews remain

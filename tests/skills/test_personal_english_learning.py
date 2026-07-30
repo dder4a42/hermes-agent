@@ -37,6 +37,7 @@ from learning_core import (
     load_ranked_lemmas,
 )
 from learning_core.reading import lemma_candidates
+from learning_core.vocabulary_builder import normalize_part_of_speech
 from tools.blueprints import blueprint_to_job_spec, parse_blueprint
 
 
@@ -66,8 +67,13 @@ def seed(service: LearningService, ranks: list[int]) -> list[str]:
 
 def _wordnet_fixture(path: Path) -> Path:
     entries = {
-        "address": {
+        "a": {
             "n": {
+                "sense": [{"id": "a%1:23:01::", "synset": "a-n-1"}]
+            }
+        },
+        "address": {
+            "n-1": {
                 "sense": [
                     {"id": "address%1:10:00::", "synset": "address-n-1"},
                     {"id": "address%1:10:01::", "synset": "address-n-2"},
@@ -86,6 +92,7 @@ def _wordnet_fixture(path: Path) -> Path:
         },
     }
     noun_synsets = {
+        "a-n-1": {"definition": ["a metric unit used for wavelengths"]},
         "address-n-1": {"definition": ["the place where something is located"]},
         "address-n-2": {"definition": ["a formal spoken communication"]},
     }
@@ -102,9 +109,10 @@ def _wordnet_fixture(path: Path) -> Path:
             "index.sense",
             "\n".join(
                 (
+                    "a%1:23:01:: 00000000 1 20",
                     "address%1:10:00:: 00000001 1 4",
                     "address%1:10:01:: 00000002 2 0",
-                    "address%2:32:00:: 00000003 1 3",
+                    "address%2:32:00:: 00000003 1 8",
                     "derive%2:40:00:: 00000004 1 2",
                 )
             )
@@ -752,7 +760,7 @@ def test_skill_blueprint_is_daily_profile_local_terminal_automation() -> None:
     assert job["enabled_toolsets"] == ["terminal"]
 
 
-def test_general_vocabulary_builder_is_deterministic_and_round_robins_pos(
+def test_general_vocabulary_builder_is_deterministic_and_ranks_across_pos(
     tmp_path: Path,
 ) -> None:
     wordnet = _wordnet_fixture(tmp_path / "oewn-2025.zip")
@@ -804,8 +812,8 @@ def test_general_vocabulary_builder_is_deterministic_and_round_robins_pos(
     assert first["sense_entries"] == 3
     assert first["unmatched_lemmas"] == ["the"]
     assert [(row["lemma"], row["part_of_speech"]) for row in rows] == [
-        ("address", "noun"),
         ("address", "verb"),
+        ("address", "noun"),
         ("derive", "verb"),
     ]
     assert {row["source"] for row in rows} == {"oewn-2025"}
@@ -823,6 +831,20 @@ def test_general_vocabulary_builder_is_deterministic_and_round_robins_pos(
     assert plan["collection_selection"] == "auto_general"
     assert [item["lemma"] for item in plan["new_items"]] == ["address", "derive"]
     assert [item["collection_sense_rank"] for item in plan["new_items"]] == [1, 1]
+
+    sample = service.assessment_sample(
+        per_band=5,
+        bands=((1, 10),),
+        collection_id="general-core-test",
+        seed=2,
+    )
+    assert sample["count"] == 2
+    assert {item["lemma"] for item in sample["items"]} == {"address", "derive"}
+    assert {item["collection_sense_rank"] for item in sample["items"]} == {1}
+
+
+def test_academic_avl_adjective_code_is_supported() -> None:
+    assert normalize_part_of_speech("j") == "adjective"
 
 
 def test_academic_collection_reuses_senses_and_preserves_general_frequency(
@@ -903,7 +925,9 @@ def test_vocabulary_builder_cli_creates_importable_general_collection(
 ) -> None:
     wordnet = _wordnet_fixture(tmp_path / "oewn-2025.zip")
     frequency = tmp_path / "frequency.tsv"
-    frequency.write_text("rank\tword\n1\taddress\n2\tderive\n", encoding="utf-8")
+    frequency.write_text(
+        "rank\tword\n1\ta\n2\taddress\n3\tderive\n", encoding="utf-8"
+    )
     output = tmp_path / "built.jsonl"
     database = tmp_path / "learning.db"
 
@@ -943,7 +967,47 @@ def test_vocabulary_builder_cli_creates_importable_general_collection(
 
     assert json.loads(built.stdout)["selected_lemmas"] == 2
     assert json.loads(imported.stdout)["created"] == 3
+    assert {
+        json.loads(line)["lemma"] for line in output.read_text().splitlines()
+    } == {"address", "derive"}
     assert output.with_suffix(".jsonl.manifest.json").is_file()
+
+
+def test_academic_builder_cli_does_not_backfill_beyond_rank_limit(
+    tmp_path: Path,
+) -> None:
+    wordnet = _wordnet_fixture(tmp_path / "oewn-2025.zip")
+    academic = tmp_path / "academic.csv"
+    academic.write_text(
+        "academic_rank,lemma,pos\n1,missing,n\n2,address,v\n3,derive,v\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "academic.jsonl"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(CLI_PATH),
+            "vocabulary-build-academic",
+            "--wordnet-zip",
+            str(wordnet),
+            "--sense-index-zip",
+            str(wordnet),
+            "--academic-list",
+            str(academic),
+            "--output",
+            str(output),
+            "--limit",
+            "2",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+
+    assert json.loads(completed.stdout)["selected_lemmas"] == 1
+    assert {row["lemma"] for row in rows} == {"address"}
 
 
 def test_toefl_2026_profile_preserves_version_sources_and_task_contract() -> None:

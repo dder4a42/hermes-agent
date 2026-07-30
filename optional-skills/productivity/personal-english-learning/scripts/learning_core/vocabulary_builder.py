@@ -20,6 +20,7 @@ POS_NAMES = {
     "verb": "verb",
     "a": "adjective",
     "s": "adjective",
+    "j": "adjective",
     "adj": "adjective",
     "adjective": "adjective",
     "r": "adverb",
@@ -102,12 +103,15 @@ class VocabularyBuilder:
         frequency_ranks: dict[str, int] | None = None,
         lemma_limit: int = 5000,
         max_senses_per_lemma: int = 2,
+        minimum_sense_tag_count: int = 0,
         force: bool = False,
         ranked_source_path: str | Path | None = None,
         frequency_source_path: str | Path | None = None,
     ) -> dict[str, Any]:
         if lemma_limit <= 0 or max_senses_per_lemma <= 0:
             raise ValueError("lemma_limit and max_senses_per_lemma must be positive")
+        if minimum_sense_tag_count < 0:
+            raise ValueError("minimum_sense_tag_count cannot be negative")
         output_path = Path(output).expanduser()
         manifest_path = output_path.with_suffix(output_path.suffix + ".manifest.json")
         if not force and (output_path.exists() or manifest_path.exists()):
@@ -154,8 +158,16 @@ class VocabularyBuilder:
                     pos_senses = by_pos.get(pos_code, [])
                     if sense_index < len(pos_senses):
                         senses.append((pos_code, pos_senses[sense_index]))
+            # Sense numbers are only ordered within a part of speech.  Rank the
+            # combined candidates by corpus tag count so a frequent verb does
+            # not lose to an unrelated noun merely because nouns were visited
+            # first.  The Princeton sense index is accepted separately from
+            # the newer OEWN definitions for this purpose.
+            senses.sort(key=lambda value: self._sense_sort_key(value[1]))
             emitted = 0
             for pos_code, sense in senses:
+                if self._sense_tag_count(sense) < minimum_sense_tag_count:
+                    continue
                 synset = synsets.get(sense["synset"])
                 if not synset or not synset.get("definition"):
                     continue
@@ -227,6 +239,7 @@ class VocabularyBuilder:
             "parameters": {
                 "lemma_limit": lemma_limit,
                 "max_senses_per_lemma": max_senses_per_lemma,
+                "minimum_sense_tag_count": minimum_sense_tag_count,
                 "wordnet_version": self.wordnet_version,
             },
             "result": {
@@ -288,7 +301,15 @@ class VocabularyBuilder:
                         continue
                     target = result.setdefault(lemma, {})
                     for pos_code, entry in pos_entries.items():
-                        target.setdefault(pos_code, []).extend(entry.get("sense", []))
+                        # OEWN disambiguates homographs with keys such as ``n-1``
+                        # and ``v-2``.  They still carry the base WordNet POS and
+                        # must be merged for ranked-list matching.
+                        base_pos_code = pos_code.split("-", 1)[0]
+                        if base_pos_code not in {"n", "v", "a", "s", "r"}:
+                            continue
+                        target.setdefault(base_pos_code, []).extend(
+                            entry.get("sense", [])
+                        )
         for pos_entries in result.values():
             for senses in pos_entries.values():
                 senses.sort(key=self._sense_sort_key)
@@ -318,6 +339,9 @@ class VocabularyBuilder:
             (1_000_000, 0),
         )
         return (-tag_count, sense_number, sense.get("id", ""))
+
+    def _sense_tag_count(self, sense: dict[str, str]) -> int:
+        return self._sense_ranks.get(sense.get("id", ""), (0, 0))[1]
 
     def _load_synsets(self, target_ids: set[str]) -> dict[str, dict[str, Any]]:
         result: dict[str, dict[str, Any]] = {}
