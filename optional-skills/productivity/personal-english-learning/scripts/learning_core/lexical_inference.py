@@ -173,6 +173,9 @@ class LexicalInferenceService:
             analysis_type = str(analysis.get("analysis_type", "")).strip()
             status = str(analysis.get("status", "")).strip().casefold()
             status = {
+                "complete": "available",
+                "completed": "available",
+                "success": "available",
                 "uncertain": "ambiguous",
                 "unclear": "ambiguous",
                 "unknown": "not_found",
@@ -206,7 +209,12 @@ class LexicalInferenceService:
             if analysis_type in seen:
                 raise ValueError("duplicate lexical analysis type")
             if status not in OUTPUT_STATUSES or not isinstance(content, dict):
-                raise ValueError("invalid lexical analysis status or content")
+                raise ValueError(
+                    "invalid lexical analysis status or content: "
+                    f"type={analysis_type!r}, status={status!r}, "
+                    f"content_type={type(content).__name__}, "
+                    f"keys={sorted(str(key) for key in analysis)}"
+                )
             if not explanation or not 0.0 <= confidence <= 1.0:
                 raise ValueError("lexical analysis needs explanation and confidence")
             if analysis_type == "modern_morphology" and status == "available":
