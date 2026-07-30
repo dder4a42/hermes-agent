@@ -1224,6 +1224,26 @@ def test_learning_items_group_cards_by_concrete_sense(service: LearningService) 
     assert notebook["items"][0]["next_review_at"] is not None
 
 
+def test_vocabulary_search_item_can_be_added_to_notebook_idempotently(
+    service: LearningService,
+) -> None:
+    sense_id = service.upsert_vocabulary(
+        VocabularyEntry(
+            "derive", "verb", "obtain from a source", "源自", 900,
+            "fixture", "derive.v",
+        ),
+        now=NOW,
+    )["sense_id"]
+
+    first = service.add_learning_item(sense_id, now=NOW)
+    repeated = service.add_learning_item(sense_id, now=NOW)
+
+    assert first["created"] is True
+    assert repeated["created"] is False
+    assert first["card_id"] == repeated["card_id"]
+    assert service.learning_items()["items"][0]["sense_id"] == sense_id
+
+
 def test_learning_web_exposes_writing_review_and_separate_word_views(
     tmp_path: Path,
 ) -> None:

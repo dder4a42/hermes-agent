@@ -917,6 +917,68 @@ class LearningService:
         self._attach_lexical_analyses(items)
         return {"count": total, "offset": offset, "limit": limit, "items": items}
 
+    def add_learning_item(
+        self, sense_id: str, *, now: datetime | None = None
+    ) -> dict:
+        """Idempotently add one concrete sense to the learner's notebook."""
+
+        sense_id = sense_id.strip()
+        if not sense_id:
+            raise ValueError("sense_id is required")
+        now = now or utc_now()
+        now_text = iso(now)
+        with self.database.connect() as connection:
+            sense = connection.execute(
+                "SELECT * FROM word_senses WHERE id = ?", (sense_id,)
+            ).fetchone()
+            if not sense:
+                raise ValueError(f"unknown sense_id: {sense_id}")
+            existing = connection.execute(
+                """
+                SELECT * FROM review_cards
+                WHERE sense_id = ? AND card_type = 'recognition'
+                """,
+                (sense_id,),
+            ).fetchone()
+            if existing:
+                if existing["state"] == "suspended":
+                    connection.execute(
+                        """
+                        UPDATE review_cards
+                        SET state = 'learning', due_at = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now_text, now_text, existing["id"]),
+                    )
+                    return {
+                        "sense_id": sense_id,
+                        "card_id": existing["id"],
+                        "created": False,
+                        "reactivated": True,
+                    }
+                return {
+                    "sense_id": sense_id,
+                    "card_id": existing["id"],
+                    "created": False,
+                    "reactivated": False,
+                }
+            card_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO review_cards(
+                    id, sense_id, card_type, state, step, due_at,
+                    created_at, updated_at
+                ) VALUES (?, ?, 'recognition', 'new', 0, ?, ?, ?)
+                """,
+                (card_id, sense_id, now_text, now_text, now_text),
+            )
+        return {
+            "sense_id": sense_id,
+            "card_id": card_id,
+            "created": True,
+            "reactivated": False,
+        }
+
     def _attach_pronunciations(self, items: list[dict]) -> None:
         pronunciation_service = PronunciationService(self.database)
         pronunciations = pronunciation_service.lookup_many(

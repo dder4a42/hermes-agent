@@ -307,8 +307,24 @@ async function searchVocabulary(event) {
   container.replaceChildren(...data.items.map(item => {
     const card = document.createElement("article"); card.className = "result-card";
     card.innerHTML = `<div><h3>${escapeHtml(item.lemma)}</h3><span>${escapeHtml(item.part_of_speech)}</span></div><div class="result-pronunciation pronunciation">${pronunciationHtml(item)}</div><p>${escapeHtml(item.definition_en)}</p><small>识别 ${Math.round(item.recognition_score * 100)}% · 回忆 ${Math.round(item.recall_score * 100)}% · 来源 ${escapeHtml(item.source)}</small>${lexicalAnalysisHtml(item)}`;
+    const add = document.createElement("button"); add.className = "secondary notebook-add"; add.textContent = "加入生词本";
+    add.addEventListener("click", () => void addToNotebook(item, add).catch(error => notify(error.message, "error")));
+    card.append(add);
     return card;
   }));
+}
+
+async function addToNotebook(item, button) {
+  button.disabled = true;
+  try {
+    const result = await api(`/api/vocabulary/notebook/${encodeURIComponent(item.sense_id)}`, {method: "POST"});
+    button.textContent = result.created || result.reactivated ? "已加入生词本" : "已在生词本中";
+    todayPlanPromise = null;
+    notify(`${item.lemma} 的当前词义已加入学习队列。`, "success");
+    await loadStats();
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function loadNotebook() {

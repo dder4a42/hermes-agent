@@ -229,6 +229,10 @@ def create_app(
     ) -> dict:
         return {"ok": True, **service.learning_items(limit=limit, offset=offset)}
 
+    @app.post("/api/vocabulary/notebook/{sense_id}")
+    async def vocabulary_notebook_add(sense_id: str) -> dict:
+        return {"ok": True, **service.add_learning_item(sense_id)}
+
     @app.post("/api/reading/today")
     async def reading_today(body: ReadingTodayRequest) -> dict:
         # This is a loopback-only, single-user service. Generation is bounded by
