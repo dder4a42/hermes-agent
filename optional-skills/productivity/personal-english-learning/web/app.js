@@ -8,9 +8,21 @@ let reviewItems = [];
 let reviewIndex = 0;
 let reviewStartedAt = 0;
 let lastSearchItems = [];
+let reviewPlanLoading = false;
+let reviewSubmitting = false;
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {...options, headers: {...headers, ...(options.headers || {})}});
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 15000);
+  let response;
+  try {
+    response = await fetch(path, {...options, signal: controller.signal, headers: {...headers, ...(options.headers || {})}});
+  } catch (error) {
+    if (error.name === "AbortError") throw new Error("请求超时，请稍后重试。今日计划不会被重复创建。");
+    throw new Error("连接失败，请检查 SSH 隧道和服务器状态。");
+  } finally {
+    window.clearTimeout(timeout);
+  }
   const payload = await response.json().catch(() => ({detail: "服务器返回了无效响应"}));
   if (!response.ok) throw new Error(payload.detail || `请求失败 (${response.status})`);
   return payload;
@@ -43,6 +55,45 @@ function pronunciationHtml(item) {
   if (mode !== "respelling" && pronunciation.ipa) parts.push(`<span>US /${escapeHtml(pronunciation.ipa)}/</span>`);
   if (mode !== "ipa" && pronunciation.respelling) parts.push(`<strong>${escapeHtml(pronunciation.respelling)}</strong>`);
   return parts.join('<span class="pronunciation-separator">·</span>');
+}
+
+function analysisSourceLabel(analysis) {
+  if (analysis.source_level === "authoritative") return "权威来源";
+  if (analysis.source_level === "deterministic") return "系统分析";
+  return `AI 分析 ${Math.round(analysis.confidence * 100)}%`;
+}
+
+function lexicalAnalysisHtml(item, compact = false) {
+  const lexical = item?.lexical_analysis;
+  if (!lexical) return "";
+  const family = (lexical.word_family || []).slice(0, compact ? 6 : 12);
+  const visibleAnalyses = (lexical.analyses || []).filter(analysis => {
+    if (analysis.status !== "available") return false;
+    if (analysis.source_level !== "llm_inferred") return true;
+    const threshold = analysis.analysis_type === "historical_etymology" ? 0.75 : 0.6;
+    return analysis.confidence >= threshold;
+  });
+  const seenAnalysisTypes = new Set();
+  const analyses = visibleAnalyses.filter(analysis => {
+    if (seenAnalysisTypes.has(analysis.analysis_type)) return false;
+    seenAnalysisTypes.add(analysis.analysis_type); return true;
+  });
+  const sections = [];
+  if (family.length) {
+    sections.push(`<section class="lexical-section"><h4>词族</h4><div class="family-chips">${family.map(entry => `<span>${escapeHtml(entry.form)}${entry.part_of_speech ? `<small>${escapeHtml(entry.part_of_speech)}</small>` : ""}</span>`).join("")}</div><small class="analysis-source">OEWN · 权威来源</small></section>`);
+  }
+  for (const analysis of analyses.slice(0, compact ? 1 : 3)) {
+    const title = analysis.analysis_type === "modern_morphology" ? "构词分析" : "词源解读";
+    const segments = Array.isArray(analysis.content?.segments) ? analysis.content.segments : [];
+    const segmentHtml = segments.length ? `<div class="morpheme-chain">${segments.map(segment => `<span><strong>${escapeHtml(segment.form)}</strong><small>${escapeHtml(segment.meaning || segment.type || "")}</small></span>`).join('<b>+</b>')}</div>` : "";
+    const explanation = analysis.explanation_zh || analysis.content?.summary_zh || analysis.content?.summary || "";
+    const uncertain = analysis.source_level === "llm_inferred" && analysis.confidence < 0.8 ? " · 可能的分析" : "";
+    sections.push(`<section class="lexical-section"><h4>${title}</h4>${segmentHtml}${explanation ? `<p>${escapeHtml(explanation)}</p>` : ""}<small class="analysis-source">${escapeHtml(analysisSourceLabel(analysis))}${uncertain} · ${escapeHtml(analysis.source)}</small></section>`);
+  }
+  if (!sections.length && !compact && Object.values(lexical.needs_inference || {}).some(Boolean)) {
+    sections.push('<p class="analysis-missing">暂无可靠分析；可在需要时由 AI 辅助补全。</p>');
+  }
+  return sections.length ? `<div class="lexical-analysis">${sections.join("")}</div>` : "";
 }
 
 async function loadStats() {
@@ -101,12 +152,23 @@ async function answerAssessment(response) {
 }
 
 async function startReview() {
-  const data = await api("/api/plans/today", {method: "POST", body: JSON.stringify({review_limit: 30, new_limit: 8, collection_id: selectedCollection()})});
-  reviewItems = [...data.reviews, ...data.new_items]; reviewIndex = 0;
-  document.querySelector("#review-empty").hidden = reviewItems.length > 0;
-  document.querySelector("#review-card").hidden = reviewItems.length === 0;
-  if (!reviewItems.length) notify("今天暂时没有待复习或可加入的新词。", "success");
-  renderReview(); await loadStats();
+  if (reviewPlanLoading) return;
+  reviewPlanLoading = true;
+  const button = document.querySelector("#review-start");
+  const originalText = button.textContent;
+  button.disabled = true; button.textContent = "正在载入…";
+  try {
+    const data = await api("/api/plans/today", {method: "POST", body: JSON.stringify({review_limit: 30, new_limit: 8, collection_id: selectedCollection()})});
+    reviewItems = [...data.reviews, ...data.new_items]; reviewIndex = 0;
+    document.querySelector("#review-empty").hidden = reviewItems.length > 0;
+    document.querySelector("#review-card").hidden = reviewItems.length === 0;
+    if (!reviewItems.length) notify("今天的学习任务已经完成。", "success");
+    else if (data.reused_plan) notify("已恢复今天尚未完成的任务。", "success");
+    renderReview(); await loadStats();
+  } finally {
+    reviewPlanLoading = false;
+    button.disabled = false; button.textContent = originalText;
+  }
 }
 
 function renderReview() {
@@ -120,6 +182,7 @@ function renderReview() {
   document.querySelector("#review-answer-main").textContent = recall ? item.lemma : item.definition_en;
   document.querySelector("#review-answer-pronunciation").innerHTML = pronunciationHtml(item);
   document.querySelector("#review-answer-extra").textContent = `${item.part_of_speech} · ${item.definition_zh || "暂无中文释义"}`;
+  document.querySelector("#review-lexical-analysis").innerHTML = lexicalAnalysisHtml(item, true);
   document.querySelector("#review-answer").hidden = true;
   document.querySelector("#review-ratings").hidden = true;
   document.querySelector("#reveal-answer").hidden = false;
@@ -127,16 +190,25 @@ function renderReview() {
 }
 
 async function rateReview(rating) {
+  if (reviewSubmitting) return;
   const item = reviewItems[reviewIndex]; if (!item) return;
-  await api(`/api/reviews/${encodeURIComponent(item.card_id)}`, {method: "POST", body: JSON.stringify({rating, idempotency_key: crypto.randomUUID(), response_time_ms: Math.round(performance.now() - reviewStartedAt)})});
-  reviewIndex += 1;
-  if (reviewIndex >= reviewItems.length) {
-    document.querySelector("#review-card").hidden = true;
-    document.querySelector("#review-empty").hidden = false;
-    document.querySelector("#review-empty").textContent = `今日 ${reviewItems.length} 张卡片已完成。`;
-    notify("今日复习完成。", "success"); await loadStats(); return;
+  reviewSubmitting = true;
+  const ratingButtons = [...document.querySelectorAll("[data-rating]")];
+  ratingButtons.forEach(button => { button.disabled = true; });
+  try {
+    await api(`/api/reviews/${encodeURIComponent(item.card_id)}`, {method: "POST", body: JSON.stringify({rating, idempotency_key: crypto.randomUUID(), response_time_ms: Math.round(performance.now() - reviewStartedAt)})});
+    reviewIndex += 1;
+    if (reviewIndex >= reviewItems.length) {
+      document.querySelector("#review-card").hidden = true;
+      document.querySelector("#review-empty").hidden = false;
+      document.querySelector("#review-empty").textContent = `今日 ${reviewItems.length} 张卡片已完成。`;
+      notify("今日复习完成。", "success"); await loadStats(); return;
+    }
+    renderReview();
+  } finally {
+    reviewSubmitting = false;
+    ratingButtons.forEach(button => { button.disabled = false; });
   }
-  renderReview();
 }
 
 async function searchVocabulary(event) {
@@ -148,7 +220,7 @@ async function searchVocabulary(event) {
   if (!data.items.length) { container.innerHTML = '<div class="empty-state">没有匹配词义。</div>'; return; }
   container.replaceChildren(...data.items.map(item => {
     const card = document.createElement("article"); card.className = "result-card";
-    card.innerHTML = `<div><h3>${escapeHtml(item.lemma)}</h3><span>${escapeHtml(item.part_of_speech)}</span></div><div class="result-pronunciation pronunciation">${pronunciationHtml(item)}</div><p>${escapeHtml(item.definition_en)}</p><small>识别 ${Math.round(item.recognition_score * 100)}% · 回忆 ${Math.round(item.recall_score * 100)}% · 来源 ${escapeHtml(item.source)}</small>`;
+    card.innerHTML = `<div><h3>${escapeHtml(item.lemma)}</h3><span>${escapeHtml(item.part_of_speech)}</span></div><div class="result-pronunciation pronunciation">${pronunciationHtml(item)}</div><p>${escapeHtml(item.definition_en)}</p><small>识别 ${Math.round(item.recognition_score * 100)}% · 回忆 ${Math.round(item.recall_score * 100)}% · 来源 ${escapeHtml(item.source)}</small>${lexicalAnalysisHtml(item)}`;
     return card;
   }));
 }

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .database import LearningDatabase
+from .lexical_analysis import LexicalAnalysisService
 from .pronunciation import PronunciationService
 
 
@@ -408,9 +409,18 @@ class LearningService:
         now = now or utc_now()
         now_text = iso(now)
         with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             collection_id, collection_selection = self._resolve_collection_id(
                 connection, collection_id
             )
+            collection_key = collection_id or "__all__"
+            existing_plan = connection.execute(
+                """
+                SELECT * FROM daily_plans
+                WHERE plan_date = ? AND collection_key = ?
+                """,
+                (now.date().isoformat(), collection_key),
+            ).fetchone()
             due_count = int(
                 connection.execute(
                     """
@@ -420,6 +430,37 @@ class LearningService:
                     (now_text,),
                 ).fetchone()[0]
             )
+            if existing_plan:
+                plan_rows = self._daily_plan_rows(
+                    connection, existing_plan["id"], now_text
+                )
+                review_items = [
+                    self._card_dict(row)
+                    for row in plan_rows
+                    if row["item_kind"] == "review"
+                ]
+                new_items = [
+                    self._card_dict(row)
+                    for row in plan_rows
+                    if row["item_kind"] == "new"
+                ]
+                response = {
+                    "generated_at": existing_plan["created_at"],
+                    "due_count": due_count,
+                    "review_limit": existing_plan["review_limit"],
+                    "requested_new_limit": existing_plan["new_limit"],
+                    "effective_new_limit": existing_plan["effective_new_limit"],
+                    "collection_id": collection_id,
+                    "collection_selection": collection_selection,
+                    "reused_plan": True,
+                    "reviews": review_items,
+                    "new_items": new_items,
+                }
+                connection.commit()
+                self._attach_pronunciations(review_items + new_items)
+                self._attach_lexical_analyses(review_items + new_items)
+                return response
+
             effective_new_limit = new_limit
             if due_count >= backlog_stop_at:
                 effective_new_limit = 0
@@ -443,54 +484,36 @@ class LearningService:
             if collection_id:
                 candidates = connection.execute(
                     """
-                    SELECT ws.*, wsc.collection_id,
-                           wsc.priority_rank AS collection_rank,
-                           wsc.sense_rank AS collection_sense_rank
-                    FROM word_senses ws
-                    JOIN word_sense_collections wsc ON wsc.sense_id = ws.id
-                    LEFT JOIN user_knowledge_states uks ON uks.sense_id = ws.id
-                    WHERE wsc.collection_id = ?
-                      AND COALESCE(uks.recognition_score, 0.0) < 0.7
-                      AND NOT EXISTS (
-                          SELECT 1 FROM review_cards rc WHERE rc.sense_id = ws.id
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM word_senses earlier_ws
-                          JOIN word_sense_collections earlier_wsc
-                            ON earlier_wsc.sense_id = earlier_ws.id
-                          LEFT JOIN user_knowledge_states earlier_uks
-                            ON earlier_uks.sense_id = earlier_ws.id
-                          WHERE earlier_wsc.collection_id = wsc.collection_id
-                            AND earlier_ws.normalized_lemma = ws.normalized_lemma
-                            AND COALESCE(earlier_uks.recognition_score, 0.0) < 0.7
-                            AND NOT EXISTS (
-                                SELECT 1 FROM review_cards earlier_rc
-                                WHERE earlier_rc.sense_id = earlier_ws.id
-                            )
-                            AND (
-                                earlier_wsc.priority_rank < wsc.priority_rank
-                                OR (
-                                    earlier_wsc.priority_rank = wsc.priority_rank
-                                    AND earlier_wsc.sense_rank < wsc.sense_rank
-                                )
-                                OR (
-                                    earlier_wsc.priority_rank = wsc.priority_rank
-                                    AND earlier_wsc.sense_rank = wsc.sense_rank
-                                    AND earlier_ws.id < ws.id
-                                )
-                            )
-                      )
+                    WITH eligible AS (
+                        SELECT ws.*, wsc.collection_id,
+                               wsc.priority_rank AS collection_rank,
+                               wsc.sense_rank AS collection_sense_rank,
+                               COALESCE(uks.recognition_score, 0.0)
+                                   AS mastery_score,
+                               COALESCE(uks.recognition_evidence_count, 0)
+                                   AS mastery_evidence,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY ws.normalized_lemma
+                                   ORDER BY wsc.priority_rank, wsc.sense_rank, ws.id
+                               ) AS lemma_order
+                        FROM word_senses ws
+                        JOIN word_sense_collections wsc ON wsc.sense_id = ws.id
+                        LEFT JOIN user_knowledge_states uks ON uks.sense_id = ws.id
+                        WHERE wsc.collection_id = ?
+                          AND COALESCE(uks.recognition_score, 0.0) < 0.7
+                          AND NOT EXISTS (
+                              SELECT 1 FROM review_cards rc WHERE rc.sense_id = ws.id
+                          )
+                    )
+                    SELECT * FROM eligible
+                    WHERE lemma_order = 1
                     ORDER BY
-                        CASE
-                            WHEN COALESCE(uks.recognition_evidence_count, 0) > 0 THEN 0
-                            ELSE 1
-                        END,
-                        COALESCE(uks.recognition_score, 0.0),
-                        wsc.priority_rank,
-                        wsc.sense_rank,
-                        ws.normalized_lemma,
-                        ws.id
+                        CASE WHEN mastery_evidence > 0 THEN 0 ELSE 1 END,
+                        mastery_score,
+                        collection_rank,
+                        collection_sense_rank,
+                        normalized_lemma,
+                        id
                     LIMIT ?
                     """,
                     (collection_id, effective_new_limit),
@@ -498,57 +521,47 @@ class LearningService:
             else:
                 candidates = connection.execute(
                     """
-                    SELECT ws.* FROM word_senses ws
-                    LEFT JOIN user_knowledge_states uks ON uks.sense_id = ws.id
-                    WHERE ws.frequency_rank IS NOT NULL
-                      AND COALESCE(uks.recognition_score, 0.0) < 0.7
-                      AND NOT EXISTS (
-                          SELECT 1 FROM review_cards rc WHERE rc.sense_id = ws.id
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM word_senses earlier_ws
-                          LEFT JOIN user_knowledge_states earlier_uks
-                            ON earlier_uks.sense_id = earlier_ws.id
-                          WHERE earlier_ws.normalized_lemma = ws.normalized_lemma
-                            AND earlier_ws.frequency_rank IS NOT NULL
-                            AND COALESCE(earlier_uks.recognition_score, 0.0) < 0.7
-                            AND NOT EXISTS (
-                                SELECT 1 FROM review_cards earlier_rc
-                                WHERE earlier_rc.sense_id = earlier_ws.id
-                            )
-                            AND (
-                                earlier_ws.frequency_rank < ws.frequency_rank
-                                OR (
-                                    earlier_ws.frequency_rank = ws.frequency_rank
-                                    AND earlier_ws.id < ws.id
-                                )
-                            )
-                      )
+                    WITH eligible AS (
+                        SELECT ws.*,
+                               COALESCE(uks.recognition_score, 0.0)
+                                   AS mastery_score,
+                               COALESCE(uks.recognition_evidence_count, 0)
+                                   AS mastery_evidence,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY ws.normalized_lemma
+                                   ORDER BY ws.frequency_rank, ws.id
+                               ) AS lemma_order
+                        FROM word_senses ws
+                        LEFT JOIN user_knowledge_states uks ON uks.sense_id = ws.id
+                        WHERE ws.frequency_rank IS NOT NULL
+                          AND COALESCE(uks.recognition_score, 0.0) < 0.7
+                          AND NOT EXISTS (
+                              SELECT 1 FROM review_cards rc WHERE rc.sense_id = ws.id
+                          )
+                    )
+                    SELECT * FROM eligible
+                    WHERE lemma_order = 1
                     ORDER BY
-                        CASE
-                            WHEN COALESCE(uks.recognition_evidence_count, 0) > 0 THEN 0
-                            ELSE 1
-                        END,
-                        COALESCE(uks.recognition_score, 0.0),
+                        CASE WHEN mastery_evidence > 0 THEN 0 ELSE 1 END,
+                        mastery_score,
                         CASE
                             WHEN EXISTS (
                                 SELECT 1
                                 FROM word_sense_collections ordering_wsc
                                 JOIN vocabulary_collections ordering_vc
                                   ON ordering_vc.id = ordering_wsc.collection_id
-                                WHERE ordering_wsc.sense_id = ws.id
+                                WHERE ordering_wsc.sense_id = eligible.id
                                   AND ordering_vc.kind = 'general'
                             ) THEN 0
                             WHEN NOT EXISTS (
                                 SELECT 1 FROM word_sense_collections ordering_wsc
-                                WHERE ordering_wsc.sense_id = ws.id
+                                WHERE ordering_wsc.sense_id = eligible.id
                             ) THEN 1
                             ELSE 2
                         END,
-                        ws.frequency_rank,
-                        ws.normalized_lemma,
-                        ws.id
+                        frequency_rank,
+                        normalized_lemma,
+                        id
                     LIMIT ?
                     """,
                     (effective_new_limit,),
@@ -569,9 +582,44 @@ class LearningService:
                 item.update({"card_id": card_id, "card_type": "recognition"})
                 new_items.append(item)
 
+            plan_id = str(uuid.uuid4())
+            connection.execute(
+                """
+                INSERT INTO daily_plans(
+                    id, plan_date, collection_key, collection_id, review_limit,
+                    new_limit, effective_new_limit, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    plan_id,
+                    now.date().isoformat(),
+                    collection_key,
+                    collection_id,
+                    review_limit,
+                    new_limit,
+                    effective_new_limit,
+                    now_text,
+                ),
+            )
+            plan_cards = [
+                (row["id"], "review") for row in due_rows
+            ] + [
+                (item["card_id"], "new") for item in new_items
+            ]
+            connection.executemany(
+                """
+                INSERT INTO daily_plan_items(plan_id, card_id, item_order, item_kind)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (plan_id, card_id, item_order, item_kind)
+                    for item_order, (card_id, item_kind) in enumerate(plan_cards)
+                ],
+            )
+
         review_items = [self._card_dict(row) for row in due_rows]
-        self._attach_pronunciations(review_items)
-        self._attach_pronunciations(new_items)
+        self._attach_pronunciations(review_items + new_items)
+        self._attach_lexical_analyses(review_items + new_items)
         return {
             "generated_at": now_text,
             "due_count": due_count,
@@ -580,9 +628,29 @@ class LearningService:
             "effective_new_limit": effective_new_limit,
             "collection_id": collection_id,
             "collection_selection": collection_selection,
+            "reused_plan": False,
             "reviews": review_items,
             "new_items": new_items,
         }
+
+    @staticmethod
+    def _daily_plan_rows(
+        connection: sqlite3.Connection, plan_id: str, now_text: str
+    ) -> list[sqlite3.Row]:
+        return connection.execute(
+            """
+            SELECT dpi.item_kind, rc.*, ws.lemma, ws.part_of_speech,
+                   ws.definition_en, ws.definition_zh, ws.frequency_rank,
+                   ws.source, ws.source_sense_id
+            FROM daily_plan_items dpi
+            JOIN review_cards rc ON rc.id = dpi.card_id
+            JOIN word_senses ws ON ws.id = rc.sense_id
+            WHERE dpi.plan_id = ?
+              AND rc.state != 'suspended' AND rc.due_at <= ?
+            ORDER BY dpi.item_order
+            """,
+            (plan_id, now_text),
+        ).fetchall()
 
     def record_review(
         self,
@@ -676,6 +744,12 @@ class LearningService:
             pronunciations = int(
                 connection.execute("SELECT COUNT(*) FROM word_pronunciations").fetchone()[0]
             )
+            lexical_relations = int(
+                connection.execute("SELECT COUNT(*) FROM lexical_relations").fetchone()[0]
+            )
+            lexical_analyses = int(
+                connection.execute("SELECT COUNT(*) FROM lexical_analyses").fetchone()[0]
+            )
             assessed = int(
                 connection.execute("SELECT COUNT(DISTINCT sense_id) FROM assessment_events").fetchone()[0]
             )
@@ -710,6 +784,8 @@ class LearningService:
         return {
             "vocabulary_senses": vocabulary,
             "pronunciations": pronunciations,
+            "lexical_relations": lexical_relations,
+            "lexical_analyses": lexical_analyses,
             "assessed_senses": assessed,
             "tracked_senses": int(states["tracked"]),
             "due_reviews": due,
@@ -782,18 +858,40 @@ class LearningService:
             )
             items.append(item)
         self._attach_pronunciations(items)
+        self._attach_lexical_analyses(items)
         return {"query": query, "count": len(items), "items": items}
 
     def _attach_pronunciations(self, items: list[dict]) -> None:
         pronunciation_service = PronunciationService(self.database)
-        cache: dict[tuple[str, str | None], list[dict]] = {}
+        pronunciations = pronunciation_service.lookup_many(
+            [(item["lemma"], item.get("part_of_speech")) for item in items]
+        )
         for item in items:
-            key = (item["lemma"], item.get("part_of_speech"))
-            if key not in cache:
-                cache[key] = pronunciation_service.lookup(
-                    key[0], part_of_speech=key[1]
+            key = (
+                " ".join(item["lemma"].casefold().strip().split()),
+                item.get("part_of_speech"),
+            )
+            item["pronunciations"] = pronunciations.get(key, [])
+
+    def _attach_lexical_analyses(self, items: list[dict]) -> None:
+        lexical_service = LexicalAnalysisService(self.database)
+        analyses = lexical_service.lookup_many(
+            [
+                (
+                    item["lemma"],
+                    item.get("part_of_speech"),
+                    item.get("source_sense_id"),
                 )
-            item["pronunciations"] = cache[key]
+                for item in items
+            ]
+        )
+        for item in items:
+            key = (
+                " ".join(item["lemma"].casefold().strip().split()),
+                item.get("part_of_speech"),
+                item.get("source_sense_id"),
+            )
+            item["lexical_analysis"] = analyses[key]
 
     @staticmethod
     def _resolve_collection_id(

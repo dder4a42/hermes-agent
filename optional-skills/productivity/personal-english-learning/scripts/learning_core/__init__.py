@@ -2,6 +2,7 @@
 
 from .database import LearningDatabase
 from .exam import ExamService
+from .lexical_analysis import LexicalAnalysisService
 from .production import ProductionService
 from .pronunciation import PronunciationService
 from .reading import ReadingService
@@ -20,6 +21,7 @@ __all__ = [
     "LearningDatabase",
     "ExamService",
     "LearningService",
+    "LexicalAnalysisService",
     "VocabularyCollection",
     "ProductionService",
     "PronunciationService",

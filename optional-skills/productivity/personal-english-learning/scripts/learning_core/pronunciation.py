@@ -277,15 +277,68 @@ class PronunciationService:
                 """,
                 (normalized, dialect, part_of_speech, part_of_speech, limit),
             ).fetchall()
-        return [
-            {
-                "dialect": row["dialect"],
-                "ipa": row["ipa"],
-                "respelling": row["respelling"],
-                "arpabet": row["arpabet"],
-                "stress_pattern": row["stress_pattern"],
-                "variant_rank": row["variant_rank"],
-                "source": row["source"],
-            }
-            for row in rows
-        ]
+        return [self._row_dict(row) for row in rows]
+
+    def lookup_many(
+        self,
+        items: list[tuple[str, str | None]],
+        *,
+        dialect: str = "en-US",
+        limit_per_form: int = 4,
+    ) -> dict[tuple[str, str | None], list[dict]]:
+        """Load pronunciations for several form/POS pairs with one connection."""
+
+        keys = list(
+            dict.fromkeys(
+                (" ".join(form.casefold().strip().split()), part_of_speech)
+                for form, part_of_speech in items
+                if form.strip()
+            )
+        )
+        result = {key: [] for key in keys}
+        if not keys:
+            return result
+        forms = list(dict.fromkeys(form for form, _part_of_speech in keys))
+        placeholders = ", ".join("?" for _form in forms)
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM word_pronunciations
+                WHERE normalized_form IN ({placeholders}) AND dialect = ?
+                ORDER BY normalized_form, variant_rank, source, source_entry_id
+                """,
+                (*forms, dialect),
+            ).fetchall()
+        by_form: dict[str, list] = {form: [] for form in forms}
+        for row in rows:
+            by_form[row["normalized_form"]].append(row)
+        for key in keys:
+            form, part_of_speech = key
+            matching = [
+                row
+                for row in by_form[form]
+                if row["part_of_speech"] is None
+                or row["part_of_speech"] == part_of_speech
+            ]
+            matching.sort(
+                key=lambda row: (
+                    0 if row["part_of_speech"] == part_of_speech else 1,
+                    row["variant_rank"],
+                    row["source"],
+                    row["source_entry_id"],
+                )
+            )
+            result[key] = [self._row_dict(row) for row in matching[:limit_per_form]]
+        return result
+
+    @staticmethod
+    def _row_dict(row) -> dict:
+        return {
+            "dialect": row["dialect"],
+            "ipa": row["ipa"],
+            "respelling": row["respelling"],
+            "arpabet": row["arpabet"],
+            "stress_pattern": row["stress_pattern"],
+            "variant_rank": row["variant_rank"],
+            "source": row["source"],
+        }

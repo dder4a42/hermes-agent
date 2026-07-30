@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 
 
 KNOWLEDGE_EVIDENCE_TABLE = """
@@ -47,6 +47,9 @@ CREATE TABLE IF NOT EXISTS word_senses (
 
 CREATE INDEX IF NOT EXISTS idx_word_senses_frequency
     ON word_senses(frequency_rank, normalized_lemma);
+
+CREATE INDEX IF NOT EXISTS idx_word_senses_lemma_priority
+    ON word_senses(normalized_lemma, frequency_rank, id);
 
 CREATE TABLE IF NOT EXISTS word_pronunciations (
     id TEXT PRIMARY KEY,
@@ -141,6 +144,30 @@ CREATE TABLE IF NOT EXISTS review_cards (
 
 CREATE INDEX IF NOT EXISTS idx_review_cards_due
     ON review_cards(state, due_at);
+
+CREATE TABLE IF NOT EXISTS daily_plans (
+    id TEXT PRIMARY KEY,
+    plan_date TEXT NOT NULL,
+    collection_key TEXT NOT NULL,
+    collection_id TEXT REFERENCES vocabulary_collections(id) ON DELETE CASCADE,
+    review_limit INTEGER NOT NULL CHECK (review_limit >= 0),
+    new_limit INTEGER NOT NULL CHECK (new_limit >= 0),
+    effective_new_limit INTEGER NOT NULL CHECK (effective_new_limit >= 0),
+    created_at TEXT NOT NULL,
+    UNIQUE (plan_date, collection_key)
+);
+
+CREATE TABLE IF NOT EXISTS daily_plan_items (
+    plan_id TEXT NOT NULL REFERENCES daily_plans(id) ON DELETE CASCADE,
+    card_id TEXT NOT NULL REFERENCES review_cards(id) ON DELETE CASCADE,
+    item_order INTEGER NOT NULL CHECK (item_order >= 0),
+    item_kind TEXT NOT NULL CHECK (item_kind IN ('review', 'new')),
+    PRIMARY KEY (plan_id, card_id),
+    UNIQUE (plan_id, item_order)
+);
+
+CREATE INDEX IF NOT EXISTS idx_daily_plan_items_plan
+    ON daily_plan_items(plan_id, item_order);
 
 CREATE TABLE IF NOT EXISTS review_events (
     id TEXT PRIMARY KEY,
@@ -243,6 +270,70 @@ CREATE TABLE IF NOT EXISTS production_attempts (
 
 CREATE INDEX IF NOT EXISTS idx_production_attempts_exercise
     ON production_attempts(exercise_id, created_at);
+
+CREATE TABLE IF NOT EXISTS lexical_relations (
+    id TEXT PRIMARY KEY,
+    source_form TEXT NOT NULL,
+    source_part_of_speech TEXT,
+    source_sense_id TEXT,
+    target_form TEXT NOT NULL,
+    target_part_of_speech TEXT,
+    target_sense_id TEXT,
+    relation_type TEXT NOT NULL CHECK (
+        relation_type IN ('derivation', 'word_family', 'inflection', 'compound', 'related')
+    ),
+    affix TEXT,
+    confidence REAL NOT NULL CHECK (confidence BETWEEN 0.0 AND 1.0),
+    source_level TEXT NOT NULL CHECK (
+        source_level IN ('authoritative', 'deterministic', 'llm_inferred')
+    ),
+    source TEXT NOT NULL,
+    source_version TEXT NOT NULL,
+    source_license TEXT NOT NULL,
+    source_entry_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (source, source_entry_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lexical_relations_source
+    ON lexical_relations(source_form, source_part_of_speech, relation_type);
+
+CREATE INDEX IF NOT EXISTS idx_lexical_relations_target
+    ON lexical_relations(target_form, target_part_of_speech, relation_type);
+
+CREATE TABLE IF NOT EXISTS lexical_analyses (
+    id TEXT PRIMARY KEY,
+    normalized_form TEXT NOT NULL,
+    part_of_speech TEXT,
+    source_sense_id TEXT,
+    analysis_type TEXT NOT NULL CHECK (
+        analysis_type IN ('modern_morphology', 'historical_etymology')
+    ),
+    status TEXT NOT NULL CHECK (
+        status IN ('available', 'not_found', 'ambiguous', 'opaque')
+    ),
+    source_level TEXT NOT NULL CHECK (
+        source_level IN ('authoritative', 'deterministic', 'llm_inferred')
+    ),
+    content_json TEXT NOT NULL,
+    explanation_zh TEXT,
+    confidence REAL NOT NULL CHECK (confidence BETWEEN 0.0 AND 1.0),
+    source TEXT NOT NULL,
+    source_version TEXT NOT NULL,
+    source_license TEXT NOT NULL,
+    source_entry_id TEXT NOT NULL,
+    model_name TEXT,
+    prompt_version TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (source, source_entry_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_lexical_analyses_lookup
+    ON lexical_analyses(
+        normalized_form, part_of_speech, source_sense_id,
+        analysis_type, source_level, confidence
+    );
 """
 
 
@@ -257,12 +348,12 @@ class LearningDatabase:
         connection = sqlite3.connect(self.path, timeout=10.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA busy_timeout = 10000")
         return connection
 
     def initialize(self) -> None:
         with self.connect() as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(SCHEMA)
             self._migrate_v3(connection)
             self._migrate_v4(connection)

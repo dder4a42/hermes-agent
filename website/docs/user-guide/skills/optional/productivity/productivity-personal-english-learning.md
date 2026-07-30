@@ -16,7 +16,7 @@ Use when a learner wants to assess, expand, or review English vocabulary with a 
 |---|---|
 | Source | Optional — install with `hermes skills install official/productivity/personal-english-learning` |
 | Path | `optional-skills/productivity/personal-english-learning` |
-| Version | `0.2.0` |
+| Version | `0.3.0` |
 | Author | Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
@@ -188,7 +188,9 @@ python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_
 
 One OEWN sense may belong to both collections. The importer stores one sense
 and two memberships; academic rank never overwrites general frequency. A daily
-plan introduces at most one new sense of the same lemma at a time.
+plan introduces at most one new sense of the same lemma at a time. The first
+plan for a date and collection is persisted; repeated loads restore unfinished
+cards instead of silently adding another batch.
 
 Import American pronunciations from a pinned CMUdict `cmudict.dict` file after
 the vocabulary is present. The importer keeps only forms used by the local
@@ -208,6 +210,51 @@ store it as a property of one WordNet sense. CMUdict is American English and
 does not label part of speech, so POS-specific dictionary IPA may supersede a
 generic CMU variant when such a source is added later. The web UI displays IPA,
 respelling, or both; primary stress is capitalized in respelling.
+
+Import the sense-aware OEWN derivational relations after vocabulary import:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  relations-import-oewn /data/english-wordnet-2025-json.zip \
+  --source-version 2025 \
+  --source-license CC-BY-4.0
+```
+
+Use `analysis-lookup derive --part-of-speech verb` to retrieve its word family,
+stored morphology/etymology, and the two `needs_inference` flags. Prefer an
+authoritative source, then a deterministic analysis. When a needed analysis is
+missing or disproportionately expensive to retrieve, the active Hermes model
+may produce one structured inference and cache it with `analysis-upsert PATH`.
+The JSON file must contain one object like:
+
+```json
+{
+  "form": "unpredictable",
+  "part_of_speech": "adjective",
+  "analysis_type": "modern_morphology",
+  "status": "available",
+  "source_level": "llm_inferred",
+  "content": {
+    "segments": [
+      {"form": "un-", "type": "prefix", "meaning": "not"},
+      {"form": "predict", "type": "base", "meaning": "say in advance"},
+      {"form": "-able", "type": "suffix", "meaning": "capable of"}
+    ],
+    "compositionality": "transparent"
+  },
+  "explanation_zh": "由否定前缀、词基和形容词后缀构成。",
+  "confidence": 0.91,
+  "model_name": "ACTUAL_MODEL_NAME",
+  "prompt_version": "lexical-analysis-v1"
+}
+```
+
+Do not present inferred exact dates, first attestations, or reconstructed
+historical forms as facts. For modern morphology, cache only results with
+confidence at least 0.60; describe results below 0.80 as possible analyses.
+For historical etymology, require at least 0.75. Keep `not_found`, `ambiguous`,
+and `opaque` distinct from an empty result. A later authoritative import may
+supersede an LLM record without deleting its provenance.
 
 For a basic learner, draw new items from the general collection first:
 

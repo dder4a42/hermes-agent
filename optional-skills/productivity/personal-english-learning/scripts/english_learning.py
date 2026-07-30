@@ -13,6 +13,7 @@ from pathlib import Path
 from learning_core import (
     CollectionSpec,
     ExamService,
+    LexicalAnalysisService,
     LearningDatabase,
     LearningService,
     PronunciationService,
@@ -78,6 +79,27 @@ def build_parser() -> argparse.ArgumentParser:
     pronunciation_lookup.add_argument("word")
     pronunciation_lookup.add_argument("--part-of-speech")
     pronunciation_lookup.add_argument("--dialect", default="en-US")
+
+    relation_import = commands.add_parser(
+        "relations-import-oewn",
+        help="Import derivational word-family relations from OEWN JSON",
+    )
+    relation_import.add_argument("path", type=Path)
+    relation_import.add_argument("--source-version", default="2025")
+    relation_import.add_argument("--source-license", default="CC-BY-4.0")
+
+    analysis_upsert = commands.add_parser(
+        "analysis-upsert",
+        help="Validate and cache one authoritative, deterministic, or LLM analysis",
+    )
+    analysis_upsert.add_argument("path", type=Path)
+
+    analysis_lookup = commands.add_parser(
+        "analysis-lookup", help="Look up word family, morphology, and etymology"
+    )
+    analysis_lookup.add_argument("word")
+    analysis_lookup.add_argument("--part-of-speech")
+    analysis_lookup.add_argument("--source-sense-id")
 
     add = commands.add_parser("add-sense", help="Add or update one word sense")
     add.add_argument("--lemma", required=True)
@@ -270,6 +292,23 @@ def run(args: argparse.Namespace) -> dict:
             dialect=args.dialect,
         )
         return {"word": args.word, "count": len(pronunciations), "items": pronunciations}
+    if args.command == "relations-import-oewn":
+        return LexicalAnalysisService(service.database).import_oewn_derivations(
+            args.path,
+            source_version=args.source_version,
+            source_license=args.source_license,
+        )
+    if args.command == "analysis-upsert":
+        payload = json.loads(args.path.expanduser().read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("analysis input must be one JSON object")
+        return LexicalAnalysisService(service.database).upsert_analysis(payload)
+    if args.command == "analysis-lookup":
+        return LexicalAnalysisService(service.database).lookup(
+            args.word,
+            part_of_speech=args.part_of_speech,
+            source_sense_id=args.source_sense_id,
+        )
     if args.command == "add-sense":
         return service.upsert_vocabulary(
             VocabularyEntry(

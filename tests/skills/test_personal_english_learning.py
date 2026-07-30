@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from learning_core import (
     CollectionSpec,
     ExamService,
     LearningDatabase,
+    LexicalAnalysisService,
     LearningService,
     PronunciationService,
     ProductionService,
@@ -92,7 +94,16 @@ def _wordnet_fixture(path: Path) -> Path:
         },
         "derive": {
             "v": {
-                "sense": [{"id": "derive%2:40:00::", "synset": "derive-v-1"}]
+                "sense": [
+                    {
+                        "id": "derive%2:40:00::",
+                        "synset": "derive-v-1",
+                        "derivation": [
+                            "derivation%1:22:00::",
+                            "derivative%5:00:00:derived:00",
+                        ],
+                    }
+                ]
             }
         },
     }
@@ -253,18 +264,64 @@ def test_daily_plan_reduces_then_stops_new_items_for_review_backlog(
         review_limit=0,
         backlog_reduce_at=30,
         backlog_stop_at=60,
-        now=NOW,
+        now=NOW + timedelta(days=1),
     )
     assert reduced["due_count"] == 35
     assert reduced["effective_new_limit"] == 4
     assert len(reduced["new_items"]) == 4
 
-    service.daily_plan(new_limit=30, review_limit=0, now=NOW)
-    service.daily_plan(new_limit=30, review_limit=0, now=NOW)
-    stopped = service.daily_plan(new_limit=8, review_limit=0, now=NOW)
+    service.daily_plan(new_limit=30, review_limit=0, now=NOW + timedelta(days=2))
+    service.daily_plan(new_limit=30, review_limit=0, now=NOW + timedelta(days=3))
+    stopped = service.daily_plan(
+        new_limit=8, review_limit=0, now=NOW + timedelta(days=4)
+    )
     assert stopped["due_count"] >= 60
     assert stopped["effective_new_limit"] == 0
     assert stopped["new_items"] == []
+
+
+def test_daily_plan_is_idempotent_for_date_and_collection(
+    service: LearningService,
+) -> None:
+    seed(service, list(range(1, 21)))
+
+    first = service.daily_plan(new_limit=8, review_limit=30, now=NOW)
+    repeated = service.daily_plan(new_limit=20, review_limit=100, now=NOW)
+
+    assert first["reused_plan"] is False
+    assert repeated["reused_plan"] is True
+    assert repeated["requested_new_limit"] == 8
+    assert [item["card_id"] for item in repeated["new_items"]] == [
+        item["card_id"] for item in first["new_items"]
+    ]
+    with service.database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM daily_plans").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM review_cards").fetchone()[0] == 8
+
+
+def test_concurrent_daily_plan_requests_create_one_plan(
+    service: LearningService,
+) -> None:
+    seed(service, list(range(1, 21)))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda _index: service.daily_plan(
+                    new_limit=8, review_limit=30, now=NOW
+                ),
+                range(2),
+            )
+        )
+
+    assert {result["reused_plan"] for result in results} == {False, True}
+    assert {
+        tuple(item["card_id"] for item in result["new_items"])
+        for result in results
+    } == {tuple(item["card_id"] for item in results[0]["new_items"])}
+    with service.database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM daily_plans").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM review_cards").fetchone()[0] == 8
 
 
 def test_daily_plan_prioritizes_assessed_gap_over_unassessed_frequency(
@@ -842,6 +899,84 @@ def test_arpabet_display_conversion(
 ) -> None:
     assert arpabet_to_ipa(arpabet) == ipa
     assert arpabet_to_respelling(arpabet) == respelling
+
+
+def test_oewn_derivations_are_imported_as_source_aware_word_family(
+    service: LearningService, tmp_path: Path
+) -> None:
+    service.upsert_vocabulary(
+        VocabularyEntry(
+            lemma="derive",
+            part_of_speech="verb",
+            definition_en="obtain from a source",
+            definition_zh="从某来源获得",
+            frequency_rank=900,
+            source="oewn-2025",
+            source_sense_id="derive%2:40:00::",
+        ),
+        now=NOW,
+    )
+    wordnet = _wordnet_fixture(tmp_path / "oewn-2025.zip")
+    lexical = LexicalAnalysisService(service.database)
+
+    imported = lexical.import_oewn_derivations(wordnet)
+    repeated = lexical.import_oewn_derivations(wordnet)
+    result = lexical.lookup(
+        "derive",
+        part_of_speech="verb",
+        source_sense_id="derive%2:40:00::",
+    )
+
+    assert imported == {"created": 2, "updated": 0, "skipped": 0, "errors": []}
+    assert repeated == {"created": 0, "updated": 2, "skipped": 0, "errors": []}
+    assert {(item["form"], item["part_of_speech"]) for item in result["word_family"]} == {
+        ("derivation", "noun"),
+        ("derivative", "adjective"),
+    }
+    assert {item["source_level"] for item in result["word_family"]} == {
+        "authoritative"
+    }
+    searched = service.search_vocabulary("derive")["items"][0]
+    assert len(searched["lexical_analysis"]["word_family"]) == 2
+    assert service.stats()["lexical_relations"] == 2
+
+
+def test_llm_analysis_is_validated_cached_and_identified(
+    service: LearningService,
+) -> None:
+    lexical = LexicalAnalysisService(service.database)
+    payload = {
+        "form": "unpredictable",
+        "part_of_speech": "adjective",
+        "analysis_type": "modern_morphology",
+        "status": "available",
+        "source_level": "llm_inferred",
+        "content": {
+            "segments": [
+                {"form": "un-", "type": "prefix", "meaning": "not"},
+                {"form": "predict", "type": "base", "meaning": "say in advance"},
+                {"form": "-able", "type": "suffix", "meaning": "capable of"},
+            ],
+            "compositionality": "transparent",
+        },
+        "explanation_zh": "由否定前缀、词基和形容词后缀构成。",
+        "confidence": 0.91,
+        "model_name": "fixture-model",
+        "prompt_version": "lexical-analysis-v1",
+    }
+
+    created = lexical.upsert_analysis(payload)
+    updated = lexical.upsert_analysis(payload)
+    result = lexical.lookup("unpredictable", part_of_speech="adjective")
+
+    assert created["created"] is True
+    assert updated["created"] is False
+    assert result["needs_inference"]["modern_morphology"] is False
+    assert result["needs_inference"]["historical_etymology"] is True
+    assert result["analyses"][0]["source_level"] == "llm_inferred"
+    assert result["analyses"][0]["content"]["segments"][1]["form"] == "predict"
+    with pytest.raises(ValueError, match="model_name"):
+        lexical.upsert_analysis({**payload, "model_name": None})
 
 
 def test_learning_web_is_session_gated_and_host_restricted(tmp_path: Path) -> None:
