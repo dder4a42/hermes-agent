@@ -37,6 +37,7 @@ from learning_core import (
     ReadingService,
     ReadingTutorService,
     ReportService,
+    WritingCoachService,
     VocabularyEntry,
     VocabularyBuilder,
     frequency_rank_map,
@@ -1135,6 +1136,140 @@ def test_learning_web_serves_proactive_reading_and_distinct_review_front_style(
     assert reading.json()["source_mode"] == "source_adapted"
     assert 'data-view="reading"' in page.text
     assert 'id="review-front" class="review-front' in page.text
+
+
+def test_writing_coach_persists_feedback_and_links_revision(
+    service: LearningService,
+) -> None:
+    lesson = ReadingTutorService(service.database, generator=None).today(
+        level="B1", minutes=10, topic="science", now=NOW
+    )
+    calls: list[dict] = []
+
+    def review(payload: dict) -> dict:
+        calls.append(payload)
+        is_revision = payload["submission"]["stage"] == "revision"
+        return {
+            "summary_zh": "修改稿更清楚。" if is_revision else "主旨基本清楚。",
+            "strengths": ["抓住了模型需要根据证据调整这一点。"],
+            "issues": [] if is_revision else [
+                {
+                    "category": "grammar",
+                    "excerpt": "evidence are",
+                    "explanation_zh": "evidence 在这里是不可数名词。",
+                    "hint_zh": "检查谓语的单复数形式。",
+                }
+            ],
+            "revision_priorities": [] if is_revision else ["修正主谓一致"],
+            "traits": {
+                "content": "覆盖了文章主旨。",
+                "accuracy": "有一处主谓一致问题。" if not is_revision else "表达准确。",
+                "cohesion": "句间关系清楚。",
+                "register": "语域适合简短学术摘要。",
+            },
+        }
+
+    coach = WritingCoachService(service.database, generator=review)
+    first = coach.review(
+        lesson["lesson_id"],
+        "The evidence are important, so a model should change.",
+        "writing-1",
+        now=NOW,
+    )
+    revision = coach.review(
+        lesson["lesson_id"],
+        "The evidence is important, so a model should change.",
+        "writing-2",
+        parent_submission_id=first["submission_id"],
+        now=NOW + timedelta(minutes=5),
+    )
+    duplicate = coach.review(
+        lesson["lesson_id"],
+        "The evidence is important, so a model should change.",
+        "writing-2",
+        parent_submission_id=first["submission_id"],
+        now=NOW + timedelta(minutes=6),
+    )
+
+    assert first["stage"] == "initial"
+    assert first["feedback"]["issues"][0]["category"] == "grammar"
+    assert revision["stage"] == "revision"
+    assert revision["parent_submission_id"] == first["submission_id"]
+    assert duplicate["duplicate"] is True
+    assert len(calls) == 2
+
+
+def test_learning_items_group_cards_by_concrete_sense(service: LearningService) -> None:
+    sense_id = service.upsert_vocabulary(
+        VocabularyEntry(
+            "evidence", "noun", "supporting information", "证据", 700,
+            "fixture", "evidence.n",
+        ),
+        now=NOW,
+    )["sense_id"]
+    service.record_assessment(
+        sense_id, "unknown", "1-1000", event_id="gap", now=NOW
+    )
+    plan = service.daily_plan(new_limit=1, review_limit=0, now=NOW)
+    service.record_review(
+        plan["new_items"][0]["card_id"], "good", "review-one", now=NOW
+    )
+
+    notebook = service.learning_items(limit=20)
+
+    assert notebook["count"] == 1
+    assert notebook["items"][0]["sense_id"] == sense_id
+    assert notebook["items"][0]["lemma"] == "evidence"
+    assert notebook["items"][0]["card_types"] == ["recognition"]
+    assert notebook["items"][0]["next_review_at"] is not None
+
+
+def test_learning_web_exposes_writing_review_and_separate_word_views(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "learning.db"
+    feedback = {
+        "summary_zh": "主旨清楚。",
+        "strengths": ["表达简洁。"],
+        "issues": [],
+        "revision_priorities": [],
+        "traits": {
+            "content": "覆盖主旨。", "accuracy": "准确。",
+            "cohesion": "连贯。", "register": "语域合适。",
+        },
+    }
+    app = create_app(
+        database,
+        session_token="test-session-token",
+        writing_generator=lambda _payload: feedback,
+    )
+    lesson = ReadingTutorService(
+        LearningDatabase(database), generator=None
+    ).today(level="B1", minutes=10, topic="science", now=NOW)
+
+    async def exercise_app():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1",
+            headers={SESSION_HEADER: "test-session-token"},
+        ) as client:
+            return await client.get("/"), await client.post(
+                "/api/writing/review",
+                json={
+                    "lesson_id": lesson["lesson_id"],
+                    "text": "A model should change when evidence changes.",
+                    "idempotency_key": "web-writing-1",
+                },
+            ), await client.get("/api/vocabulary/notebook")
+
+    page, reviewed, notebook = asyncio.run(exercise_app())
+
+    assert reviewed.status_code == 200
+    assert reviewed.json()["feedback"]["summary_zh"] == "主旨清楚。"
+    assert notebook.status_code == 200
+    assert 'data-view="learn"' in page.text
+    assert 'data-view="review"' in page.text
+    assert 'data-view="notebook"' in page.text
 
 
 def test_learning_web_refuses_public_bind_without_touching_database(

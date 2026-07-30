@@ -1,7 +1,7 @@
 ---
 name: personal-english-learning
 description: Use when a learner wants to assess, expand, or review English vocabulary with a private profile-local SQLite learning history. Prioritize high-frequency concrete word senses, Chinese-supported explanations, small daily loads, and deterministic review scheduling.
-version: 0.3.0
+version: 0.4.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -112,6 +112,12 @@ NCBI Bookshelf, adds current low-recognition senses to the teaching brief, and
 asks the configured Hermes model for a level-adjusted lesson. The result is
 cached in the profile-local SQLite database. If model generation is unavailable
 or invalid, the UI serves the curated seed instead of failing the session.
+
+The vocabulary workflow has three separate views backed by one daily plan:
+`新词学习` presents only newly assigned senses with definitions and lexical
+analysis, `到期复习` presents only previously learned due cards, and `生词本`
+groups recognition/recall cards by concrete sense. Do not call the plan endpoint
+again to compensate for a short list; its persisted workload is authoritative.
 
 The page uses an in-memory session token injected into the page and rejects
 non-loopback Host headers. The token is not a substitute for TLS and must not be
@@ -390,8 +396,24 @@ topic, collection, target senses, and prompt version restores the cached lesson.
 
 Use 5 or 10 minutes at A2/B1 initially. Move toward B2 material after the learner
 can complete the short summary without creating an unmanageable vocabulary
-backlog. The browser stores the current draft locally; it is not yet submitted
-as production evidence in this MVP slice.
+backlog. The browser keeps the draft locally until it is submitted for feedback.
+
+#### Review and revise a Reading Tutor response
+
+The Reading Tutor writing box uses a two-stage workflow. On the initial
+submission, the configured Hermes model returns structured feedback with:
+
+- a concise Chinese summary and strengths;
+- exact excerpts classified as grammar, collocation, register, cohesion,
+  content, or word choice;
+- an explanation and a hint, but not a rewritten full answer;
+- comments on content, accuracy, cohesion, and register.
+
+The learner edits the original text and submits a revision. The revision is an
+immutable child of the first submission and must be reviewed against the
+previous feedback. Never overwrite the initial answer. Feedback is learning
+guidance, not an official score. If model feedback is unavailable, keep the
+browser draft and retry later; do not manufacture a successful review.
 
 When the learner provides their own text, use the deterministic analyzer below.
 

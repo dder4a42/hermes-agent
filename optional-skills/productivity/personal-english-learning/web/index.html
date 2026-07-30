@@ -17,7 +17,9 @@
       <nav aria-label="学习导航">
         <button class="nav-item active" data-view="home">今日学习</button>
         <button class="nav-item" data-view="assessment">基础评估</button>
-        <button class="nav-item" data-view="review">词汇复习</button>
+        <button class="nav-item" data-view="learn">新词学习</button>
+        <button class="nav-item" data-view="review">到期复习</button>
+        <button class="nav-item" data-view="notebook">生词本</button>
         <button class="nav-item" data-view="reading">阅读私教</button>
         <button class="nav-item" data-view="vocabulary">词库查询</button>
         <button class="nav-item" data-view="progress">学习进度</button>
@@ -48,7 +50,7 @@
         <div class="hero">
           <div><p class="eyebrow">DAILY FOCUS</p><h2>少量、准确、持续。</h2>
             <p>先确认认识程度，再开始今天的复习。基础阶段默认每天最多 8 个新词义。</p></div>
-          <button class="primary" data-go="review">开始今日学习</button>
+          <button class="primary" data-go="learn">开始今日学习</button>
         </div>
         <div class="metrics" id="home-metrics">
           <article><span>待复习</span><strong id="metric-due">—</strong><small>张卡片</small></article>
@@ -85,10 +87,29 @@
         </article>
       </section>
 
+      <section class="view" id="view-learn">
+        <div class="section-intro"><div><h2>今天的新词</h2><p>先学习核心词义和语境信息，再做一次初始自评；不会混入到期复习。</p></div>
+          <button id="learning-start" class="primary">载入新词任务</button></div>
+        <div id="learning-empty" class="empty-state">尚未载入。新词数量仍由每日计划和复习积压决定。</div>
+        <article id="learning-card" class="study-card learning-card" hidden>
+          <div class="card-meta"><span>新词学习</span><span id="learning-progress"></span></div>
+          <h2 id="learning-lemma" class="word-front"></h2>
+          <p id="learning-pos" class="part-of-speech"></p>
+          <p id="learning-pronunciation" class="pronunciation"></p>
+          <div class="learning-meaning"><p id="learning-definition-en"></p><p id="learning-definition-zh"></p></div>
+          <div id="learning-lexical-analysis"></div>
+          <button id="learning-assess" class="secondary wide">学完了，进行初始自评</button>
+          <div id="learning-ratings" class="four-actions" hidden>
+            <button data-learning-rating="again">没记住</button><button data-learning-rating="hard">有些吃力</button>
+            <button data-learning-rating="good">基本掌握</button><button data-learning-rating="easy">非常熟悉</button>
+          </div>
+        </article>
+      </section>
+
       <section class="view" id="view-review">
-        <div class="section-intro"><div><h2>今日复习</h2><p>先尝试回忆，再显示答案。评分会确定下一次复习时间。</p></div>
-          <button id="review-start" class="primary">载入今日任务</button></div>
-        <div id="review-empty" class="empty-state">尚未载入任务。载入操作会创建最多 8 张新卡。</div>
+        <div class="section-intro"><div><h2>到期复习</h2><p>这里只显示以前学过且今天到期的卡片，不再混入新词。</p></div>
+          <button id="review-start" class="primary">载入到期任务</button></div>
+        <div id="review-empty" class="empty-state">尚未载入到期复习。</div>
         <article id="review-card" class="study-card" hidden>
           <div class="card-meta"><span id="review-type"></span><span id="review-progress"></span></div>
           <p id="review-prompt-label" class="prompt-label"></p><h2 id="review-front" class="review-front word-front"></h2>
@@ -100,6 +121,12 @@
             <button data-rating="good">Good</button><button data-rating="easy">Easy</button>
           </div>
         </article>
+      </section>
+
+      <section class="view" id="view-notebook">
+        <div class="section-intro"><div><h2>生词本</h2><p>按具体词义查看正在学习的内容、掌握维度和下次复习时间。</p></div>
+          <button id="notebook-refresh" class="secondary">刷新生词本</button></div>
+        <div id="notebook-content" class="notebook-list"></div>
       </section>
 
       <section class="view" id="view-reading">
@@ -119,7 +146,10 @@
           <div id="reading-targets" class="reading-targets"></div>
           <div id="reading-passage" class="reading-passage"></div>
           <section class="reading-questions"><h3>理解检查</h3><div id="reading-questions"></div></section>
-          <section class="writing-task"><h3>阅读后输出</h3><p id="reading-writing-prompt"></p><textarea id="reading-summary" rows="5" placeholder="先自行完成摘要或回应；当前版本保存在浏览器中。"></textarea></section>
+          <section class="writing-task"><h3>阅读后输出与评阅</h3><p id="reading-writing-prompt"></p><textarea id="reading-summary" rows="5" placeholder="完成摘要或回应。提交后私教会先指出问题并给修改提示，不会直接替你重写。"></textarea>
+            <div class="writing-actions"><button id="writing-submit" class="primary">提交初稿评阅</button><span id="writing-stage-note"></span></div>
+            <div id="writing-feedback" class="writing-feedback" hidden></div>
+          </section>
         </article>
       </section>
 

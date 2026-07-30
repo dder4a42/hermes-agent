@@ -17,6 +17,7 @@ from .vocabulary_builder import (
     load_ranked_lemmas,
     load_wordfreq_lemmas,
 )
+from .writing_coach import HermesWritingGenerator, WritingCoachService
 
 __all__ = [
     "LearningDatabase",
@@ -37,4 +38,6 @@ __all__ = [
     "frequency_rank_map",
     "load_ranked_lemmas",
     "load_wordfreq_lemmas",
+    "HermesWritingGenerator",
+    "WritingCoachService",
 ]

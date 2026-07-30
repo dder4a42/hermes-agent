@@ -88,6 +88,25 @@ class ReportService:
                 """,
                 (start_text, end_text, start_text, end_text),
             ).fetchone()
+            tutor_lessons = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM reading_tutor_sessions
+                    WHERE created_at >= ? AND created_at <= ?
+                    """,
+                    (start_text, end_text),
+                ).fetchone()[0]
+            )
+            writing_summary = connection.execute(
+                """
+                SELECT COUNT(*) AS submissions,
+                       SUM(CASE WHEN stage = 'revision' THEN 1 ELSE 0 END) AS revisions,
+                       COUNT(DISTINCT lesson_id) AS lessons
+                FROM writing_submissions
+                WHERE created_at >= ? AND created_at <= ?
+                """,
+                (start_text, end_text),
+            ).fetchone()
             cards_created = int(
                 connection.execute(
                     """
@@ -115,6 +134,7 @@ class ReportService:
             },
             "reading": {
                 "documents": int(reading_summary["documents"] or 0),
+                "tutor_lessons": tutor_lessons,
                 "encounters": int(reading_summary["encounters"] or 0),
                 "encountered_senses": int(reading_summary["encountered_senses"] or 0),
             },
@@ -123,6 +143,11 @@ class ReportService:
                 "unique_exercises": int(production_summary["unique_exercises"] or 0),
                 "revisions": int(production_summary["revisions"] or 0),
                 "outcomes": production_outcomes,
+            },
+            "writing": {
+                "submissions": int(writing_summary["submissions"] or 0),
+                "revisions": int(writing_summary["revisions"] or 0),
+                "lessons": int(writing_summary["lessons"] or 0),
             },
             "cards_created": cards_created,
             "current_state": current,

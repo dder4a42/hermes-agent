@@ -861,6 +861,62 @@ class LearningService:
         self._attach_lexical_analyses(items)
         return {"query": query, "count": len(items), "items": items}
 
+    def learning_items(self, *, limit: int = 100, offset: int = 0) -> dict:
+        """List the learner's concrete tracked senses, grouped across card types."""
+
+        if not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        if offset < 0:
+            raise ValueError("offset cannot be negative")
+        with self.database.connect() as connection:
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(DISTINCT sense_id) FROM review_cards"
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                """
+                SELECT ws.*,
+                       COALESCE(uks.recognition_score, 0.0) AS recognition_score,
+                       COALESCE(uks.recall_score, 0.0) AS recall_score,
+                       COALESCE(uks.production_score, 0.0) AS production_score,
+                       GROUP_CONCAT(rc.card_type) AS card_types,
+                       MIN(CASE WHEN rc.state != 'suspended' THEN rc.due_at END)
+                           AS next_review_at,
+                       MAX(re.reviewed_at) AS last_reviewed_at
+                FROM review_cards rc
+                JOIN word_senses ws ON ws.id = rc.sense_id
+                LEFT JOIN user_knowledge_states uks ON uks.sense_id = ws.id
+                LEFT JOIN review_events re ON re.card_id = rc.id
+                GROUP BY ws.id
+                ORDER BY
+                    CASE WHEN next_review_at IS NULL THEN 1 ELSE 0 END,
+                    next_review_at, ws.frequency_rank, ws.normalized_lemma
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = self._sense_dict(row)
+            recognition = round(float(row["recognition_score"]), 4)
+            recall = round(float(row["recall_score"]), 4)
+            item.update(
+                recognition_score=recognition,
+                recall_score=recall,
+                production_score=round(float(row["production_score"]), 4),
+                card_types=sorted(set(str(row["card_types"] or "").split(","))),
+                next_review_at=row["next_review_at"],
+                last_reviewed_at=row["last_reviewed_at"],
+                learning_status=(
+                    "mastered" if recognition >= 0.7 and recall >= 0.7 else "learning"
+                ),
+            )
+            items.append(item)
+        self._attach_pronunciations(items)
+        self._attach_lexical_analyses(items)
+        return {"count": total, "offset": offset, "limit": limit, "items": items}
+
     def _attach_pronunciations(self, items: list[dict]) -> None:
         pronunciation_service = PronunciationService(self.database)
         pronunciations = pronunciation_service.lookup_many(

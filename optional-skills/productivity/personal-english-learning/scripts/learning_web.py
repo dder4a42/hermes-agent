@@ -20,10 +20,12 @@ from pydantic import BaseModel, Field
 
 from learning_core import (
     HermesReadingGenerator,
+    HermesWritingGenerator,
     LearningDatabase,
     LearningService,
     ReadingTutorService,
     ReportService,
+    WritingCoachService,
 )
 
 
@@ -78,17 +80,29 @@ class ReadingTodayRequest(BaseModel):
     collection_id: str | None = None
 
 
+class WritingReviewRequest(BaseModel):
+    lesson_id: str
+    text: str = Field(min_length=1, max_length=6000)
+    idempotency_key: str
+    parent_submission_id: str | None = None
+
+
 def create_app(
     database_path: str | Path | None = None,
     *,
     session_token: str | None = None,
     reading_generator: Callable[[dict], dict] | None = None,
+    writing_generator: Callable[[dict], dict] | None = None,
 ) -> FastAPI:
     database = LearningDatabase(database_path or default_database_path())
     service = LearningService(database)
     tutor = ReadingTutorService(
         database,
         generator=reading_generator or HermesReadingGenerator(),
+    )
+    writing_coach = WritingCoachService(
+        database,
+        generator=writing_generator or HermesWritingGenerator(),
     )
     token = session_token or secrets.token_urlsafe(32)
     app = FastAPI(
@@ -99,6 +113,7 @@ def create_app(
     )
     app.state.learning_service = service
     app.state.reading_tutor_service = tutor
+    app.state.writing_coach_service = writing_coach
     app.state.session_token = token
 
     @app.middleware("http")
@@ -207,6 +222,13 @@ def create_app(
             ),
         }
 
+    @app.get("/api/vocabulary/notebook")
+    async def vocabulary_notebook(
+        limit: int = Query(default=100, ge=1, le=200),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        return {"ok": True, **service.learning_items(limit=limit, offset=offset)}
+
     @app.post("/api/reading/today")
     async def reading_today(body: ReadingTodayRequest) -> dict:
         # This is a loopback-only, single-user service. Generation is bounded by
@@ -217,6 +239,22 @@ def create_app(
             topic=body.topic,
             collection_id=body.collection_id,
         )
+        return {"ok": True, **result}
+
+    @app.post("/api/writing/review")
+    async def writing_review(body: WritingReviewRequest) -> dict:
+        try:
+            result = writing_coach.review(
+                body.lesson_id,
+                body.text,
+                body.idempotency_key,
+                parent_submission_id=body.parent_submission_id,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail="写作评阅模型暂时不可用，请稍后重试。草稿仍保存在浏览器中。",
+            ) from exc
         return {"ok": True, **result}
 
     app.mount("/assets", StaticFiles(directory=WEB_DIR), name="learning-assets")

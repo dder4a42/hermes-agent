@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 
 
 KNOWLEDGE_EVIDENCE_TABLE = """
@@ -354,6 +354,22 @@ CREATE TABLE IF NOT EXISTS reading_tutor_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_reading_tutor_sessions_created
     ON reading_tutor_sessions(created_at, seed_id);
+
+CREATE TABLE IF NOT EXISTS writing_submissions (
+    id TEXT PRIMARY KEY,
+    lesson_id TEXT NOT NULL REFERENCES reading_tutor_sessions(id) ON DELETE CASCADE,
+    parent_submission_id TEXT REFERENCES writing_submissions(id) ON DELETE SET NULL,
+    stage TEXT NOT NULL CHECK (stage IN ('initial', 'revision')),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    text TEXT NOT NULL,
+    feedback_json TEXT NOT NULL,
+    generator_name TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_writing_submissions_lesson
+    ON writing_submissions(lesson_id, created_at);
 """
 
 

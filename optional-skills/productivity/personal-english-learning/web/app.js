@@ -1,15 +1,22 @@
 const sessionToken = document.querySelector('meta[name="learning-session"]').content;
 const headers = {"Content-Type": "application/json", "X-Learning-Session": sessionToken};
-const titles = {home: "今日学习", assessment: "基础评估", review: "词汇复习", reading: "阅读私教", vocabulary: "词库查询", progress: "学习进度"};
+const titles = {home: "今日学习", assessment: "基础评估", learn: "新词学习", review: "到期复习", notebook: "生词本", reading: "阅读私教", vocabulary: "词库查询", progress: "学习进度"};
 let collections = [];
 let assessmentItems = [];
 let assessmentIndex = 0;
 let reviewItems = [];
 let reviewIndex = 0;
 let reviewStartedAt = 0;
+let learningItems = [];
+let learningIndex = 0;
+let learningStartedAt = 0;
 let lastSearchItems = [];
 let reviewPlanLoading = false;
 let reviewSubmitting = false;
+let learningSubmitting = false;
+let todayPlanPromise = null;
+let currentLesson = null;
+let currentWritingSubmission = null;
 
 async function api(path, options = {}) {
   const controller = new AbortController();
@@ -43,6 +50,7 @@ function showView(name) {
   document.querySelectorAll(".nav-item").forEach(el => el.classList.toggle("active", el.dataset.view === name));
   document.querySelector("#page-title").textContent = titles[name];
   if (name === "progress") void loadProgress();
+  if (name === "notebook") void loadNotebook().catch(error => notify(error.message, "error"));
 }
 
 function selectedCollection() { return document.querySelector("#collection-select").value || null; }
@@ -159,16 +167,89 @@ async function startReview() {
   const originalText = button.textContent;
   button.disabled = true; button.textContent = "正在载入…";
   try {
-    const data = await api("/api/plans/today", {method: "POST", body: JSON.stringify({review_limit: 30, new_limit: 8, collection_id: selectedCollection()})});
-    reviewItems = [...data.reviews, ...data.new_items]; reviewIndex = 0;
+    const data = await ensureTodayPlan();
+    reviewItems = data.reviews; reviewIndex = 0;
     document.querySelector("#review-empty").hidden = reviewItems.length > 0;
     document.querySelector("#review-card").hidden = reviewItems.length === 0;
-    if (!reviewItems.length) notify("今天的学习任务已经完成。", "success");
-    else if (data.reused_plan) notify("已恢复今天尚未完成的任务。", "success");
+    if (!reviewItems.length) notify("当前没有到期复习。", "success");
+    else if (data.reused_plan) notify("已恢复今天尚未完成的到期卡。", "success");
     renderReview(); await loadStats();
   } finally {
     reviewPlanLoading = false;
     button.disabled = false; button.textContent = originalText;
+  }
+}
+
+async function ensureTodayPlan() {
+  if (!todayPlanPromise) {
+    todayPlanPromise = api("/api/plans/today", {
+      method: "POST",
+      body: JSON.stringify({review_limit: 30, new_limit: 8, collection_id: selectedCollection()}),
+    }).catch(error => { todayPlanPromise = null; throw error; });
+  }
+  return todayPlanPromise;
+}
+
+async function startLearning() {
+  if (reviewPlanLoading) return;
+  reviewPlanLoading = true;
+  const button = document.querySelector("#learning-start");
+  const originalText = button.textContent;
+  button.disabled = true; button.textContent = "正在载入…";
+  try {
+    const data = await ensureTodayPlan();
+    learningItems = data.new_items; learningIndex = 0;
+    document.querySelector("#learning-empty").hidden = learningItems.length > 0;
+    document.querySelector("#learning-card").hidden = learningItems.length === 0;
+    if (!learningItems.length) {
+      const reason = data.effective_new_limit === 0 ? "复习积压较多，今天暂停增加新词。" : "今天的新词已经完成。";
+      notify(reason, "success");
+    }
+    renderLearning(); await loadStats();
+  } finally {
+    reviewPlanLoading = false;
+    button.disabled = false; button.textContent = originalText;
+  }
+}
+
+function renderLearning() {
+  const item = learningItems[learningIndex]; if (!item) return;
+  document.querySelector("#learning-progress").textContent = `${learningIndex + 1} / ${learningItems.length}`;
+  document.querySelector("#learning-lemma").textContent = item.lemma;
+  document.querySelector("#learning-pos").textContent = item.part_of_speech;
+  document.querySelector("#learning-pronunciation").innerHTML = pronunciationHtml(item);
+  document.querySelector("#learning-definition-en").textContent = item.definition_en;
+  document.querySelector("#learning-definition-zh").textContent = item.definition_zh || "暂无中文释义";
+  document.querySelector("#learning-lexical-analysis").innerHTML = lexicalAnalysisHtml(item);
+  document.querySelector("#learning-assess").hidden = false;
+  document.querySelector("#learning-ratings").hidden = true;
+  learningStartedAt = performance.now();
+}
+
+async function rateLearning(rating) {
+  if (learningSubmitting) return;
+  const item = learningItems[learningIndex]; if (!item) return;
+  learningSubmitting = true;
+  const buttons = [...document.querySelectorAll("[data-learning-rating]")];
+  buttons.forEach(button => { button.disabled = true; });
+  try {
+    await api(`/api/reviews/${encodeURIComponent(item.card_id)}`, {
+      method: "POST",
+      body: JSON.stringify({rating, idempotency_key: crypto.randomUUID(), response_time_ms: Math.round(performance.now() - learningStartedAt)}),
+    });
+    todayPlanPromise = null;
+    learningIndex += 1;
+    if (learningIndex >= learningItems.length) {
+      document.querySelector("#learning-card").hidden = true;
+      document.querySelector("#learning-empty").hidden = false;
+      document.querySelector("#learning-empty").textContent = `今天 ${learningItems.length} 个新词已完成。`;
+      notify("新词学习完成，之后会进入到期复习。", "success");
+      await loadStats(); return;
+    }
+    renderLearning();
+  } finally {
+    learningSubmitting = false;
+    buttons.forEach(button => { button.disabled = false; });
   }
 }
 
@@ -201,6 +282,7 @@ async function rateReview(rating) {
   ratingButtons.forEach(button => { button.disabled = true; });
   try {
     await api(`/api/reviews/${encodeURIComponent(item.card_id)}`, {method: "POST", body: JSON.stringify({rating, idempotency_key: crypto.randomUUID(), response_time_ms: Math.round(performance.now() - reviewStartedAt)})});
+    todayPlanPromise = null;
     reviewIndex += 1;
     if (reviewIndex >= reviewItems.length) {
       document.querySelector("#review-card").hidden = true;
@@ -225,6 +307,22 @@ async function searchVocabulary(event) {
   container.replaceChildren(...data.items.map(item => {
     const card = document.createElement("article"); card.className = "result-card";
     card.innerHTML = `<div><h3>${escapeHtml(item.lemma)}</h3><span>${escapeHtml(item.part_of_speech)}</span></div><div class="result-pronunciation pronunciation">${pronunciationHtml(item)}</div><p>${escapeHtml(item.definition_en)}</p><small>识别 ${Math.round(item.recognition_score * 100)}% · 回忆 ${Math.round(item.recall_score * 100)}% · 来源 ${escapeHtml(item.source)}</small>${lexicalAnalysisHtml(item)}`;
+    return card;
+  }));
+}
+
+async function loadNotebook() {
+  const data = await api("/api/vocabulary/notebook?limit=100");
+  const container = document.querySelector("#notebook-content");
+  if (!data.items.length) {
+    container.innerHTML = '<div class="empty-state">生词本还是空的。完成基础评估、阅读选词或新词学习后，具体词义会出现在这里。</div>';
+    return;
+  }
+  container.replaceChildren(...data.items.map(item => {
+    const card = document.createElement("article"); card.className = "notebook-card";
+    const next = item.next_review_at ? new Date(item.next_review_at).toLocaleString("zh-CN", {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"}) : "未安排";
+    const types = item.card_types.map(type => type === "recall" ? "主动回忆" : "词义识别").join(" · ");
+    card.innerHTML = `<header><div><h3>${escapeHtml(item.lemma)}</h3><span>${escapeHtml(item.part_of_speech)} · ${escapeHtml(item.definition_zh || item.definition_en)}</span></div><b>${item.learning_status === "mastered" ? "较稳定" : "学习中"}</b></header><p>${escapeHtml(item.definition_en)}</p><div class="mastery-bars"><span>识别 <i style="--score:${Math.round(item.recognition_score * 100)}%"></i><em>${Math.round(item.recognition_score * 100)}%</em></span><span>回忆 <i style="--score:${Math.round(item.recall_score * 100)}%"></i><em>${Math.round(item.recall_score * 100)}%</em></span><span>使用 <i style="--score:${Math.round(item.production_score * 100)}%"></i><em>${Math.round(item.production_score * 100)}%</em></span></div><small>${escapeHtml(types)} · 下次复习 ${escapeHtml(next)}</small>`;
     return card;
   }));
 }
@@ -255,6 +353,8 @@ async function prepareReading(event) {
 }
 
 function renderReading(lesson) {
+  currentLesson = lesson;
+  currentWritingSubmission = null;
   document.querySelector("#reading-empty").hidden = true;
   document.querySelector("#reading-lesson").hidden = false;
   document.querySelector("#reading-title").textContent = lesson.title;
@@ -293,13 +393,58 @@ function renderReading(lesson) {
   const storageKey = `reading-summary:${lesson.lesson_id}`;
   summary.value = localStorage.getItem(storageKey) || "";
   summary.oninput = () => localStorage.setItem(storageKey, summary.value);
+  document.querySelector("#writing-submit").textContent = "提交初稿评阅";
+  document.querySelector("#writing-stage-note").textContent = "";
+  document.querySelector("#writing-feedback").hidden = true;
+}
+
+async function submitWriting() {
+  if (!currentLesson) return;
+  const text = document.querySelector("#reading-summary").value.trim();
+  if (!text) { notify("请先完成一段英文写作。", "error"); return; }
+  const button = document.querySelector("#writing-submit");
+  const original = button.textContent;
+  button.disabled = true; button.textContent = "私教正在评阅…";
+  try {
+    const result = await api("/api/writing/review", {
+      method: "POST",
+      timeoutMs: 100000,
+      body: JSON.stringify({
+        lesson_id: currentLesson.lesson_id,
+        text,
+        idempotency_key: crypto.randomUUID(),
+        parent_submission_id: currentWritingSubmission?.submission_id || null,
+      }),
+    });
+    currentWritingSubmission = result;
+    renderWritingFeedback(result);
+    button.textContent = "提交修改稿复评";
+    document.querySelector("#writing-stage-note").textContent = "请根据提示自行修改上方文本，再提交复评。";
+    notify(result.stage === "revision" ? "修改稿反馈已生成。" : "初稿反馈已生成，请先自行修改。", "success");
+  } finally {
+    button.disabled = false;
+    if (!currentWritingSubmission) button.textContent = original;
+  }
+}
+
+function renderWritingFeedback(result) {
+  const feedback = result.feedback;
+  const node = document.querySelector("#writing-feedback");
+  const categoryLabels = {grammar: "语法", collocation: "搭配", register: "语域", cohesion: "衔接", content: "内容", word_choice: "选词"};
+  const issues = feedback.issues.length ? feedback.issues.map(issue => `<article><span>${escapeHtml(categoryLabels[issue.category] || issue.category)}</span><strong>${escapeHtml(issue.excerpt)}</strong><p>${escapeHtml(issue.explanation_zh)}</p><small>修改提示：${escapeHtml(issue.hint_zh)}</small></article>`).join("") : '<p class="feedback-success">没有发现需要优先修改的问题。</p>';
+  const strengths = feedback.strengths.map(item => `<li>${escapeHtml(item)}</li>`).join("");
+  const priorities = feedback.revision_priorities.map(item => `<li>${escapeHtml(item)}</li>`).join("");
+  const traitLabels = {content: "内容", accuracy: "准确性", cohesion: "连贯性", register: "语域"};
+  const traits = Object.entries(feedback.traits).map(([key, value]) => `<div><b>${escapeHtml(traitLabels[key] || key)}</b><p>${escapeHtml(value)}</p></div>`).join("");
+  node.innerHTML = `<header><span>${result.stage === "revision" ? "修改稿反馈" : "初稿反馈"}</span><h4>${escapeHtml(feedback.summary_zh)}</h4></header><section><h5>做得好的地方</h5><ul>${strengths}</ul></section><section><h5>需要你修改</h5><div class="writing-issues">${issues}</div>${priorities ? `<ol>${priorities}</ol>` : ""}</section><section><h5>分项观察</h5><div class="trait-grid">${traits}</div></section>`;
+  node.hidden = false;
 }
 
 async function loadProgress() {
   const data = await api("/api/reports/weekly?days=7");
   const cards = [
     ["评估", data.assessment.total, "次回答"], ["复习", data.reviews.attempts, "次作答"],
-    ["阅读", data.reading.documents, "篇材料"], ["写作", data.production.attempts, "次练习"]
+    ["阅读", data.reading.documents + data.reading.tutor_lessons, "篇材料"], ["写作", data.writing.submissions + data.production.attempts, "次练习"]
   ];
   document.querySelector("#progress-content").replaceChildren(...cards.map(([label, value, suffix]) => {
     const card = document.createElement("article"); card.innerHTML = `<span>${label}</span><strong>${formatNumber(value)}</strong><small>${suffix}</small>`; return card;
@@ -310,12 +455,18 @@ document.querySelectorAll(".nav-item").forEach(button => button.addEventListener
 document.querySelectorAll("[data-go]").forEach(button => button.addEventListener("click", () => showView(button.dataset.go)));
 document.querySelector("#assessment-start").addEventListener("click", () => void startAssessment().catch(error => notify(error.message, "error")));
 document.querySelectorAll("[data-assessment]").forEach(button => button.addEventListener("click", () => void answerAssessment(button.dataset.assessment).catch(error => notify(error.message, "error"))));
+document.querySelector("#learning-start").addEventListener("click", () => void startLearning().catch(error => notify(error.message, "error")));
+document.querySelector("#learning-assess").addEventListener("click", event => { event.currentTarget.hidden = true; document.querySelector("#learning-ratings").hidden = false; });
+document.querySelectorAll("[data-learning-rating]").forEach(button => button.addEventListener("click", () => void rateLearning(button.dataset.learningRating).catch(error => notify(error.message, "error"))));
 document.querySelector("#review-start").addEventListener("click", () => void startReview().catch(error => notify(error.message, "error")));
 document.querySelector("#reveal-answer").addEventListener("click", event => { event.currentTarget.hidden = true; document.querySelector("#review-answer").hidden = false; document.querySelector("#review-ratings").hidden = false; });
 document.querySelectorAll("[data-rating]").forEach(button => button.addEventListener("click", () => void rateReview(button.dataset.rating).catch(error => notify(error.message, "error"))));
 document.querySelector("#search-form").addEventListener("submit", event => void searchVocabulary(event).catch(error => notify(error.message, "error")));
 document.querySelector("#reading-form").addEventListener("submit", event => void prepareReading(event).catch(error => notify(error.message, "error")));
+document.querySelector("#writing-submit").addEventListener("click", () => void submitWriting().catch(error => notify(error.message, "error")));
+document.querySelector("#notebook-refresh").addEventListener("click", () => void loadNotebook().catch(error => notify(error.message, "error")));
 document.querySelector("#progress-refresh").addEventListener("click", () => void loadProgress().catch(error => notify(error.message, "error")));
+document.querySelector("#collection-select").addEventListener("change", () => { todayPlanPromise = null; });
 document.querySelector("#pronunciation-mode").addEventListener("change", () => {
   const assessmentItem = assessmentItems[assessmentIndex];
   if (assessmentItem) document.querySelector("#assessment-pronunciation").innerHTML = pronunciationHtml(assessmentItem);
@@ -324,6 +475,8 @@ document.querySelector("#pronunciation-mode").addEventListener("change", () => {
     document.querySelector("#review-pronunciation").innerHTML = reviewItem.card_type === "recall" ? "" : pronunciationHtml(reviewItem);
     document.querySelector("#review-answer-pronunciation").innerHTML = pronunciationHtml(reviewItem);
   }
+  const learningItem = learningItems[learningIndex];
+  if (learningItem) document.querySelector("#learning-pronunciation").innerHTML = pronunciationHtml(learningItem);
   if (lastSearchItems.length) document.querySelector("#search-form").requestSubmit();
 });
 document.addEventListener("keydown", event => {
