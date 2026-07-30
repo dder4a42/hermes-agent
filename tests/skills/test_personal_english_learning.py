@@ -1122,6 +1122,34 @@ def test_lexical_inference_repairs_one_invalid_model_response(
     }
 
 
+def test_lexical_inference_normalizes_bounded_schema_variants(
+    service: LearningService,
+) -> None:
+    sense_id = service.upsert_vocabulary(
+        VocabularyEntry("study", "verb", "learn about a subject", "学习", 500,
+                        "fixture", "study.v"),
+        now=NOW,
+    )["sense_id"]
+
+    def generate(_payload: dict) -> dict:
+        return {"analyses": [
+            {"analysis_type": "historical_etymology", "status": "uncertain",
+             "content": "历史路径存在多种解释。", "explanation_zh": "谨慎处理。",
+             "confidence": 0.6},
+            {"analysis_type": "modern_morphology", "status": "not_applicable",
+             "summary_zh": "现代英语中作为整体使用。", "explanation_zh": "不强拆。",
+             "confidence": 0.9},
+        ]}
+
+    result = LexicalInferenceService(
+        service.database, generator=generate
+    ).analyze_sense(sense_id)
+
+    analyses = result["lexical_analysis"]["analyses"]
+    assert {item["status"] for item in analyses} == {"ambiguous", "opaque"}
+    assert all(not value for value in result["lexical_analysis"]["needs_inference"].values())
+
+
 def test_learning_web_runs_lexical_inference_as_background_job(tmp_path: Path) -> None:
     database = tmp_path / "learning.db"
     service = LearningService(LearningDatabase(database))

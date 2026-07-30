@@ -171,9 +171,32 @@ class LexicalInferenceService:
         seen = set()
         for analysis in analyses:
             analysis_type = str(analysis.get("analysis_type", "")).strip()
-            status = str(analysis.get("status", "")).strip()
+            status = str(analysis.get("status", "")).strip().casefold()
+            status = {
+                "uncertain": "ambiguous",
+                "unclear": "ambiguous",
+                "unknown": "not_found",
+                "unavailable": "not_found",
+                "not_applicable": "opaque",
+                "non_compositional": "opaque",
+            }.get(status, status)
             content = analysis.get("content")
             explanation = str(analysis.get("explanation_zh", "")).strip()
+            if isinstance(content, str) and content.strip():
+                content = {"summary_zh": content.strip()}
+            elif content is None:
+                content_keys = {
+                    "segments", "compositionality", "compositionality_summary",
+                    "summary_zh", "origin_language", "language_origin",
+                    "historical_form", "root_form", "root_meaning",
+                    "semantic_evolution", "semantic_evolution_zh",
+                }
+                lifted = {
+                    key: analysis[key]
+                    for key in content_keys
+                    if key in analysis
+                }
+                content = lifted or None
             try:
                 confidence = float(analysis.get("confidence"))
             except (TypeError, ValueError) as exc:
@@ -237,6 +260,7 @@ class LexicalInferenceJobs:
                 "sense_id": sense["id"],
                 "status": "queued",
                 "result": None,
+                "error": None,
             }
             self.jobs[job_id] = job
             self.executor.submit(self._run, job_id, sense["id"])
@@ -254,9 +278,10 @@ class LexicalInferenceJobs:
             self.jobs[job_id]["status"] = "running"
         try:
             result = self.service.analyze_sense(sense_id)
-        except Exception:
+        except Exception as exc:
             with self.lock:
                 self.jobs[job_id]["status"] = "failed"
+                self.jobs[job_id]["error"] = f"{type(exc).__name__}: {exc}"
             return
         with self.lock:
             self.jobs[job_id]["status"] = "ready"
@@ -269,6 +294,7 @@ class LexicalInferenceJobs:
             "sense_id": job["sense_id"],
             "status": job["status"],
             "result": job.get("result"),
+            "error": job.get("error"),
         }
 
 
