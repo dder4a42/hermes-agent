@@ -16,11 +16,11 @@ Use when a learner wants to assess, expand, or review English vocabulary with a 
 |---|---|
 | Source | Optional — install with `hermes skills install official/productivity/personal-english-learning` |
 | Path | `optional-skills/productivity/personal-english-learning` |
-| Version | `0.1.0` |
+| Version | `0.2.0` |
 | Author | Hermes Agent |
 | License | MIT |
 | Platforms | linux, macos, windows |
-| Tags | `education`, `english`, `vocabulary`, `spaced-repetition`, `sqlite` |
+| Tags | `education`, `english`, `vocabulary`, `academic-english`, `spaced-repetition`, `sqlite` |
 
 ## Reference: full SKILL.md
 
@@ -88,7 +88,92 @@ Completion criterion: the result contains `"ok": true` and a database path.
 
 ### 2. Import vocabulary
 
-Import a prepared JSONL vocabulary source:
+For a reproducible core library, download both official Open English WordNet
+2025 archives: the JSON archive supplies entries and definitions, while the
+WNDB archive supplies `index.sense` ordering. Keep both outside the repository.
+
+Build a general-English candidate collection from a UTF-8 CSV/TSV/JSONL
+frequency list:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  vocabulary-build-general \
+  --wordnet-zip /data/english-wordnet-2025-json.zip \
+  --sense-index-zip /data/english-wordnet-2025.zip \
+  --frequency-list /data/english-frequency.csv \
+  --output /data/general-core.jsonl \
+  --limit 5000
+```
+
+The ranked list accepts headers such as `rank,lemma` or `rank,word`. If
+`--frequency-list` is omitted, the command uses the optional `wordfreq` Python
+package and requests extra candidates because function words do not necessarily
+have OEWN senses.
+
+Build academic candidates from a lemma list such as the Academic Vocabulary
+List. Its official download is an Excel workbook; export the relevant worksheet
+as UTF-8 CSV first. Preserve any POS column when available:
+
+```csv
+lemma,academic_rank,pos
+analyse,1,verb
+approach,2,noun
+derive,3,verb
+```
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  vocabulary-build-academic \
+  --wordnet-zip /data/english-wordnet-2025-json.zip \
+  --sense-index-zip /data/english-wordnet-2025.zip \
+  --academic-list /data/academic-vocabulary.csv \
+  --frequency-list /data/english-frequency.csv \
+  --output /data/academic-core.jsonl
+```
+
+Every build writes a deterministic `.manifest.json` beside the JSONL. It
+contains SHA-256 identities, versions, licenses, parameters, unmatched lemmas,
+and the output hash. Review unmatched counts before import. Rebuilding refuses
+to replace an existing output unless `--force` is explicit.
+
+These are candidate sense collections, not a claim that every selected OEWN
+sense is pedagogically central. OEWN `index.sense` determines stable sense
+order, but an academic lemma list generally does not identify the academic
+sense. Academic builds therefore retain up to five candidate senses by default;
+actual reading context and explicit learner confirmation decide which sense
+enters active study.
+
+Import the generated collections separately:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  import-jsonl /data/general-core.jsonl
+
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  import-jsonl /data/academic-core.jsonl
+```
+
+One OEWN sense may belong to both collections. The importer stores one sense
+and two memberships; academic rank never overwrites general frequency. A daily
+plan introduces at most one new sense of the same lemma at a time.
+
+For a basic learner, draw new items from the general collection first:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  daily-plan --collection-id general-core-oewn-2025 --new-limit 8
+```
+
+When `--collection-id` is omitted, assessment and daily planning automatically
+select the lexically first installed `general` collection. If no general
+collection exists, legacy uncollected behavior is retained. The JSON response
+reports `collection_selection` so the caller never has to guess which path ran.
+
+Use `academic-core-oewn-2025` explicitly only when the learner requests
+academic work or their general review load is under control. Due reviews remain
+global so changing the new-item collection never abandons earlier cards.
+
+You may also import a prepared JSONL vocabulary source directly:
 
 ```bash
 python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
@@ -382,6 +467,8 @@ for a basic learner; never reproduce or imply access to official test items.
 - Learning state is private and profile-local.
 - Do not import scraped commercial dictionaries or commercial TOEFL questions.
 - Preserve `source` and `source_sense_id` on every imported sense.
+- Preserve collection source terms and the generated manifest. Do not commit or
+  redistribute an upstream list whose terms permit personal academic use only.
 - Never run SQL from user-provided text.
 - Never delete or reset the database without explicit user confirmation.
 - Do not claim a review was recorded unless the CLI returned success.
@@ -410,6 +497,9 @@ for a basic learner; never reproduce or imply access to official test items.
     command so the summary reflects SQLite evidence.
 11. Treating a practice band or legacy comparison range as an official score.
     Preserve the disclaimer and describe it as learning feedback.
+12. Assuming a lemma list identifies the intended sense. Academic lists rank
+    lemmas or lemma/POS pairs; use reading context and explicit confirmation for
+    concrete senses.
 
 ## Verification Checklist
 
@@ -425,3 +515,5 @@ for a basic learner; never reproduce or imply access to official test items.
 - [ ] Automation used the active profile and respected the returned plan limits
 - [ ] Weekly summaries came from `weekly-report`, not conversational memory
 - [ ] TOEFL guidance used the bundled profile version and preserved its disclaimer
+- [ ] Vocabulary builds retained their manifests and collection provenance
+- [ ] Academic candidates were not presented as automatically disambiguated senses

@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 
 from learning_core import (
+    CollectionSpec,
     ExamService,
     LearningDatabase,
     LearningService,
@@ -18,6 +19,10 @@ from learning_core import (
     ReadingService,
     ReportService,
     VocabularyEntry,
+    VocabularyBuilder,
+    frequency_rank_map,
+    load_ranked_lemmas,
+    load_wordfreq_lemmas,
 )
 
 
@@ -48,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     sample = commands.add_parser("assessment-sample", help="Sample frequency bands")
     sample.add_argument("--per-band", type=int, default=10)
     sample.add_argument("--seed", type=int, default=0)
+    sample.add_argument("--collection-id")
 
     assessment = commands.add_parser("assessment-record", help="Record one assessment")
     assessment.add_argument("--sense-id", required=True)
@@ -60,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--new-limit", type=int, default=8)
     plan.add_argument("--backlog-reduce-at", type=int, default=30)
     plan.add_argument("--backlog-stop-at", type=int, default=60)
+    plan.add_argument("--collection-id")
 
     review = commands.add_parser("review", help="Record and schedule one review")
     review.add_argument("--card-id", required=True)
@@ -130,11 +137,60 @@ def build_parser() -> argparse.ArgumentParser:
         dest="sections",
     )
 
+    general = commands.add_parser(
+        "vocabulary-build-general",
+        help="Build a compact general-English OEWN JSONL collection",
+    )
+    _add_builder_arguments(general, default_limit=5000, default_senses=2)
+    general.add_argument("--frequency-list", type=Path)
+    general.add_argument("--collection-id", default="general-core-oewn-2025")
+    general.add_argument("--collection-title", default="General English Core")
+    general.add_argument(
+        "--ranking-source", default="https://github.com/rspeer/wordfreq"
+    )
+    general.add_argument("--ranking-version", default="user-provided-or-runtime")
+    general.add_argument("--ranking-license", default="Apache-2.0 / CC-BY-SA-4.0")
+
+    academic = commands.add_parser(
+        "vocabulary-build-academic",
+        help="Build an academic-English OEWN JSONL collection",
+    )
+    _add_builder_arguments(academic, default_limit=3000, default_senses=5)
+    academic.add_argument("--academic-list", type=Path, required=True)
+    academic.add_argument("--frequency-list", type=Path)
+    academic.add_argument("--collection-id", default="academic-core-oewn-2025")
+    academic.add_argument("--collection-title", default="Academic English Core")
+    academic.add_argument(
+        "--ranking-source", default="https://www.academicvocabulary.info/"
+    )
+    academic.add_argument("--ranking-version", default="Gardner-Davies-2013")
+    academic.add_argument(
+        "--ranking-license",
+        default="academic-use-only; verify upstream terms; do not redistribute list",
+    )
+
     commands.add_parser("stats", help="Show learning progress statistics")
     return parser
 
 
+def _add_builder_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    default_limit: int,
+    default_senses: int,
+) -> None:
+    parser.add_argument("--wordnet-zip", type=Path, required=True)
+    parser.add_argument("--sense-index-zip", type=Path, required=True)
+    parser.add_argument("--wordnet-version", default="2025")
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--limit", type=int, default=default_limit)
+    parser.add_argument("--max-senses-per-lemma", type=int, default=default_senses)
+    parser.add_argument("--force", action="store_true")
+
+
 def run(args: argparse.Namespace) -> dict:
+    if args.command in {"vocabulary-build-general", "vocabulary-build-academic"}:
+        return _run_vocabulary_builder(args)
     if args.command == "toefl-profile":
         return {"profile": ExamService().profile()}
     if args.command == "toefl-score":
@@ -168,7 +224,11 @@ def run(args: argparse.Namespace) -> dict:
             )
         )
     if args.command == "assessment-sample":
-        return service.assessment_sample(per_band=args.per_band, seed=args.seed)
+        return service.assessment_sample(
+            per_band=args.per_band,
+            seed=args.seed,
+            collection_id=args.collection_id,
+        )
     if args.command == "assessment-record":
         return service.record_assessment(
             args.sense_id,
@@ -182,6 +242,7 @@ def run(args: argparse.Namespace) -> dict:
             new_limit=args.new_limit,
             backlog_reduce_at=args.backlog_reduce_at,
             backlog_stop_at=args.backlog_stop_at,
+            collection_id=args.collection_id,
         )
     if args.command == "review":
         return service.record_review(
@@ -232,6 +293,52 @@ def run(args: argparse.Namespace) -> dict:
     if args.command == "stats":
         return service.stats()
     raise AssertionError(f"unhandled command: {args.command}")
+
+
+def _run_vocabulary_builder(args: argparse.Namespace) -> dict:
+    frequency_items = (
+        load_ranked_lemmas(args.frequency_list)
+        if args.frequency_list is not None
+        else None
+    )
+    if args.command == "vocabulary-build-general":
+        ranked_items = frequency_items or load_wordfreq_lemmas(args.limit * 3)
+        kind = "general"
+        ranked_source_path = args.frequency_list
+    else:
+        ranked_items = load_ranked_lemmas(args.academic_list)
+        kind = "academic"
+        ranked_source_path = args.academic_list
+    if kind == "general":
+        ranks = frequency_rank_map(frequency_items or ranked_items)
+    else:
+        ranks = (
+            frequency_rank_map(frequency_items)
+            if frequency_items is not None
+            else {}
+        )
+    return VocabularyBuilder(
+        args.wordnet_zip,
+        sense_index_zip=args.sense_index_zip,
+        wordnet_version=args.wordnet_version,
+    ).build(
+        ranked_items,
+        args.output,
+        CollectionSpec(
+            id=args.collection_id,
+            title=args.collection_title,
+            kind=kind,
+            source=args.ranking_source,
+            version=args.ranking_version,
+            license=args.ranking_license,
+        ),
+        frequency_ranks=ranks,
+        lemma_limit=args.limit,
+        max_senses_per_lemma=args.max_senses_per_lemma,
+        force=args.force,
+        ranked_source_path=ranked_source_path,
+        frequency_source_path=args.frequency_list,
+    )
 
 
 def main() -> int:

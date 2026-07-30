@@ -34,6 +34,55 @@ def normalize_lemma(value: str) -> str:
 
 
 @dataclass(frozen=True)
+class VocabularyCollection:
+    id: str
+    title: str
+    kind: str
+    source: str
+    version: str
+    license: str
+    rank: int
+    source_lemma: str
+    sense_rank: int = 1
+
+    def __post_init__(self) -> None:
+        if not all(
+            value and value.strip()
+            for value in (
+                self.id,
+                self.title,
+                self.source,
+                self.version,
+                self.license,
+                self.source_lemma,
+            )
+        ):
+            raise ValueError("collection metadata fields are required")
+        if self.kind not in {"general", "academic", "custom"}:
+            raise ValueError("collection kind must be general, academic, or custom")
+        if self.rank <= 0:
+            raise ValueError("collection rank must be positive")
+        if self.sense_rank <= 0:
+            raise ValueError("collection sense_rank must be positive")
+
+    @classmethod
+    def from_mapping(cls, value: dict[str, Any]) -> "VocabularyCollection":
+        if not isinstance(value, dict):
+            raise ValueError("collection must be a JSON object")
+        return cls(
+            id=str(value.get("id", "")).strip(),
+            title=str(value.get("title", "")).strip(),
+            kind=str(value.get("kind", "")).strip(),
+            source=str(value.get("source", "")).strip(),
+            version=str(value.get("version", "")).strip(),
+            license=str(value.get("license", "")).strip(),
+            rank=int(value.get("rank", 0)),
+            source_lemma=str(value.get("source_lemma", "")).strip(),
+            sense_rank=int(value.get("sense_rank", 1)),
+        )
+
+
+@dataclass(frozen=True)
 class VocabularyEntry:
     lemma: str
     part_of_speech: str
@@ -42,6 +91,7 @@ class VocabularyEntry:
     frequency_rank: int | None
     source: str
     source_sense_id: str | None = None
+    collection: VocabularyCollection | None = None
 
     def __post_init__(self) -> None:
         if not all(
@@ -75,6 +125,11 @@ class VocabularyEntry:
             source_sense_id=(
                 str(value["source_sense_id"]).strip()
                 if value.get("source_sense_id")
+                else None
+            ),
+            collection=(
+                VocabularyCollection.from_mapping(value["collection"])
+                if value.get("collection") is not None
                 else None
             ),
         )
@@ -122,8 +177,12 @@ class LearningService:
                     normalized_lemma = excluded.normalized_lemma,
                     part_of_speech = excluded.part_of_speech,
                     definition_en = excluded.definition_en,
-                    definition_zh = excluded.definition_zh,
-                    frequency_rank = excluded.frequency_rank,
+                    definition_zh = COALESCE(
+                        excluded.definition_zh, word_senses.definition_zh
+                    ),
+                    frequency_rank = COALESCE(
+                        excluded.frequency_rank, word_senses.frequency_rank
+                    ),
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -141,10 +200,56 @@ class LearningService:
                     iso(now),
                 ),
             )
+            if entry.collection is not None:
+                collection = entry.collection
+                connection.execute(
+                    """
+                    INSERT INTO vocabulary_collections(
+                        id, title, kind, source, version, license, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        title = excluded.title,
+                        kind = excluded.kind,
+                        source = excluded.source,
+                        version = excluded.version,
+                        license = excluded.license
+                    """,
+                    (
+                        collection.id,
+                        collection.title,
+                        collection.kind,
+                        collection.source,
+                        collection.version,
+                        collection.license,
+                        iso(now),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO word_sense_collections(
+                        sense_id, collection_id, priority_rank, sense_rank,
+                        source_lemma
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(sense_id, collection_id) DO UPDATE SET
+                        priority_rank = excluded.priority_rank,
+                        sense_rank = excluded.sense_rank,
+                        source_lemma = excluded.source_lemma
+                    """,
+                    (
+                        sense_id,
+                        collection.id,
+                        collection.rank,
+                        collection.sense_rank,
+                        collection.source_lemma,
+                    ),
+                )
         return {
             "sense_id": sense_id,
             "created": existed is None,
             "identity_derived": derived,
+            "collection_id": (
+                entry.collection.id if entry.collection is not None else None
+            ),
         }
 
     def import_jsonl(self, path: str | Path) -> dict:
@@ -180,31 +285,59 @@ class LearningService:
         per_band: int = 10,
         seed: int = 0,
         bands: Iterable[tuple[int, int]] = DEFAULT_BANDS,
+        collection_id: str | None = None,
     ) -> dict:
         if per_band <= 0:
             raise ValueError("per_band must be positive")
         generator = random.Random(seed)
         samples: list[dict] = []
         with self.database.connect() as connection:
+            collection_id, collection_selection = self._resolve_collection_id(
+                connection, collection_id
+            )
             for lower, upper in bands:
-                rows = connection.execute(
-                    """
-                    SELECT ws.* FROM word_senses ws
-                    WHERE ws.frequency_rank BETWEEN ? AND ?
-                      AND NOT EXISTS (
-                          SELECT 1 FROM assessment_events ae
-                          WHERE ae.sense_id = ws.id
-                      )
-                    ORDER BY ws.frequency_rank, ws.normalized_lemma, ws.id
-                    """,
-                    (lower, upper),
-                ).fetchall()
+                if collection_id:
+                    rows = connection.execute(
+                        """
+                        SELECT ws.*, wsc.collection_id,
+                               wsc.priority_rank AS collection_rank,
+                               wsc.sense_rank AS collection_sense_rank
+                        FROM word_senses ws
+                        JOIN word_sense_collections wsc ON wsc.sense_id = ws.id
+                        WHERE wsc.collection_id = ?
+                          AND wsc.priority_rank BETWEEN ? AND ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM assessment_events ae
+                              WHERE ae.sense_id = ws.id
+                          )
+                        ORDER BY wsc.priority_rank, ws.normalized_lemma, ws.id
+                        """,
+                        (collection_id, lower, upper),
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        """
+                        SELECT ws.* FROM word_senses ws
+                        WHERE ws.frequency_rank BETWEEN ? AND ?
+                          AND NOT EXISTS (
+                              SELECT 1 FROM assessment_events ae
+                              WHERE ae.sense_id = ws.id
+                          )
+                        ORDER BY ws.frequency_rank, ws.normalized_lemma, ws.id
+                        """,
+                        (lower, upper),
+                    ).fetchall()
                 chosen = generator.sample(rows, min(per_band, len(rows)))
                 for row in chosen:
                     item = self._sense_dict(row)
                     item["frequency_band"] = f"{lower}-{upper}"
                     samples.append(item)
-        return {"count": len(samples), "items": samples}
+        return {
+            "count": len(samples),
+            "collection_id": collection_id,
+            "collection_selection": collection_selection,
+            "items": samples,
+        }
 
     def record_assessment(
         self,
@@ -262,6 +395,7 @@ class LearningService:
         new_limit: int = 8,
         backlog_reduce_at: int = 30,
         backlog_stop_at: int = 60,
+        collection_id: str | None = None,
         now: datetime | None = None,
     ) -> dict:
         if review_limit < 0 or new_limit < 0:
@@ -271,6 +405,9 @@ class LearningService:
         now = now or utc_now()
         now_text = iso(now)
         with self.database.connect() as connection:
+            collection_id, collection_selection = self._resolve_collection_id(
+                connection, collection_id
+            )
             due_count = int(
                 connection.execute(
                     """
@@ -300,28 +437,119 @@ class LearningService:
                 (now_text, review_limit),
             ).fetchall()
 
-            candidates = connection.execute(
-                """
-                SELECT ws.* FROM word_senses ws
-                LEFT JOIN user_knowledge_states uks ON uks.sense_id = ws.id
-                WHERE ws.frequency_rank IS NOT NULL
-                  AND COALESCE(uks.recognition_score, 0.0) < 0.7
-                  AND NOT EXISTS (
-                      SELECT 1 FROM review_cards rc WHERE rc.sense_id = ws.id
-                  )
-                ORDER BY
-                    CASE
-                        WHEN COALESCE(uks.recognition_evidence_count, 0) > 0 THEN 0
-                        ELSE 1
-                    END,
-                    COALESCE(uks.recognition_score, 0.0),
-                    ws.frequency_rank,
-                    ws.normalized_lemma,
-                    ws.id
-                LIMIT ?
-                """,
-                (effective_new_limit,),
-            ).fetchall()
+            if collection_id:
+                candidates = connection.execute(
+                    """
+                    SELECT ws.*, wsc.collection_id,
+                           wsc.priority_rank AS collection_rank,
+                           wsc.sense_rank AS collection_sense_rank
+                    FROM word_senses ws
+                    JOIN word_sense_collections wsc ON wsc.sense_id = ws.id
+                    LEFT JOIN user_knowledge_states uks ON uks.sense_id = ws.id
+                    WHERE wsc.collection_id = ?
+                      AND COALESCE(uks.recognition_score, 0.0) < 0.7
+                      AND NOT EXISTS (
+                          SELECT 1 FROM review_cards rc WHERE rc.sense_id = ws.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM word_senses earlier_ws
+                          JOIN word_sense_collections earlier_wsc
+                            ON earlier_wsc.sense_id = earlier_ws.id
+                          LEFT JOIN user_knowledge_states earlier_uks
+                            ON earlier_uks.sense_id = earlier_ws.id
+                          WHERE earlier_wsc.collection_id = wsc.collection_id
+                            AND earlier_ws.normalized_lemma = ws.normalized_lemma
+                            AND COALESCE(earlier_uks.recognition_score, 0.0) < 0.7
+                            AND NOT EXISTS (
+                                SELECT 1 FROM review_cards earlier_rc
+                                WHERE earlier_rc.sense_id = earlier_ws.id
+                            )
+                            AND (
+                                earlier_wsc.priority_rank < wsc.priority_rank
+                                OR (
+                                    earlier_wsc.priority_rank = wsc.priority_rank
+                                    AND earlier_wsc.sense_rank < wsc.sense_rank
+                                )
+                                OR (
+                                    earlier_wsc.priority_rank = wsc.priority_rank
+                                    AND earlier_wsc.sense_rank = wsc.sense_rank
+                                    AND earlier_ws.id < ws.id
+                                )
+                            )
+                      )
+                    ORDER BY
+                        CASE
+                            WHEN COALESCE(uks.recognition_evidence_count, 0) > 0 THEN 0
+                            ELSE 1
+                        END,
+                        COALESCE(uks.recognition_score, 0.0),
+                        wsc.priority_rank,
+                        wsc.sense_rank,
+                        ws.normalized_lemma,
+                        ws.id
+                    LIMIT ?
+                    """,
+                    (collection_id, effective_new_limit),
+                ).fetchall()
+            else:
+                candidates = connection.execute(
+                    """
+                    SELECT ws.* FROM word_senses ws
+                    LEFT JOIN user_knowledge_states uks ON uks.sense_id = ws.id
+                    WHERE ws.frequency_rank IS NOT NULL
+                      AND COALESCE(uks.recognition_score, 0.0) < 0.7
+                      AND NOT EXISTS (
+                          SELECT 1 FROM review_cards rc WHERE rc.sense_id = ws.id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM word_senses earlier_ws
+                          LEFT JOIN user_knowledge_states earlier_uks
+                            ON earlier_uks.sense_id = earlier_ws.id
+                          WHERE earlier_ws.normalized_lemma = ws.normalized_lemma
+                            AND earlier_ws.frequency_rank IS NOT NULL
+                            AND COALESCE(earlier_uks.recognition_score, 0.0) < 0.7
+                            AND NOT EXISTS (
+                                SELECT 1 FROM review_cards earlier_rc
+                                WHERE earlier_rc.sense_id = earlier_ws.id
+                            )
+                            AND (
+                                earlier_ws.frequency_rank < ws.frequency_rank
+                                OR (
+                                    earlier_ws.frequency_rank = ws.frequency_rank
+                                    AND earlier_ws.id < ws.id
+                                )
+                            )
+                      )
+                    ORDER BY
+                        CASE
+                            WHEN COALESCE(uks.recognition_evidence_count, 0) > 0 THEN 0
+                            ELSE 1
+                        END,
+                        COALESCE(uks.recognition_score, 0.0),
+                        CASE
+                            WHEN EXISTS (
+                                SELECT 1
+                                FROM word_sense_collections ordering_wsc
+                                JOIN vocabulary_collections ordering_vc
+                                  ON ordering_vc.id = ordering_wsc.collection_id
+                                WHERE ordering_wsc.sense_id = ws.id
+                                  AND ordering_vc.kind = 'general'
+                            ) THEN 0
+                            WHEN NOT EXISTS (
+                                SELECT 1 FROM word_sense_collections ordering_wsc
+                                WHERE ordering_wsc.sense_id = ws.id
+                            ) THEN 1
+                            ELSE 2
+                        END,
+                        ws.frequency_rank,
+                        ws.normalized_lemma,
+                        ws.id
+                    LIMIT ?
+                    """,
+                    (effective_new_limit,),
+                ).fetchall()
 
             new_items = []
             for row in candidates:
@@ -344,6 +572,8 @@ class LearningService:
             "review_limit": review_limit,
             "requested_new_limit": new_limit,
             "effective_new_limit": effective_new_limit,
+            "collection_id": collection_id,
+            "collection_selection": collection_selection,
             "reviews": [self._card_dict(row) for row in due_rows],
             "new_items": new_items,
         }
@@ -459,6 +689,15 @@ class LearningService:
                 FROM user_knowledge_states
                 """
             ).fetchone()
+            collections = connection.execute(
+                """
+                SELECT vc.id, vc.title, vc.kind, COUNT(wsc.sense_id) AS sense_count
+                FROM vocabulary_collections vc
+                LEFT JOIN word_sense_collections wsc ON wsc.collection_id = vc.id
+                GROUP BY vc.id, vc.title, vc.kind
+                ORDER BY vc.kind, vc.id
+                """
+            ).fetchall()
         return {
             "vocabulary_senses": vocabulary,
             "assessed_senses": assessed,
@@ -467,7 +706,32 @@ class LearningService:
             "mean_recognition": round(float(states["recognition"]), 4),
             "mean_recall": round(float(states["recall"]), 4),
             "mean_production": round(float(states["production"]), 4),
+            "collections": [dict(row) for row in collections],
         }
+
+    @staticmethod
+    def _resolve_collection_id(
+        connection: sqlite3.Connection,
+        collection_id: str | None,
+    ) -> tuple[str | None, str]:
+        if collection_id:
+            if not connection.execute(
+                "SELECT 1 FROM vocabulary_collections WHERE id = ?",
+                (collection_id,),
+            ).fetchone():
+                raise ValueError(f"unknown collection_id: {collection_id}")
+            return collection_id, "explicit"
+        general = connection.execute(
+            """
+            SELECT id FROM vocabulary_collections
+            WHERE kind = 'general'
+            ORDER BY id
+            LIMIT 1
+            """
+        ).fetchone()
+        if general:
+            return str(general["id"]), "auto_general"
+        return None, "unfiltered"
 
     @staticmethod
     def _schedule(step: int, rating: str) -> tuple[int, int, str]:
@@ -554,7 +818,7 @@ class LearningService:
 
     @staticmethod
     def _sense_dict(row: sqlite3.Row) -> dict:
-        return {
+        result = {
             "sense_id": row["id"],
             "lemma": row["lemma"],
             "part_of_speech": row["part_of_speech"],
@@ -564,6 +828,11 @@ class LearningService:
             "source": row["source"],
             "source_sense_id": row["source_sense_id"],
         }
+        if "collection_id" in row.keys():
+            result["collection_id"] = row["collection_id"]
+            result["collection_rank"] = row["collection_rank"]
+            result["collection_sense_rank"] = row["collection_sense_rank"]
+        return result
 
     @staticmethod
     def _card_dict(row: sqlite3.Row) -> dict:

@@ -14,6 +14,7 @@ frequency-band assessment
   -> cloze and short-sentence production with revision
   -> daily plan delivery and weekly evidence summary
   -> versioned TOEFL 2026 Reading/Writing practice planning
+  -> reproducible general and academic vocabulary collections
   -> immutable learning evidence
   -> deterministic scheduling
   -> weekly progress data
@@ -42,6 +43,7 @@ Included:
 - profile-local daily automation and read-only weekly reporting;
 - versioned TOEFL 2026 rules, deterministic practice-band calculation, and
   bounded Reading/Writing practice plans;
+- reproducible OEWN-based general and academic candidate collection builds;
 - JSON CLI responses suitable for Hermes skills and cron jobs.
 
 Deferred:
@@ -184,6 +186,28 @@ minute budget and explicitly reports that it is not an adaptive simulation or
 official score prediction. Listening, Speaking, adaptive routing, and actual
 prompt generation remain deferred.
 
+### Phase 6: vocabulary data pipeline
+
+Build compact general-English and academic-English collections without
+committing large upstream datasets to Hermes.
+
+Status: complete. The builder consumes the official OEWN JSON and WNDB archives
+plus an explicit ranked lemma list, filters malformed/non-lexical entries,
+selects stable source senses using `index.sense`, and emits deterministic JSONL
+with a SHA-256 manifest. Academic inputs may retain POS and have independent
+priority ranks. SQLite stores collection membership separately from word-sense
+identity, so a sense can belong to general and academic collections without
+duplication or frequency overwrite. Assessment and daily planning can filter by
+collection, while due reviews remain global. A daily plan introduces at most
+one new sense per lemma. Unqualified assessment and planning automatically
+select an installed general collection, preserving the vocabulary-first default;
+academic new items require an explicit collection choice.
+
+The output is deliberately a candidate library. Lemma-level academic lists do
+not prove which concrete sense is academic, and OEWN sense order is not treated
+as contextual disambiguation. Reading encounters and explicit confirmation
+remain the authority for activating a sense.
+
 ## Verification
 
 - Unit tests cover schema constraints, import identity, assessment bands,
@@ -198,8 +222,9 @@ prompt generation remain deferred.
 
 ## Next decision gates
 
-Before rolling Phase 2 out for daily use, choose the first vocabulary source and
-validate its import quality on at least 500 common word senses; fixture-backed
-development of the deterministic reading path does not waive that data-quality
-gate. Before FSRS adoption, collect enough real review history to compare the
-new scheduler against the deterministic MVP baseline.
+Before daily rollout, build the first general collection and manually audit at
+least 500 candidate senses for definition usefulness, modernity and appropriate
+sense order. Then audit a stratified academic sample across several disciplines;
+the deterministic builder does not waive this data-quality gate. Before FSRS
+adoption, collect enough real review history to compare the new scheduler
+against the deterministic MVP baseline.

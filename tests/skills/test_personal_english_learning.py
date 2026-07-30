@@ -6,6 +6,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,6 +24,7 @@ CLI_PATH = SCRIPTS_DIR / "english_learning.py"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from learning_core import (
+    CollectionSpec,
     ExamService,
     LearningDatabase,
     LearningService,
@@ -30,6 +32,9 @@ from learning_core import (
     ReadingService,
     ReportService,
     VocabularyEntry,
+    VocabularyBuilder,
+    frequency_rank_map,
+    load_ranked_lemmas,
 )
 from learning_core.reading import lemma_candidates
 from tools.blueprints import blueprint_to_job_spec, parse_blueprint
@@ -57,6 +62,55 @@ def entry(rank: int, *, source_sense_id: str | None = None) -> VocabularyEntry:
 
 def seed(service: LearningService, ranks: list[int]) -> list[str]:
     return [service.upsert_vocabulary(entry(rank), now=NOW)["sense_id"] for rank in ranks]
+
+
+def _wordnet_fixture(path: Path) -> Path:
+    entries = {
+        "address": {
+            "n": {
+                "sense": [
+                    {"id": "address%1:10:00::", "synset": "address-n-1"},
+                    {"id": "address%1:10:01::", "synset": "address-n-2"},
+                ]
+            },
+            "v": {
+                "sense": [
+                    {"id": "address%2:32:00::", "synset": "address-v-1"}
+                ]
+            },
+        },
+        "derive": {
+            "v": {
+                "sense": [{"id": "derive%2:40:00::", "synset": "derive-v-1"}]
+            }
+        },
+    }
+    noun_synsets = {
+        "address-n-1": {"definition": ["the place where something is located"]},
+        "address-n-2": {"definition": ["a formal spoken communication"]},
+    }
+    verb_synsets = {
+        "address-v-1": {"definition": ["to deal with a problem"]},
+        "derive-v-1": {"definition": ["to obtain something from a source"]},
+    }
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("entries-a.json", json.dumps(entries))
+        archive.writestr("noun.communication.json", json.dumps(noun_synsets))
+        archive.writestr("verb.communication.json", json.dumps(verb_synsets))
+        archive.writestr("frames.json", "{}")
+        archive.writestr(
+            "index.sense",
+            "\n".join(
+                (
+                    "address%1:10:00:: 00000001 1 4",
+                    "address%1:10:01:: 00000002 2 0",
+                    "address%2:32:00:: 00000003 1 3",
+                    "derive%2:40:00:: 00000004 1 2",
+                )
+            )
+            + "\n",
+        )
+    return path
 
 
 def test_import_is_source_idempotent_and_preserves_provenance(
@@ -596,6 +650,10 @@ def test_schema_v2_migrates_production_columns_and_preserves_evidence(
         columns = {
             row["name"] for row in migrated.execute("PRAGMA table_info(user_knowledge_states)")
         }
+        membership_columns = {
+            row["name"]
+            for row in migrated.execute("PRAGMA table_info(word_sense_collections)")
+        }
         evidence = migrated.execute("SELECT * FROM knowledge_evidence").fetchall()
         migrated.execute(
             """
@@ -606,6 +664,7 @@ def test_schema_v2_migrates_production_columns_and_preserves_evidence(
             """
         )
     assert {"production_score", "production_evidence_count"} <= columns
+    assert {"collection_id", "priority_rank", "sense_rank"} <= membership_columns
     assert len(evidence) == 1
     assert evidence[0]["id"] == "evidence"
 
@@ -691,6 +750,200 @@ def test_skill_blueprint_is_daily_profile_local_terminal_automation() -> None:
     job = blueprint_to_job_spec(spec)
     assert job["skills"] == ["personal-english-learning"]
     assert job["enabled_toolsets"] == ["terminal"]
+
+
+def test_general_vocabulary_builder_is_deterministic_and_round_robins_pos(
+    tmp_path: Path,
+) -> None:
+    wordnet = _wordnet_fixture(tmp_path / "oewn-2025.zip")
+    frequency = tmp_path / "frequency.csv"
+    frequency.write_text(
+        "rank,lemma\n1,the\n2,address\n3,derive\n4,123\n",
+        encoding="utf-8",
+    )
+    ranked = load_ranked_lemmas(frequency)
+    output = tmp_path / "general.jsonl"
+    builder = VocabularyBuilder(wordnet)
+    collection = CollectionSpec(
+        "general-core-test",
+        "General Core Test",
+        "general",
+        "fixture-frequency",
+        "1",
+        "test-only",
+    )
+
+    first = builder.build(
+        ranked,
+        output,
+        collection,
+        frequency_ranks=frequency_rank_map(ranked),
+        lemma_limit=2,
+        max_senses_per_lemma=2,
+        ranked_source_path=frequency,
+        frequency_source_path=frequency,
+    )
+    first_output = output.read_bytes()
+    first_manifest = Path(first["manifest"]).read_bytes()
+    repeated = builder.build(
+        ranked,
+        output,
+        collection,
+        frequency_ranks=frequency_rank_map(ranked),
+        lemma_limit=2,
+        max_senses_per_lemma=2,
+        force=True,
+        ranked_source_path=frequency,
+        frequency_source_path=frequency,
+    )
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+
+    assert output.read_bytes() == first_output
+    assert Path(repeated["manifest"]).read_bytes() == first_manifest
+    assert first["selected_lemmas"] == 2
+    assert first["sense_entries"] == 3
+    assert first["unmatched_lemmas"] == ["the"]
+    assert [(row["lemma"], row["part_of_speech"]) for row in rows] == [
+        ("address", "noun"),
+        ("address", "verb"),
+        ("derive", "verb"),
+    ]
+    assert {row["source"] for row in rows} == {"oewn-2025"}
+    assert [row["frequency_rank"] for row in rows] == [2, 2, 3]
+    assert [row["collection"]["rank"] for row in rows] == [2, 2, 3]
+
+    service = LearningService(LearningDatabase(tmp_path / "general.db"))
+    service.import_jsonl(output)
+    plan = service.daily_plan(
+        new_limit=3,
+        review_limit=0,
+        now=NOW,
+    )
+    assert plan["collection_id"] == "general-core-test"
+    assert plan["collection_selection"] == "auto_general"
+    assert [item["lemma"] for item in plan["new_items"]] == ["address", "derive"]
+    assert [item["collection_sense_rank"] for item in plan["new_items"]] == [1, 1]
+
+
+def test_academic_collection_reuses_senses_and_preserves_general_frequency(
+    tmp_path: Path,
+) -> None:
+    wordnet = _wordnet_fixture(tmp_path / "oewn-2025.zip")
+    frequency = tmp_path / "frequency.csv"
+    frequency.write_text("rank,lemma\n10,address\n20,derive\n", encoding="utf-8")
+    academic = tmp_path / "academic.csv"
+    academic.write_text(
+        "lemma,academic_rank,pos\naddress,1,verb\nderive,2,verb\n",
+        encoding="utf-8",
+    )
+    general_output = tmp_path / "general.jsonl"
+    academic_output = tmp_path / "academic.jsonl"
+    builder = VocabularyBuilder(wordnet)
+    frequency_items = load_ranked_lemmas(frequency)
+    builder.build(
+        frequency_items,
+        general_output,
+        CollectionSpec("general", "General", "general", "fixture", "1", "test"),
+        frequency_ranks=frequency_rank_map(frequency_items),
+        lemma_limit=2,
+        max_senses_per_lemma=2,
+    )
+    builder.build(
+        load_ranked_lemmas(academic),
+        academic_output,
+        CollectionSpec("academic", "Academic", "academic", "fixture", "1", "test"),
+        lemma_limit=2,
+        max_senses_per_lemma=1,
+    )
+    service = LearningService(LearningDatabase(tmp_path / "learning.db"))
+
+    service.import_jsonl(general_output)
+    service.import_jsonl(academic_output)
+
+    with service.database.connect() as connection:
+        senses = connection.execute(
+            "SELECT lemma, part_of_speech, frequency_rank FROM word_senses"
+        ).fetchall()
+        memberships = connection.execute(
+            "SELECT collection_id, priority_rank FROM word_sense_collections"
+        ).fetchall()
+    assert len(senses) == 3
+    assert next(
+        row["frequency_rank"]
+        for row in senses
+        if row["lemma"] == "address" and row["part_of_speech"] == "verb"
+    ) == 10
+    assert len(memberships) == 5
+    assert {row["collection_id"] for row in memberships} == {"general", "academic"}
+
+    sample = service.assessment_sample(
+        per_band=5,
+        bands=((1, 10),),
+        collection_id="academic",
+        seed=2,
+    )
+    assert {item["lemma"] for item in sample["items"]} == {"address", "derive"}
+    assert {item["collection_rank"] for item in sample["items"]} == {1, 2}
+    plan = service.daily_plan(
+        new_limit=2,
+        review_limit=0,
+        collection_id="academic",
+        now=NOW,
+    )
+    assert [item["lemma"] for item in plan["new_items"]] == ["address", "derive"]
+    assert [item["collection_rank"] for item in plan["new_items"]] == [1, 2]
+    assert [item["kind"] for item in service.stats()["collections"]] == [
+        "academic",
+        "general",
+    ]
+
+
+def test_vocabulary_builder_cli_creates_importable_general_collection(
+    tmp_path: Path,
+) -> None:
+    wordnet = _wordnet_fixture(tmp_path / "oewn-2025.zip")
+    frequency = tmp_path / "frequency.tsv"
+    frequency.write_text("rank\tword\n1\taddress\n2\tderive\n", encoding="utf-8")
+    output = tmp_path / "built.jsonl"
+    database = tmp_path / "learning.db"
+
+    built = subprocess.run(
+        [
+            sys.executable,
+            str(CLI_PATH),
+            "vocabulary-build-general",
+            "--wordnet-zip",
+            str(wordnet),
+            "--sense-index-zip",
+            str(wordnet),
+            "--frequency-list",
+            str(frequency),
+            "--output",
+            str(output),
+            "--limit",
+            "2",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    imported = subprocess.run(
+        [
+            sys.executable,
+            str(CLI_PATH),
+            "--db",
+            str(database),
+            "import-jsonl",
+            str(output),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(built.stdout)["selected_lemmas"] == 2
+    assert json.loads(imported.stdout)["created"] == 3
+    assert output.with_suffix(".jsonl.manifest.json").is_file()
 
 
 def test_toefl_2026_profile_preserves_version_sources_and_task_contract() -> None:

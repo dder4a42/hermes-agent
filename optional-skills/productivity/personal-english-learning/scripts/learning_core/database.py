@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 
 KNOWLEDGE_EVIDENCE_TABLE = """
@@ -47,6 +47,25 @@ CREATE TABLE IF NOT EXISTS word_senses (
 
 CREATE INDEX IF NOT EXISTS idx_word_senses_frequency
     ON word_senses(frequency_rank, normalized_lemma);
+
+CREATE TABLE IF NOT EXISTS vocabulary_collections (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('general', 'academic', 'custom')),
+    source TEXT NOT NULL,
+    version TEXT NOT NULL,
+    license TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS word_sense_collections (
+    sense_id TEXT NOT NULL REFERENCES word_senses(id) ON DELETE CASCADE,
+    collection_id TEXT NOT NULL REFERENCES vocabulary_collections(id) ON DELETE CASCADE,
+    priority_rank INTEGER NOT NULL CHECK (priority_rank > 0),
+    sense_rank INTEGER NOT NULL DEFAULT 1 CHECK (sense_rank > 0),
+    source_lemma TEXT NOT NULL,
+    PRIMARY KEY (sense_id, collection_id)
+);
 
 CREATE TABLE IF NOT EXISTS user_knowledge_states (
     sense_id TEXT PRIMARY KEY REFERENCES word_senses(id) ON DELETE CASCADE,
@@ -223,6 +242,7 @@ class LearningDatabase:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             self._migrate_v3(connection)
+            self._migrate_v4(connection)
             connection.execute(
                 """
                 INSERT INTO metadata(key, value) VALUES ('schema_version', ?)
@@ -280,3 +300,40 @@ class LearningDatabase:
             """
         )
         connection.execute("DROP TABLE knowledge_evidence_v2")
+
+    @staticmethod
+    def _migrate_v4(connection: sqlite3.Connection) -> None:
+        """Add deterministic within-lemma collection ordering."""
+
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(word_sense_collections)"
+            ).fetchall()
+        }
+        if "sense_rank" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE word_sense_collections
+                ADD COLUMN sense_rank INTEGER NOT NULL DEFAULT 1
+                    CHECK (sense_rank > 0)
+                """
+            )
+        index = connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'index' AND name = 'idx_word_sense_collections_rank'
+            """
+        ).fetchone()
+        if not index or "sense_rank" not in (index["sql"] or ""):
+            connection.execute(
+                "DROP INDEX IF EXISTS idx_word_sense_collections_rank"
+            )
+            connection.execute(
+                """
+                CREATE INDEX idx_word_sense_collections_rank
+                ON word_sense_collections(
+                    collection_id, priority_rank, sense_rank, sense_id
+                )
+                """
+            )
