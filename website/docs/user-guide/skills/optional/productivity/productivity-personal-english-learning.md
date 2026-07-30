@@ -286,6 +286,45 @@ python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_
 Never overwrite the original answer. A failed production attempt may create a
 recall card, but it does not directly rewrite an existing review schedule.
 
+### 9. Run daily and weekly automation
+
+This skill declares a daily 08:00 automation blueprint. Installing the skill
+only creates a Hermes suggestion; it never schedules a job without user
+acceptance. Review and accept it through `/suggestions`, or create an equivalent
+profile-local cron job explicitly.
+
+The daily run must:
+
+1. Call `daily-plan --new-limit 8 --review-limit 30` exactly once.
+2. Present returned reviews before new items.
+3. Respect `effective_new_limit`; never compensate with extra conversational
+   vocabulary.
+4. On Monday in the configured profile timezone, also call:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  weekly-report --days 7
+```
+
+The weekly report is an evidence summary, not a grading model. It contains
+assessment responses, review ratings, reading encounters, production outcomes,
+revision counts, cards created, current mastery projections, and current review
+backlog. It does not infer completion rate because the MVP does not persist a
+daily-plan assignment ledger.
+
+Automation rules:
+
+- Use only the active profile's `HERMES_HOME`; never pass another profile's
+  database path.
+- Never run SQL directly from a cron prompt.
+- Retry a state-changing command only with its original idempotency key.
+- `weekly-report` is read-only with respect to learning events and may be
+  safely retried.
+- If the database or CLI fails, deliver one concise error with the failing
+  command and stop; do not fabricate a plan or report.
+- Return `[SILENT]` only when there are no due reviews, no new items, and no
+  Monday report to deliver.
+
 ## Teaching Style for a Basic Learner
 
 - Keep the initial daily load at five to ten new senses.
@@ -323,6 +362,10 @@ recall card, but it does not directly rewrite an existing review schedule.
    provide one focused hint, and link the learner's revision.
 8. Letting the model invent a numeric production score. Submit only the fixed
    outcome enum; the backend owns its deterministic evidence value.
+9. Scheduling on skill installation. A blueprint is a suggestion; require user
+   acceptance before Hermes creates the cron job.
+10. Computing weekly progress from chat memory. Always call the read-only report
+    command so the summary reflects SQLite evidence.
 
 ## Verification Checklist
 
@@ -335,3 +378,5 @@ recall card, but it does not directly rewrite an existing review schedule.
 - [ ] Ambiguous reading matches were confirmed before entering the learning set
 - [ ] Open production answers used a fixed outcome and retained the original text
 - [ ] Revisions linked to the original attempt instead of replacing it
+- [ ] Automation used the active profile and respected the returned plan limits
+- [ ] Weekly summaries came from `weekly-report`, not conversational memory

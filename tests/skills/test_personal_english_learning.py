@@ -27,9 +27,11 @@ from learning_core import (
     LearningService,
     ProductionService,
     ReadingService,
+    ReportService,
     VocabularyEntry,
 )
 from learning_core.reading import lemma_candidates
+from tools.blueprints import blueprint_to_job_spec, parse_blueprint
 
 
 NOW = datetime(2026, 7, 30, 8, 0, tzinfo=timezone.utc)
@@ -607,6 +609,89 @@ def test_schema_v2_migrates_production_columns_and_preserves_evidence(
     assert evidence[0]["id"] == "evidence"
 
 
+def test_weekly_report_aggregates_events_without_creating_learning_rows(
+    service: LearningService,
+) -> None:
+    document_id, sense_id = _accepted_reading(service)
+    production = ProductionService(service.database)
+    exercises = production.plan_for_document(document_id, now=NOW)["exercises"]
+    cloze = next(item for item in exercises if item["exercise_type"] == "cloze")
+    production.submit_attempt(
+        cloze["exercise_id"], "wrong", None, "weekly-wrong", now=NOW
+    )
+    card = service.daily_plan(new_limit=0, review_limit=10, now=NOW)["reviews"][0]
+    service.record_review(card["card_id"], "good", "weekly-review", now=NOW)
+
+    with service.database.connect() as connection:
+        before = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "assessment_events",
+                "review_events",
+                "encounters",
+                "production_attempts",
+            )
+        }
+    report = ReportService(service.database).weekly_report(
+        days=7, now=NOW + timedelta(days=1)
+    )
+    with service.database.connect() as connection:
+        after = {
+            table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in before
+        }
+
+    assert after == before
+    assert report["reviews"]["attempts"] == 1
+    assert report["reviews"]["ratings"]["good"] == 1
+    assert report["reading"]["documents"] == 1
+    assert report["reading"]["encounters"] == 2
+    assert report["reading"]["encountered_senses"] == 1
+    assert report["production"]["attempts"] == 1
+    assert report["production"]["outcomes"]["incorrect"] == 1
+    assert report["current_state"]["vocabulary_senses"] == 1
+    assert report["current_state"]["due_reviews"] >= 1
+    assert sense_id
+
+
+def test_empty_weekly_report_has_stable_zero_categories(
+    service: LearningService,
+) -> None:
+    report = ReportService(service.database).weekly_report(days=7, now=NOW)
+
+    assert report["assessment"]["responses"] == {
+        "known": 0,
+        "unsure": 0,
+        "unknown": 0,
+    }
+    assert report["reviews"]["ratings"] == {
+        "again": 0,
+        "hard": 0,
+        "good": 0,
+        "easy": 0,
+    }
+    assert report["production"]["outcomes"] == {
+        "incorrect": 0,
+        "partial": 0,
+        "correct": 0,
+    }
+
+
+def test_skill_blueprint_is_daily_profile_local_terminal_automation() -> None:
+    spec = parse_blueprint((SKILL_DIR / "SKILL.md").read_text(encoding="utf-8"))
+
+    assert spec is not None
+    assert spec.skill_name == "personal-english-learning"
+    assert spec.schedule == "0 8 * * *"
+    assert spec.deliver == "origin"
+    assert spec.enabled_toolsets == ["terminal"]
+    assert "daily-plan" in spec.prompt
+    assert "weekly-report --days 7" in spec.prompt
+    job = blueprint_to_job_spec(spec)
+    assert job["skills"] == ["personal-english-learning"]
+    assert job["enabled_toolsets"] == ["terminal"]
+
+
 def test_cli_real_sqlite_end_to_end(tmp_path: Path) -> None:
     database = tmp_path / "profile" / "learning.db"
     vocabulary = tmp_path / "words.jsonl"
@@ -711,6 +796,7 @@ def test_cli_real_sqlite_end_to_end(tmp_path: Path) -> None:
         "e2e-production",
     )
     stats = invoke("stats")
+    weekly = invoke("weekly-report", "--days", "7")
 
     assert imported["created"] == 4
     assert sampled["count"] == 4
@@ -722,4 +808,6 @@ def test_cli_real_sqlite_end_to_end(tmp_path: Path) -> None:
     assert stats["vocabulary_senses"] == 5
     assert stats["assessed_senses"] == 1
     assert stats["mean_production"] > 0
+    assert weekly["reading"]["documents"] == 1
+    assert weekly["production"]["outcomes"]["correct"] == 1
     assert database.exists()

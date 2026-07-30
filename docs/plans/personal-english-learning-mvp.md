@@ -12,6 +12,7 @@ frequency-band assessment
   -> recognition and recall reviews
   -> graded short-text coverage and target confirmation
   -> cloze and short-sentence production with revision
+  -> daily plan delivery and weekly evidence summary
   -> immutable learning evidence
   -> deterministic scheduling
   -> weekly progress data
@@ -37,6 +38,7 @@ Included:
 - immutable review and assessment events;
 - deterministic short-text coverage and target-sense confirmation;
 - lightweight production exercises and revision-linked evidence;
+- profile-local daily automation and read-only weekly reporting;
 - JSON CLI responses suitable for Hermes skills and cron jobs.
 
 Deferred:
@@ -158,6 +160,12 @@ is projected separately from recognition and recall.
 
 Add daily and weekly cron blueprints after the CLI is stable. Cron prompts call
 the skill; they never edit SQLite directly.
+
+Status: complete. The skill exposes one daily 08:00 blueprint suggestion. Its
+Monday run also requests the read-only seven-day report, avoiding a second
+scheduler surface. Installation never silently schedules the job; the user must
+accept the standard Hermes suggestion. Automation is profile-local and uses
+only the terminal toolset.
 
 ### Phase 5: TOEFL 2026
 

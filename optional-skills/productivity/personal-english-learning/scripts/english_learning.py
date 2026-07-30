@@ -15,6 +15,7 @@ from learning_core import (
     LearningService,
     ProductionService,
     ReadingService,
+    ReportService,
     VocabularyEntry,
 )
 
@@ -102,6 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--revision-of-attempt-id")
     submit.add_argument("--idempotency-key", required=True)
 
+    weekly = commands.add_parser(
+        "weekly-report", help="Aggregate recent learning activity without mutation"
+    )
+    weekly.add_argument("--days", type=int, default=7)
+
     commands.add_parser("stats", help="Show learning progress statistics")
     return parser
 
@@ -184,6 +190,8 @@ def run(args: argparse.Namespace) -> dict:
             feedback=args.feedback,
             revision_of_attempt_id=args.revision_of_attempt_id,
         )
+    if args.command == "weekly-report":
+        return ReportService(service.database).weekly_report(days=args.days)
     if args.command == "stats":
         return service.stats()
     raise AssertionError(f"unhandled command: {args.command}")
