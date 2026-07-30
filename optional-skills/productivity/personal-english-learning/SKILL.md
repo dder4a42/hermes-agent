@@ -239,7 +239,7 @@ background job for that concrete sense, while vocabulary search requires an
 explicit `生成构词与词源` click to prevent a broad query from spending many model
 calls. The queue has one worker, so lexical generation never blocks loading the
 daily plan. Successful and terminal (`opaque`, `ambiguous`, `not_found`) results
-are cached in SQLite; malformed output gets one schema-repair attempt and is
+are cached in SQLite; malformed output gets at most two schema-repair attempts and is
 otherwise shown as a retryable failure without writing partial data.
 The JSON file must contain one object like:
 

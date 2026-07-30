@@ -84,23 +84,28 @@ class LexicalInferenceService:
             "word_family": current["word_family"],
             "requested_analysis_types": missing,
         }
-        raw_response = self.generator(request)
-        try:
-            analyses = self._validate_response(raw_response, missing)
-        except ValueError as first_error:
-            repair_request = {
-                **request,
-                "repair": {
-                    "validation_error": str(first_error),
-                    "previous_response": raw_response,
-                    "instruction": (
-                        "Return a corrected JSON object only. Preserve sound analysis, "
-                        "but make every status, content object, field, and requested type "
-                        "conform exactly to the original schema."
-                    ),
-                },
-            }
-            analyses = self._validate_response(self.generator(repair_request), missing)
+        generation_request = request
+        for attempt in range(3):
+            raw_response = self.generator(generation_request)
+            try:
+                analyses = self._validate_response(raw_response, missing)
+                break
+            except ValueError as validation_error:
+                if attempt == 2:
+                    raise
+                generation_request = {
+                    **request,
+                    "repair": {
+                        "attempt": attempt + 1,
+                        "validation_error": str(validation_error),
+                        "previous_response": raw_response,
+                        "instruction": (
+                            "Return a corrected JSON object only. Preserve sound analysis, "
+                            "but make every status, content object, field, and requested "
+                            "type conform exactly to the original schema."
+                        ),
+                    },
+                }
         generator_name = getattr(self.generator, "name", "callable")
         model_name = getattr(self.generator, "model_name", generator_name)
         for analysis in analyses:
