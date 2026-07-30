@@ -35,6 +35,7 @@ from learning_core import (
     PronunciationService,
     ProductionService,
     ReadingService,
+    ReadingTutorService,
     ReportService,
     VocabularyEntry,
     VocabularyBuilder,
@@ -553,7 +554,7 @@ def test_production_plan_is_idempotent_and_uses_original_context(
     first = production.plan_for_document(document_id, now=NOW)
     repeated = production.plan_for_document(document_id, now=NOW)
 
-    assert first == repeated
+    assert {**first, "cached": None} == {**repeated, "cached": None}
     assert first["count"] == 2
     assert {item["exercise_type"] for item in first["exercises"]} == {
         "cloze",
@@ -1019,6 +1020,121 @@ def test_learning_web_is_session_gated_and_host_restricted(tmp_path: Path) -> No
     assert hostile_host.status_code == 400
     assert sampled.status_code == 200
     assert sampled.json()["count"] == 4
+
+
+def test_reading_tutor_uses_profile_targets_and_caches_generation(
+    service: LearningService,
+) -> None:
+    target = service.upsert_vocabulary(
+        VocabularyEntry(
+            "evidence",
+            "noun",
+            "information that supports a conclusion",
+            "证据",
+            700,
+            "fixture",
+            "evidence.n",
+        ),
+        now=NOW,
+    )["sense_id"]
+    service.record_assessment(
+        target, "unknown", "1-1000", event_id="evidence-gap", now=NOW
+    )
+    calls: list[dict] = []
+
+    def generate(payload: dict) -> dict:
+        calls.append(payload)
+        assert payload["learner"]["target_items"][0]["lemma"] == "evidence"
+        return {
+            "title": "How evidence changes a model",
+            "passage": "A useful model changes when new evidence challenges it.",
+            "level": "B1",
+            "why_this_passage": "练习 evidence，并识别因果关系。",
+            "target_lemmas": ["evidence"],
+            "questions": [
+                {
+                    "id": "q1",
+                    "type": "main_idea",
+                    "prompt": "What is the main idea?",
+                    "answer": "Models should respond to evidence.",
+                }
+            ],
+            "writing_prompt": "Summarize the passage in one sentence.",
+        }
+
+    tutor = ReadingTutorService(service.database, generator=generate)
+    first = tutor.today(level="B1", minutes=10, topic="science", now=NOW)
+    repeated = tutor.today(level="B1", minutes=10, topic="science", now=NOW)
+
+    assert {**first, "cached": None} == {**repeated, "cached": None}
+    assert len(calls) == 1
+    assert first["source_mode"] == "source_adapted"
+    assert first["target_items"][0]["sense_id"] == target
+    assert first["source"]["url"].startswith("https://")
+    assert first["cached"] is False
+    assert repeated["cached"] is True
+
+
+def test_reading_tutor_falls_back_to_curated_seed_when_generation_fails(
+    service: LearningService,
+) -> None:
+    def fail(_payload: dict) -> dict:
+        raise RuntimeError("model unavailable")
+
+    result = ReadingTutorService(service.database, generator=fail).today(
+        level="B1", minutes=10, topic="science", now=NOW
+    )
+
+    assert result["source_mode"] == "curated_seed"
+    assert result["generation_status"] == "fallback"
+    assert len(result["passage"].split()) >= 80
+    assert result["questions"]
+    assert "model unavailable" not in json.dumps(result)
+
+
+def test_learning_web_serves_proactive_reading_and_distinct_review_front_style(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "learning.db"
+    generated = {
+        "title": "A short lesson",
+        "passage": "Careful readers compare a claim with its evidence.",
+        "level": "B1",
+        "why_this_passage": "练习学术阅读中的证据判断。",
+        "target_lemmas": [],
+        "questions": [
+            {
+                "id": "q1",
+                "type": "main_idea",
+                "prompt": "What do careful readers compare?",
+                "answer": "A claim and its evidence.",
+            }
+        ],
+        "writing_prompt": "Write one sentence about the passage.",
+    }
+    app = create_app(
+        database,
+        session_token="test-session-token",
+        reading_generator=lambda _payload: generated,
+    )
+
+    async def exercise_app():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1",
+            headers={SESSION_HEADER: "test-session-token"},
+        ) as client:
+            return await client.get("/"), await client.post(
+                "/api/reading/today",
+                json={"level": "B1", "minutes": 10, "topic": "science"},
+            )
+
+    page, reading = asyncio.run(exercise_app())
+
+    assert reading.status_code == 200
+    assert reading.json()["source_mode"] == "source_adapted"
+    assert 'data-view="reading"' in page.text
+    assert 'id="review-front" class="review-front' in page.text
 
 
 def test_learning_web_refuses_public_bind_without_touching_database(

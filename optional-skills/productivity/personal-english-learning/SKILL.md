@@ -106,9 +106,16 @@ ssh -NT \
 
 Open `http://127.0.0.1:9121`. The page supports collection selection, baseline
 assessment, today's deterministic review plan, card grading, vocabulary search,
-and the seven-day report. It uses an in-memory session token injected into the
-page and rejects non-loopback Host headers. The token is not a substitute for
-TLS and must not be used to expose the service directly to the public Internet.
+proactive private-tutor reading, and the seven-day report. The Reading Tutor
+selects a bundled, source-attributed seed from OpenStax, MIT OpenCourseWare, or
+NCBI Bookshelf, adds current low-recognition senses to the teaching brief, and
+asks the configured Hermes model for a level-adjusted lesson. The result is
+cached in the profile-local SQLite database. If model generation is unavailable
+or invalid, the UI serves the curated seed instead of failing the session.
+
+The page uses an in-memory session token injected into the page and rejects
+non-loopback Host headers. The token is not a substitute for TLS and must not be
+used to expose the service directly to the public Internet.
 
 ### 2. Import vocabulary
 
@@ -366,6 +373,27 @@ Describe recognition and recall separately. Do not interpret the values as an
 official vocabulary size, CEFR level, or TOEFL score.
 
 ### 7. Analyze a short reading
+
+For daily practice, prefer the web interface's Reading Tutor when the learner
+has not supplied a text. It distinguishes these provenance modes:
+
+- `source_adapted`: the configured Hermes model adapted a selected source seed;
+- `tutor_generated`: reserved for a fully synthetic private-tutor scenario;
+- `curated_seed`: the bundled teaching passage was served without model changes.
+
+Treat all bundled seed passages as independently written teaching summaries,
+not quotations from the linked source. The linked source is the factual anchor.
+The model may adjust vocabulary, syntax, length, questions, and writing tasks,
+but it must not replace source metadata or claim that generated wording is an
+original quotation. A repeated request with the same date, level, duration,
+topic, collection, target senses, and prompt version restores the cached lesson.
+
+Use 5 or 10 minutes at A2/B1 initially. Move toward B2 material after the learner
+can complete the short summary without creating an unmanageable vocabulary
+backlog. The browser stores the current draft locally; it is not yet submitted
+as production evidence in this MVP slice.
+
+When the learner provides their own text, use the deterministic analyzer below.
 
 Analyze pasted text or a UTF-8 text file:
 

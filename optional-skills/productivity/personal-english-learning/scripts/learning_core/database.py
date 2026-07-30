@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = "6"
+SCHEMA_VERSION = "7"
 
 
 KNOWLEDGE_EVIDENCE_TABLE = """
@@ -334,6 +334,26 @@ CREATE INDEX IF NOT EXISTS idx_lexical_analyses_lookup
         normalized_form, part_of_speech, source_sense_id,
         analysis_type, source_level, confidence
     );
+
+CREATE TABLE IF NOT EXISTS reading_tutor_sessions (
+    id TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL UNIQUE,
+    seed_id TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    source_mode TEXT NOT NULL CHECK (
+        source_mode IN ('curated_seed', 'source_adapted', 'tutor_generated')
+    ),
+    generation_status TEXT NOT NULL CHECK (
+        generation_status IN ('generated', 'fallback')
+    ),
+    generator_name TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_reading_tutor_sessions_created
+    ON reading_tutor_sessions(created_at, seed_id);
 """
 
 

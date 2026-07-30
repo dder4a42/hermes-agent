@@ -1,6 +1,6 @@
 const sessionToken = document.querySelector('meta[name="learning-session"]').content;
 const headers = {"Content-Type": "application/json", "X-Learning-Session": sessionToken};
-const titles = {home: "今日学习", assessment: "基础评估", review: "词汇复习", vocabulary: "词库查询", progress: "学习进度"};
+const titles = {home: "今日学习", assessment: "基础评估", review: "词汇复习", reading: "阅读私教", vocabulary: "词库查询", progress: "学习进度"};
 let collections = [];
 let assessmentItems = [];
 let assessmentIndex = 0;
@@ -13,12 +13,13 @@ let reviewSubmitting = false;
 
 async function api(path, options = {}) {
   const controller = new AbortController();
-  const timeout = window.setTimeout(() => controller.abort(), 15000);
+  const {timeoutMs = 15000, ...fetchOptions} = options;
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
   let response;
   try {
-    response = await fetch(path, {...options, signal: controller.signal, headers: {...headers, ...(options.headers || {})}});
+    response = await fetch(path, {...fetchOptions, signal: controller.signal, headers: {...headers, ...(fetchOptions.headers || {})}});
   } catch (error) {
-    if (error.name === "AbortError") throw new Error("请求超时，请稍后重试。今日计划不会被重复创建。");
+    if (error.name === "AbortError") throw new Error("请求超时，请稍后重试；已生成的内容会从缓存恢复。");
     throw new Error("连接失败，请检查 SSH 隧道和服务器状态。");
   } finally {
     window.clearTimeout(timeout);
@@ -177,7 +178,10 @@ function renderReview() {
   document.querySelector("#review-type").textContent = recall ? "主动回忆" : "词义识别";
   document.querySelector("#review-progress").textContent = `${reviewIndex + 1} / ${reviewItems.length}`;
   document.querySelector("#review-prompt-label").textContent = recall ? "根据释义回忆英文词" : "回忆这个词的常见含义";
-  document.querySelector("#review-front").textContent = recall ? item.definition_en : item.lemma;
+  const front = document.querySelector("#review-front");
+  front.textContent = recall ? item.definition_en : item.lemma;
+  front.classList.toggle("word-front", !recall);
+  front.classList.toggle("sentence-front", recall);
   document.querySelector("#review-pronunciation").innerHTML = recall ? "" : pronunciationHtml(item);
   document.querySelector("#review-answer-main").textContent = recall ? item.lemma : item.definition_en;
   document.querySelector("#review-answer-pronunciation").innerHTML = pronunciationHtml(item);
@@ -225,6 +229,72 @@ async function searchVocabulary(event) {
   }));
 }
 
+async function prepareReading(event) {
+  event.preventDefault();
+  const button = document.querySelector("#reading-generate");
+  const original = button.textContent;
+  button.disabled = true; button.textContent = "私教正在备课…";
+  try {
+    const data = await api("/api/reading/today", {
+      method: "POST",
+      timeoutMs: 100000,
+      body: JSON.stringify({
+        level: document.querySelector("#reading-level").value,
+        minutes: Number(document.querySelector("#reading-minutes").value),
+        topic: document.querySelector("#reading-topic").value,
+        collection_id: selectedCollection(),
+      }),
+    });
+    renderReading(data);
+    if (data.generation_status === "fallback") notify("模型暂时不可用，已载入经过筛选的原始教练材料。", "info");
+    else if (data.cached) notify("已恢复今天生成的阅读课。", "success");
+    else notify("今天的个性化阅读已准备好。", "success");
+  } finally {
+    button.disabled = false; button.textContent = original;
+  }
+}
+
+function renderReading(lesson) {
+  document.querySelector("#reading-empty").hidden = true;
+  document.querySelector("#reading-lesson").hidden = false;
+  document.querySelector("#reading-title").textContent = lesson.title;
+  document.querySelector("#reading-why").textContent = lesson.why_this_passage;
+  const modeLabels = {tutor_generated: "AI 私教改写", source_adapted: "来源改写", curated_seed: "精选材料"};
+  document.querySelector("#reading-badges").replaceChildren(...[
+    modeLabels[lesson.source_mode] || lesson.source_mode,
+    lesson.level,
+    `${document.querySelector("#reading-minutes").value} 分钟`,
+  ].map(label => { const node = document.createElement("span"); node.textContent = label; return node; }));
+  const source = document.querySelector("#reading-source");
+  source.textContent = `${lesson.source.publisher} · 查看来源`;
+  source.href = lesson.source.url;
+  const targets = document.querySelector("#reading-targets");
+  targets.replaceChildren(...(lesson.target_items || []).map(item => {
+    const node = document.createElement("span");
+    const meaning = item.definition_zh || item.definition_en;
+    node.textContent = `${item.lemma} · ${meaning}`;
+    return node;
+  }));
+  targets.hidden = !(lesson.target_items || []).length;
+  const passage = document.querySelector("#reading-passage");
+  passage.replaceChildren(...lesson.passage.split(/\n+/).filter(Boolean).map(text => {
+    const paragraph = document.createElement("p"); paragraph.textContent = text; return paragraph;
+  }));
+  document.querySelector("#reading-questions").replaceChildren(...lesson.questions.map((question, index) => {
+    const card = document.createElement("article");
+    const heading = document.createElement("p"); heading.textContent = `${index + 1}. ${question.prompt}`;
+    const button = document.createElement("button"); button.className = "secondary"; button.textContent = "显示参考答案";
+    const answer = document.createElement("p"); answer.className = "question-answer"; answer.textContent = question.answer; answer.hidden = true;
+    button.addEventListener("click", () => { answer.hidden = false; button.hidden = true; });
+    card.append(heading, button, answer); return card;
+  }));
+  document.querySelector("#reading-writing-prompt").textContent = lesson.writing_prompt;
+  const summary = document.querySelector("#reading-summary");
+  const storageKey = `reading-summary:${lesson.lesson_id}`;
+  summary.value = localStorage.getItem(storageKey) || "";
+  summary.oninput = () => localStorage.setItem(storageKey, summary.value);
+}
+
 async function loadProgress() {
   const data = await api("/api/reports/weekly?days=7");
   const cards = [
@@ -244,6 +314,7 @@ document.querySelector("#review-start").addEventListener("click", () => void sta
 document.querySelector("#reveal-answer").addEventListener("click", event => { event.currentTarget.hidden = true; document.querySelector("#review-answer").hidden = false; document.querySelector("#review-ratings").hidden = false; });
 document.querySelectorAll("[data-rating]").forEach(button => button.addEventListener("click", () => void rateReview(button.dataset.rating).catch(error => notify(error.message, "error"))));
 document.querySelector("#search-form").addEventListener("submit", event => void searchVocabulary(event).catch(error => notify(error.message, "error")));
+document.querySelector("#reading-form").addEventListener("submit", event => void prepareReading(event).catch(error => notify(error.message, "error")));
 document.querySelector("#progress-refresh").addEventListener("click", () => void loadProgress().catch(error => notify(error.message, "error")));
 document.querySelector("#pronunciation-mode").addEventListener("change", () => {
   const assessmentItem = assessmentItems[assessmentIndex];

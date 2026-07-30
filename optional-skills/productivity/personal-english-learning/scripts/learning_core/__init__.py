@@ -6,6 +6,7 @@ from .lexical_analysis import LexicalAnalysisService
 from .production import ProductionService
 from .pronunciation import PronunciationService
 from .reading import ReadingService
+from .reading_tutor import HermesReadingGenerator, ReadingTutorService
 from .reports import ReportService
 from .service import LearningService, VocabularyCollection, VocabularyEntry
 from .vocabulary_builder import (
@@ -26,6 +27,8 @@ __all__ = [
     "ProductionService",
     "PronunciationService",
     "ReadingService",
+    "ReadingTutorService",
+    "HermesReadingGenerator",
     "ReportService",
     "VocabularyEntry",
     "CollectionSpec",

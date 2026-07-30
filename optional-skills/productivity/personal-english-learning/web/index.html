@@ -18,6 +18,7 @@
         <button class="nav-item active" data-view="home">今日学习</button>
         <button class="nav-item" data-view="assessment">基础评估</button>
         <button class="nav-item" data-view="review">词汇复习</button>
+        <button class="nav-item" data-view="reading">阅读私教</button>
         <button class="nav-item" data-view="vocabulary">词库查询</button>
         <button class="nav-item" data-view="progress">学习进度</button>
       </nav>
@@ -61,6 +62,9 @@
             <button class="secondary" data-go="assessment">开始基础评估</button></article>
           <article class="panel"><p class="eyebrow">COLLECTIONS</p><h3>已安装词库</h3>
             <div id="collection-summary" class="collection-summary"></div></article>
+          <article class="panel"><p class="eyebrow">READING TUTOR</p><h3>由私教准备今天的短文</h3>
+            <p>从可靠材料出发，结合当前薄弱词义调整遣词、句法与理解任务。</p>
+            <button class="secondary" data-go="reading">选择阅读目标</button></article>
         </div>
       </section>
 
@@ -87,7 +91,7 @@
         <div id="review-empty" class="empty-state">尚未载入任务。载入操作会创建最多 8 张新卡。</div>
         <article id="review-card" class="study-card" hidden>
           <div class="card-meta"><span id="review-type"></span><span id="review-progress"></span></div>
-          <p id="review-prompt-label" class="prompt-label"></p><h2 id="review-front"></h2>
+          <p id="review-prompt-label" class="prompt-label"></p><h2 id="review-front" class="review-front word-front"></h2>
           <p id="review-pronunciation" class="pronunciation"></p>
           <button id="reveal-answer" class="secondary wide">显示答案</button>
           <div id="review-answer" class="answer" hidden><p id="review-answer-main"></p><div id="review-answer-pronunciation" class="pronunciation"></div><small id="review-answer-extra"></small><div id="review-lexical-analysis"></div></div>
@@ -95,6 +99,27 @@
             <button data-rating="again">Again</button><button data-rating="hard">Hard</button>
             <button data-rating="good">Good</button><button data-rating="easy">Easy</button>
           </div>
+        </article>
+      </section>
+
+      <section class="view" id="view-reading">
+        <div class="section-intro"><div><h2>阅读私教</h2><p>系统主动选取可靠材料，再根据你的词汇状态调整难度和表达。</p></div></div>
+        <form id="reading-form" class="reading-controls panel">
+          <label>目标难度<select id="reading-level"><option>A2</option><option selected>B1</option><option>B2</option><option>C1</option></select></label>
+          <label>学习时间<select id="reading-minutes"><option value="5">5 分钟</option><option value="10" selected>10 分钟</option><option value="15">15 分钟</option><option value="30">30 分钟</option></select></label>
+          <label>主题<select id="reading-topic"><option value="science">科学思维</option><option value="computing">计算与系统</option><option value="health">健康研究</option></select></label>
+          <button id="reading-generate" class="primary">准备今天的阅读</button>
+        </form>
+        <div id="reading-empty" class="empty-state">不需要粘贴文章。选择目标后，私教会准备一篇来源清楚的短文。</div>
+        <article id="reading-lesson" class="reading-lesson" hidden>
+          <header class="reading-heading">
+            <div><div id="reading-badges" class="lesson-badges"></div><h2 id="reading-title"></h2><p id="reading-why"></p></div>
+            <a id="reading-source" target="_blank" rel="noopener noreferrer">查看事实来源</a>
+          </header>
+          <div id="reading-targets" class="reading-targets"></div>
+          <div id="reading-passage" class="reading-passage"></div>
+          <section class="reading-questions"><h3>理解检查</h3><div id="reading-questions"></div></section>
+          <section class="writing-task"><h3>阅读后输出</h3><p id="reading-writing-prompt"></p><textarea id="reading-summary" rows="5" placeholder="先自行完成摘要或回应；当前版本保存在浏览器中。"></textarea></section>
         </article>
       </section>
 

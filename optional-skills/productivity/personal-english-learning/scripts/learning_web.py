@@ -10,6 +10,7 @@ import secrets
 import sqlite3
 import sys
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -17,7 +18,13 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from learning_core import LearningDatabase, LearningService, ReportService
+from learning_core import (
+    HermesReadingGenerator,
+    LearningDatabase,
+    LearningService,
+    ReadingTutorService,
+    ReportService,
+)
 
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -64,13 +71,25 @@ class ReviewRequest(BaseModel):
     answer_text: str | None = None
 
 
+class ReadingTodayRequest(BaseModel):
+    level: str = Field(default="B1", pattern="^(A2|B1|B2|C1)$")
+    minutes: int = Field(default=10)
+    topic: str = Field(default="science", min_length=1, max_length=40)
+    collection_id: str | None = None
+
+
 def create_app(
     database_path: str | Path | None = None,
     *,
     session_token: str | None = None,
+    reading_generator: Callable[[dict], dict] | None = None,
 ) -> FastAPI:
     database = LearningDatabase(database_path or default_database_path())
     service = LearningService(database)
+    tutor = ReadingTutorService(
+        database,
+        generator=reading_generator or HermesReadingGenerator(),
+    )
     token = session_token or secrets.token_urlsafe(32)
     app = FastAPI(
         title="Personal English Learning",
@@ -79,6 +98,7 @@ def create_app(
         openapi_url=None,
     )
     app.state.learning_service = service
+    app.state.reading_tutor_service = tutor
     app.state.session_token = token
 
     @app.middleware("http")
@@ -186,6 +206,18 @@ def create_app(
                 q, collection_id=collection_id, limit=limit
             ),
         }
+
+    @app.post("/api/reading/today")
+    async def reading_today(body: ReadingTodayRequest) -> dict:
+        # This is a loopback-only, single-user service. Generation is bounded by
+        # the runner timeout, and identical requests return from SQLite cache.
+        result = tutor.today(
+            level=body.level,
+            minutes=body.minutes,
+            topic=body.topic,
+            collection_id=body.collection_id,
+        )
+        return {"ok": True, **result}
 
     app.mount("/assets", StaticFiles(directory=WEB_DIR), name="learning-assets")
     return app
