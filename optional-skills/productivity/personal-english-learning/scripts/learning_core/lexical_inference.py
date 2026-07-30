@@ -213,6 +213,14 @@ class LexicalInferenceService:
                 _validate_segments(content)
             if analysis_type == "historical_etymology" and status == "available":
                 if not str(content.get("summary_zh", "")).strip():
+                    summary = str(
+                        content.get("semantic_evolution_zh")
+                        or content.get("semantic_evolution")
+                        or explanation
+                    ).strip()
+                    if summary:
+                        content["summary_zh"] = summary
+                if not str(content.get("summary_zh", "")).strip():
                     raise ValueError("etymology needs a Chinese summary")
             seen.add(analysis_type)
             clean.append(

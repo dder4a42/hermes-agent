@@ -1150,6 +1150,37 @@ def test_lexical_inference_normalizes_bounded_schema_variants(
     assert all(not value for value in result["lexical_analysis"]["needs_inference"].values())
 
 
+def test_etymology_semantic_evolution_can_supply_summary(
+    service: LearningService,
+) -> None:
+    sense_id = service.upsert_vocabulary(
+        VocabularyEntry("inspect", "verb", "examine carefully", "检查", 1200,
+                        "fixture", "inspect.summary"),
+        now=NOW,
+    )["sense_id"]
+
+    def generate(_payload: dict) -> dict:
+        return {"analyses": [
+            {"analysis_type": "historical_etymology", "status": "available",
+             "content": {"language_origin": "Latin",
+                         "semantic_evolution_zh": "由查看发展为仔细检查。"},
+             "explanation_zh": "历史来源不等于现代完整词义。", "confidence": 0.9},
+            {"analysis_type": "modern_morphology", "status": "opaque",
+             "content": {"summary_zh": "不强行拆分。"},
+             "explanation_zh": "整体记忆。", "confidence": 0.9},
+        ]}
+
+    result = LexicalInferenceService(
+        service.database, generator=generate
+    ).analyze_sense(sense_id)
+
+    etymology = next(
+        item for item in result["lexical_analysis"]["analyses"]
+        if item["analysis_type"] == "historical_etymology"
+    )
+    assert etymology["content"]["summary_zh"] == "由查看发展为仔细检查。"
+
+
 def test_learning_web_runs_lexical_inference_as_background_job(tmp_path: Path) -> None:
     database = tmp_path / "learning.db"
     service = LearningService(LearningDatabase(database))
