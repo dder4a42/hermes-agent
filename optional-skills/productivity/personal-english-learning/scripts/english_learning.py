@@ -10,7 +10,13 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from learning_core import LearningDatabase, LearningService, ReadingService, VocabularyEntry
+from learning_core import (
+    LearningDatabase,
+    LearningService,
+    ProductionService,
+    ReadingService,
+    VocabularyEntry,
+)
 
 
 def default_database_path() -> Path:
@@ -80,6 +86,22 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SENSE_ID=accepted|rejected",
     )
 
+    production = commands.add_parser(
+        "production-plan", help="Generate cloze and short-sentence exercises"
+    )
+    production.add_argument("--document-id", required=True)
+    production.add_argument("--limit", type=int, default=6)
+
+    submit = commands.add_parser(
+        "production-submit", help="Record a production answer or revision"
+    )
+    submit.add_argument("--exercise-id", required=True)
+    submit.add_argument("--answer-text", required=True)
+    submit.add_argument("--outcome", choices=("correct", "partial", "incorrect"))
+    submit.add_argument("--feedback")
+    submit.add_argument("--revision-of-attempt-id")
+    submit.add_argument("--idempotency-key", required=True)
+
     commands.add_parser("stats", help="Show learning progress statistics")
     return parser
 
@@ -148,6 +170,19 @@ def run(args: argparse.Namespace) -> dict:
             decisions.append({"sense_id": sense_id, "status": status})
         return ReadingService(service.database).confirm_targets(
             args.document_id, decisions
+        )
+    if args.command == "production-plan":
+        return ProductionService(service.database).plan_for_document(
+            args.document_id, limit=args.limit
+        )
+    if args.command == "production-submit":
+        return ProductionService(service.database).submit_attempt(
+            args.exercise_id,
+            args.answer_text,
+            args.outcome,
+            args.idempotency_key,
+            feedback=args.feedback,
+            revision_of_attempt_id=args.revision_of_attempt_id,
         )
     if args.command == "stats":
         return service.stats()

@@ -6,7 +6,21 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
+
+
+KNOWLEDGE_EVIDENCE_TABLE = """
+CREATE TABLE knowledge_evidence (
+    id TEXT PRIMARY KEY,
+    sense_id TEXT NOT NULL REFERENCES word_senses(id) ON DELETE CASCADE,
+    dimension TEXT NOT NULL CHECK (dimension IN ('recognition', 'recall', 'production')),
+    value REAL NOT NULL CHECK (value BETWEEN 0.0 AND 1.0),
+    evidence_type TEXT NOT NULL,
+    source_event_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (dimension, evidence_type, source_event_id)
+)
+"""
 
 
 SCHEMA = """
@@ -40,8 +54,11 @@ CREATE TABLE IF NOT EXISTS user_knowledge_states (
         CHECK (recognition_score BETWEEN 0.0 AND 1.0),
     recall_score REAL NOT NULL DEFAULT 0.0
         CHECK (recall_score BETWEEN 0.0 AND 1.0),
+    production_score REAL NOT NULL DEFAULT 0.0
+        CHECK (production_score BETWEEN 0.0 AND 1.0),
     recognition_evidence_count INTEGER NOT NULL DEFAULT 0,
     recall_evidence_count INTEGER NOT NULL DEFAULT 0,
+    production_evidence_count INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
 
@@ -59,7 +76,7 @@ CREATE INDEX IF NOT EXISTS idx_assessment_events_sense
 CREATE TABLE IF NOT EXISTS knowledge_evidence (
     id TEXT PRIMARY KEY,
     sense_id TEXT NOT NULL REFERENCES word_senses(id) ON DELETE CASCADE,
-    dimension TEXT NOT NULL CHECK (dimension IN ('recognition', 'recall')),
+    dimension TEXT NOT NULL CHECK (dimension IN ('recognition', 'recall', 'production')),
     value REAL NOT NULL CHECK (value BETWEEN 0.0 AND 1.0),
     evidence_type TEXT NOT NULL,
     source_event_id TEXT NOT NULL,
@@ -155,6 +172,35 @@ CREATE TABLE IF NOT EXISTS encounters (
 
 CREATE INDEX IF NOT EXISTS idx_encounters_sense
     ON encounters(sense_id, created_at);
+
+CREATE TABLE IF NOT EXISTS production_exercises (
+    id TEXT PRIMARY KEY,
+    sense_id TEXT NOT NULL REFERENCES word_senses(id) ON DELETE CASCADE,
+    document_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
+    source_token_id TEXT REFERENCES document_tokens(id) ON DELETE SET NULL,
+    exercise_type TEXT NOT NULL CHECK (exercise_type IN ('cloze', 'sentence')),
+    prompt TEXT NOT NULL,
+    expected_answer TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (sense_id, document_id, source_token_id, exercise_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_production_exercises_document
+    ON production_exercises(document_id, exercise_type);
+
+CREATE TABLE IF NOT EXISTS production_attempts (
+    id TEXT PRIMARY KEY,
+    exercise_id TEXT NOT NULL REFERENCES production_exercises(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    answer_text TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('correct', 'partial', 'incorrect')),
+    feedback TEXT,
+    revision_of_attempt_id TEXT REFERENCES production_attempts(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_production_attempts_exercise
+    ON production_attempts(exercise_id, created_at);
 """
 
 
@@ -176,6 +222,7 @@ class LearningDatabase:
     def initialize(self) -> None:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
+            self._migrate_v3(connection)
             connection.execute(
                 """
                 INSERT INTO metadata(key, value) VALUES ('schema_version', ?)
@@ -183,3 +230,53 @@ class LearningDatabase:
                 """,
                 (SCHEMA_VERSION,),
             )
+
+    @staticmethod
+    def _migrate_v3(connection: sqlite3.Connection) -> None:
+        """Add production projections while preserving v1/v2 event history."""
+
+        state_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(user_knowledge_states)"
+            ).fetchall()
+        }
+        if "production_score" not in state_columns:
+            connection.execute(
+                """
+                ALTER TABLE user_knowledge_states
+                ADD COLUMN production_score REAL NOT NULL DEFAULT 0.0
+                    CHECK (production_score BETWEEN 0.0 AND 1.0)
+                """
+            )
+        if "production_evidence_count" not in state_columns:
+            connection.execute(
+                """
+                ALTER TABLE user_knowledge_states
+                ADD COLUMN production_evidence_count INTEGER NOT NULL DEFAULT 0
+                """
+            )
+
+        evidence_sql_row = connection.execute(
+            """
+            SELECT sql FROM sqlite_master
+            WHERE type = 'table' AND name = 'knowledge_evidence'
+            """
+        ).fetchone()
+        evidence_sql = evidence_sql_row["sql"] if evidence_sql_row else ""
+        if "'production'" in evidence_sql:
+            return
+        connection.execute(
+            "ALTER TABLE knowledge_evidence RENAME TO knowledge_evidence_v2"
+        )
+        connection.execute(KNOWLEDGE_EVIDENCE_TABLE)
+        connection.execute(
+            """
+            INSERT INTO knowledge_evidence(
+                id, sense_id, dimension, value, evidence_type, source_event_id, created_at
+            )
+            SELECT id, sense_id, dimension, value, evidence_type, source_event_id, created_at
+            FROM knowledge_evidence_v2
+            """
+        )
+        connection.execute("DROP TABLE knowledge_evidence_v2")

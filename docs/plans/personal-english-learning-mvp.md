@@ -11,6 +11,7 @@ frequency-band assessment
   -> daily new word senses
   -> recognition and recall reviews
   -> graded short-text coverage and target confirmation
+  -> cloze and short-sentence production with revision
   -> immutable learning evidence
   -> deterministic scheduling
   -> weekly progress data
@@ -35,6 +36,7 @@ Included:
 - daily review and new-item capacity limits;
 - immutable review and assessment events;
 - deterministic short-text coverage and target-sense confirmation;
+- lightweight production exercises and revision-linked evidence;
 - JSON CLI responses suitable for Hermes skills and cron jobs.
 
 Deferred:
@@ -145,6 +147,12 @@ pretend that spelling alone is contextual disambiguation.
 
 Add sentence completion, short sentence production, error evidence, and
 production projections. Do not start with long summaries.
+
+Status: complete. Accepted reading targets generate one source-grounded cloze
+and one short-sentence prompt. Cloze answers can be graded exactly; open
+sentences require a structured `correct`, `partial`, or `incorrect` judgment.
+Attempts are immutable, revisions link to the original attempt, and production
+is projected separately from recognition and recall.
 
 ### Phase 4: automation
 

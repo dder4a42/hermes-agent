@@ -34,6 +34,7 @@ Use this skill when the user asks to:
 - record whether a word is known, uncertain, or unknown;
 - inspect vocabulary-learning progress;
 - create a small daily English vocabulary plan.
+- practice target words through contextual gaps and short original sentences.
 
 Do not use it for general translation, complete essay generation, or an
 official TOEFL score prediction.
@@ -206,6 +207,69 @@ An accepted target creates source-linked encounters and, when needed, one
 recognition card. Repeating the same confirmation is safe and does not duplicate
 encounters or cards.
 
+### 8. Practice lightweight production
+
+Generate exercises only after the learner has accepted reading targets:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  production-plan --document-id DOCUMENT_ID --limit 6
+```
+
+The plan produces:
+
+- `cloze`: an original reading sentence with the target surface replaced by
+  `____`;
+- `sentence`: a request for one short original sentence using the concrete
+  target meaning.
+
+Present one exercise at a time. Do not show `expected_answer` before a cloze
+answer. For cloze exercises, omit `--outcome`; the CLI performs an exact,
+case-insensitive check:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  production-submit \
+  --exercise-id EXERCISE_ID \
+  --answer-text "agent" \
+  --idempotency-key UNIQUE_ATTEMPT_ID
+```
+
+For a short sentence, classify the answer using exactly one outcome:
+
+- `correct`: target sense and sentence grammar are both acceptable;
+- `partial`: target sense is understandable but grammar, collocation, or form
+  needs a material correction;
+- `incorrect`: wrong sense, unusable construction, or no meaningful attempt.
+
+Give one concise, actionable feedback point and record it:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  production-submit \
+  --exercise-id EXERCISE_ID \
+  --answer-text "The agent work automatically." \
+  --outcome partial \
+  --feedback "Use third-person singular: works." \
+  --idempotency-key UNIQUE_ATTEMPT_ID
+```
+
+For `partial` or `incorrect`, ask the learner to revise before showing a model
+answer. Record the revision as a new immutable attempt linked to the first:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  production-submit \
+  --exercise-id EXERCISE_ID \
+  --answer-text "The agent works automatically." \
+  --outcome correct \
+  --revision-of-attempt-id ORIGINAL_ATTEMPT_ID \
+  --idempotency-key UNIQUE_REVISION_ID
+```
+
+Never overwrite the original answer. A failed production attempt may create a
+recall card, but it does not directly rewrite an existing review schedule.
+
 ## Teaching Style for a Basic Learner
 
 - Keep the initial daily load at five to ten new senses.
@@ -239,6 +303,10 @@ encounters or cards.
    workload limit.
 6. Treating a spelling match as word-sense disambiguation. Require an explicit
    choice whenever the analysis returns multiple senses.
+7. Replacing the learner's answer with a correction. Save the original attempt,
+   provide one focused hint, and link the learner's revision.
+8. Letting the model invent a numeric production score. Submit only the fixed
+   outcome enum; the backend owns its deterministic evidence value.
 
 ## Verification Checklist
 
@@ -249,3 +317,5 @@ encounters or cards.
 - [ ] One learner answer produced exactly one idempotent review event
 - [ ] Feedback did not claim an official vocabulary, CEFR, or TOEFL score
 - [ ] Ambiguous reading matches were confirmed before entering the learning set
+- [ ] Open production answers used a fixed outcome and retained the original text
+- [ ] Revisions linked to the original attempt instead of replacing it

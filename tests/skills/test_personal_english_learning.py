@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -21,7 +22,13 @@ SCRIPTS_DIR = SKILL_DIR / "scripts"
 CLI_PATH = SCRIPTS_DIR / "english_learning.py"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from learning_core import LearningDatabase, LearningService, ReadingService, VocabularyEntry
+from learning_core import (
+    LearningDatabase,
+    LearningService,
+    ProductionService,
+    ReadingService,
+    VocabularyEntry,
+)
 from learning_core.reading import lemma_candidates
 
 
@@ -391,6 +398,215 @@ def test_reading_confirmation_creates_idempotent_encounters_and_card(
         assert connection.execute("SELECT COUNT(*) FROM review_cards").fetchone()[0] == 1
 
 
+def _accepted_reading(
+    service: LearningService, text: str = "An agent helps another agent."
+) -> tuple[str, str]:
+    sense_id = service.upsert_vocabulary(
+        VocabularyEntry(
+            "agent", "noun", "a system that acts", "智能体", 900, "fixture", "agent.n"
+        ),
+        now=NOW,
+    )["sense_id"]
+    reading = ReadingService(service.database)
+    analysis = reading.analyze_text(text, now=NOW)
+    reading.confirm_targets(
+        analysis["document_id"],
+        [{"sense_id": sense_id, "status": "accepted"}],
+        now=NOW,
+    )
+    return analysis["document_id"], sense_id
+
+
+def test_production_plan_is_idempotent_and_uses_original_context(
+    service: LearningService,
+) -> None:
+    document_id, sense_id = _accepted_reading(service)
+    production = ProductionService(service.database)
+
+    first = production.plan_for_document(document_id, now=NOW)
+    repeated = production.plan_for_document(document_id, now=NOW)
+
+    assert first == repeated
+    assert first["count"] == 2
+    assert {item["exercise_type"] for item in first["exercises"]} == {
+        "cloze",
+        "sentence",
+    }
+    cloze = next(item for item in first["exercises"] if item["exercise_type"] == "cloze")
+    sentence = next(
+        item for item in first["exercises"] if item["exercise_type"] == "sentence"
+    )
+    assert "____" in cloze["prompt"]
+    assert cloze["expected_answer"] == "agent"
+    assert sentence["sense_id"] == sense_id
+    assert "智能体" in sentence["prompt"]
+    with service.database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM production_exercises").fetchone()[0] == 2
+
+
+def test_cloze_attempt_auto_grades_and_revision_updates_production_projection(
+    service: LearningService,
+) -> None:
+    document_id, sense_id = _accepted_reading(service)
+    production = ProductionService(service.database)
+    cloze = next(
+        item
+        for item in production.plan_for_document(document_id, now=NOW)["exercises"]
+        if item["exercise_type"] == "cloze"
+    )
+
+    wrong = production.submit_attempt(
+        cloze["exercise_id"], "agency", None, "cloze-1", now=NOW
+    )
+    revision = production.submit_attempt(
+        cloze["exercise_id"],
+        "agent",
+        None,
+        "cloze-2",
+        revision_of_attempt_id=wrong["attempt_id"],
+        now=NOW + timedelta(minutes=1),
+    )
+    duplicate = production.submit_attempt(
+        cloze["exercise_id"],
+        "agent",
+        None,
+        "cloze-2",
+        revision_of_attempt_id=wrong["attempt_id"],
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert wrong["outcome"] == "incorrect"
+    assert wrong["recall_card_created"] == 1
+    assert revision["outcome"] == "correct"
+    assert revision["revision_of_attempt_id"] == wrong["attempt_id"]
+    assert duplicate["duplicate"] is True
+    with service.database.connect() as connection:
+        state = connection.execute(
+            "SELECT * FROM user_knowledge_states WHERE sense_id = ?", (sense_id,)
+        ).fetchone()
+        attempts = connection.execute("SELECT COUNT(*) FROM production_attempts").fetchone()[0]
+    assert attempts == 2
+    assert state["production_evidence_count"] == 2
+    assert state["production_score"] == pytest.approx(0.45)
+
+
+def test_sentence_attempt_requires_structured_outcome_and_revision_same_exercise(
+    service: LearningService,
+) -> None:
+    document_id, _ = _accepted_reading(service)
+    production = ProductionService(service.database)
+    exercises = production.plan_for_document(document_id, now=NOW)["exercises"]
+    sentence = next(item for item in exercises if item["exercise_type"] == "sentence")
+    cloze = next(item for item in exercises if item["exercise_type"] == "cloze")
+
+    with pytest.raises(ValueError, match="outcome is required"):
+        production.submit_attempt(
+            sentence["exercise_id"], "The agent work.", None, "sentence-missing", now=NOW
+        )
+    with pytest.raises(ValueError, match="feedback is required"):
+        production.submit_attempt(
+            sentence["exercise_id"],
+            "The agent work.",
+            "partial",
+            "sentence-no-feedback",
+            now=NOW,
+        )
+    partial = production.submit_attempt(
+        sentence["exercise_id"],
+        "The agent work.",
+        "partial",
+        "sentence-1",
+        feedback="Use third-person singular: works.",
+        now=NOW,
+    )
+    with pytest.raises(ValueError, match="same exercise"):
+        production.submit_attempt(
+            cloze["exercise_id"],
+            "agent",
+            "correct",
+            "bad-revision",
+            revision_of_attempt_id=partial["attempt_id"],
+            now=NOW,
+        )
+    with pytest.raises(ValueError, match="different attempt"):
+        production.submit_attempt(
+            sentence["exercise_id"],
+            "A different answer.",
+            "correct",
+            "sentence-1",
+            now=NOW,
+        )
+
+
+def test_schema_v2_migrates_production_columns_and_preserves_evidence(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE word_senses (
+            id TEXT PRIMARY KEY, lemma TEXT NOT NULL, normalized_lemma TEXT NOT NULL,
+            part_of_speech TEXT NOT NULL, definition_en TEXT NOT NULL,
+            definition_zh TEXT, frequency_rank INTEGER, source TEXT NOT NULL,
+            source_sense_id TEXT NOT NULL, identity_derived INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            UNIQUE(source, source_sense_id)
+        );
+        CREATE TABLE user_knowledge_states (
+            sense_id TEXT PRIMARY KEY REFERENCES word_senses(id),
+            recognition_score REAL NOT NULL DEFAULT 0.0,
+            recall_score REAL NOT NULL DEFAULT 0.0,
+            recognition_evidence_count INTEGER NOT NULL DEFAULT 0,
+            recall_evidence_count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE knowledge_evidence (
+            id TEXT PRIMARY KEY,
+            sense_id TEXT NOT NULL REFERENCES word_senses(id),
+            dimension TEXT NOT NULL CHECK (dimension IN ('recognition', 'recall')),
+            value REAL NOT NULL,
+            evidence_type TEXT NOT NULL,
+            source_event_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(dimension, evidence_type, source_event_id)
+        );
+        INSERT INTO word_senses VALUES (
+            'sense', 'agent', 'agent', 'noun', 'one that acts', '智能体', 900,
+            'legacy', 'agent.n', 0, '2026-01-01', '2026-01-01'
+        );
+        INSERT INTO user_knowledge_states VALUES (
+            'sense', 0.8, 0.5, 2, 1, '2026-01-01'
+        );
+        INSERT INTO knowledge_evidence VALUES (
+            'evidence', 'sense', 'recognition', 0.8, 'review', 'event', '2026-01-01'
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    database = LearningDatabase(path)
+    database.initialize()
+
+    with database.connect() as migrated:
+        columns = {
+            row["name"] for row in migrated.execute("PRAGMA table_info(user_knowledge_states)")
+        }
+        evidence = migrated.execute("SELECT * FROM knowledge_evidence").fetchall()
+        migrated.execute(
+            """
+            INSERT INTO knowledge_evidence VALUES (
+                'production', 'sense', 'production', 0.9,
+                'production_attempt', 'attempt', '2026-01-02'
+            )
+            """
+        )
+    assert {"production_score", "production_evidence_count"} <= columns
+    assert len(evidence) == 1
+    assert evidence[0]["id"] == "evidence"
+
+
 def test_cli_real_sqlite_end_to_end(tmp_path: Path) -> None:
     database = tmp_path / "profile" / "learning.db"
     vocabulary = tmp_path / "words.jsonl"
@@ -477,6 +693,23 @@ def test_cli_real_sqlite_end_to_end(tmp_path: Path) -> None:
         "--decision",
         f"{added['sense_id']}=accepted",
     )
+    production_plan = invoke(
+        "production-plan", "--document-id", reading["document_id"]
+    )
+    cloze = next(
+        item
+        for item in production_plan["exercises"]
+        if item["exercise_type"] == "cloze"
+    )
+    production_attempt = invoke(
+        "production-submit",
+        "--exercise-id",
+        cloze["exercise_id"],
+        "--answer-text",
+        cloze["expected_answer"],
+        "--idempotency-key",
+        "e2e-production",
+    )
     stats = invoke("stats")
 
     assert imported["created"] == 4
@@ -485,6 +718,8 @@ def test_cli_real_sqlite_end_to_end(tmp_path: Path) -> None:
     assert reviewed["interval_seconds"] > 0
     assert reading["targets"][0]["sense_id"] == added["sense_id"]
     assert confirmed["encounters_created"] == 2
+    assert production_attempt["outcome"] == "correct"
     assert stats["vocabulary_senses"] == 5
     assert stats["assessed_senses"] == 1
+    assert stats["mean_production"] > 0
     assert database.exists()

@@ -450,8 +450,12 @@ class LearningService:
                 """
                 SELECT
                     COUNT(*) AS tracked,
-                    COALESCE(AVG(recognition_score), 0.0) AS recognition,
-                    COALESCE(AVG(recall_score), 0.0) AS recall
+                    COALESCE(AVG(CASE WHEN recognition_evidence_count > 0
+                                      THEN recognition_score END), 0.0) AS recognition,
+                    COALESCE(AVG(CASE WHEN recall_evidence_count > 0
+                                      THEN recall_score END), 0.0) AS recall,
+                    COALESCE(AVG(CASE WHEN production_evidence_count > 0
+                                      THEN production_score END), 0.0) AS production
                 FROM user_knowledge_states
                 """
             ).fetchone()
@@ -462,6 +466,7 @@ class LearningService:
             "due_reviews": due,
             "mean_recognition": round(float(states["recognition"]), 4),
             "mean_recall": round(float(states["recall"]), 4),
+            "mean_production": round(float(states["production"]), 4),
         }
 
     @staticmethod
@@ -501,7 +506,7 @@ class LearningService:
         )
         score_column = f"{dimension}_score"
         count_column = f"{dimension}_evidence_count"
-        if dimension not in {"recognition", "recall"}:
+        if dimension not in {"recognition", "recall", "production"}:
             raise ValueError(f"unsupported dimension: {dimension}")
         connection.execute(
             """
