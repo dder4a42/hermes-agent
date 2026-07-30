@@ -7,6 +7,7 @@ let assessmentIndex = 0;
 let reviewItems = [];
 let reviewIndex = 0;
 let reviewStartedAt = 0;
+let lastSearchItems = [];
 
 async function api(path, options = {}) {
   const response = await fetch(path, {...options, headers: {...headers, ...(options.headers || {})}});
@@ -33,6 +34,16 @@ function showView(name) {
 
 function selectedCollection() { return document.querySelector("#collection-select").value || null; }
 function formatNumber(value) { return new Intl.NumberFormat("zh-CN").format(value || 0); }
+
+function pronunciationHtml(item) {
+  const pronunciation = item?.pronunciations?.[0];
+  if (!pronunciation) return '<span class="pronunciation-missing">暂无发音</span>';
+  const mode = document.querySelector("#pronunciation-mode").value;
+  const parts = [];
+  if (mode !== "respelling" && pronunciation.ipa) parts.push(`<span>US /${escapeHtml(pronunciation.ipa)}/</span>`);
+  if (mode !== "ipa" && pronunciation.respelling) parts.push(`<strong>${escapeHtml(pronunciation.respelling)}</strong>`);
+  return parts.join('<span class="pronunciation-separator">·</span>');
+}
 
 async function loadStats() {
   const data = await api("/api/stats");
@@ -71,6 +82,7 @@ function renderAssessment() {
   const item = assessmentItems[assessmentIndex]; if (!item) return;
   document.querySelector("#assessment-lemma").textContent = item.lemma;
   document.querySelector("#assessment-pos").textContent = item.part_of_speech;
+  document.querySelector("#assessment-pronunciation").innerHTML = pronunciationHtml(item);
   document.querySelector("#assessment-band").textContent = `频率 ${item.frequency_band}`;
   document.querySelector("#assessment-progress").textContent = `${assessmentIndex + 1} / ${assessmentItems.length}`;
 }
@@ -104,7 +116,9 @@ function renderReview() {
   document.querySelector("#review-progress").textContent = `${reviewIndex + 1} / ${reviewItems.length}`;
   document.querySelector("#review-prompt-label").textContent = recall ? "根据释义回忆英文词" : "回忆这个词的常见含义";
   document.querySelector("#review-front").textContent = recall ? item.definition_en : item.lemma;
+  document.querySelector("#review-pronunciation").innerHTML = recall ? "" : pronunciationHtml(item);
   document.querySelector("#review-answer-main").textContent = recall ? item.lemma : item.definition_en;
+  document.querySelector("#review-answer-pronunciation").innerHTML = pronunciationHtml(item);
   document.querySelector("#review-answer-extra").textContent = `${item.part_of_speech} · ${item.definition_zh || "暂无中文释义"}`;
   document.querySelector("#review-answer").hidden = true;
   document.querySelector("#review-ratings").hidden = true;
@@ -130,10 +144,11 @@ async function searchVocabulary(event) {
   const params = new URLSearchParams({q: query, limit: "30"}); if (selectedCollection()) params.set("collection_id", selectedCollection());
   const data = await api(`/api/vocabulary/search?${params}`);
   const container = document.querySelector("#search-results");
+  lastSearchItems = data.items;
   if (!data.items.length) { container.innerHTML = '<div class="empty-state">没有匹配词义。</div>'; return; }
   container.replaceChildren(...data.items.map(item => {
     const card = document.createElement("article"); card.className = "result-card";
-    card.innerHTML = `<div><h3>${escapeHtml(item.lemma)}</h3><span>${escapeHtml(item.part_of_speech)}</span></div><p>${escapeHtml(item.definition_en)}</p><small>识别 ${Math.round(item.recognition_score * 100)}% · 回忆 ${Math.round(item.recall_score * 100)}% · 来源 ${escapeHtml(item.source)}</small>`;
+    card.innerHTML = `<div><h3>${escapeHtml(item.lemma)}</h3><span>${escapeHtml(item.part_of_speech)}</span></div><div class="result-pronunciation pronunciation">${pronunciationHtml(item)}</div><p>${escapeHtml(item.definition_en)}</p><small>识别 ${Math.round(item.recognition_score * 100)}% · 回忆 ${Math.round(item.recall_score * 100)}% · 来源 ${escapeHtml(item.source)}</small>`;
     return card;
   }));
 }
@@ -158,6 +173,16 @@ document.querySelector("#reveal-answer").addEventListener("click", event => { ev
 document.querySelectorAll("[data-rating]").forEach(button => button.addEventListener("click", () => void rateReview(button.dataset.rating).catch(error => notify(error.message, "error"))));
 document.querySelector("#search-form").addEventListener("submit", event => void searchVocabulary(event).catch(error => notify(error.message, "error")));
 document.querySelector("#progress-refresh").addEventListener("click", () => void loadProgress().catch(error => notify(error.message, "error")));
+document.querySelector("#pronunciation-mode").addEventListener("change", () => {
+  const assessmentItem = assessmentItems[assessmentIndex];
+  if (assessmentItem) document.querySelector("#assessment-pronunciation").innerHTML = pronunciationHtml(assessmentItem);
+  const reviewItem = reviewItems[reviewIndex];
+  if (reviewItem) {
+    document.querySelector("#review-pronunciation").innerHTML = reviewItem.card_type === "recall" ? "" : pronunciationHtml(reviewItem);
+    document.querySelector("#review-answer-pronunciation").innerHTML = pronunciationHtml(reviewItem);
+  }
+  if (lastSearchItems.length) document.querySelector("#search-form").requestSubmit();
+});
 document.addEventListener("keydown", event => {
   if (!document.querySelector("#view-assessment").classList.contains("active")) return;
   const map = {"1": "unknown", "2": "unsure", "3": "known"}; if (map[event.key]) void answerAssessment(map[event.key]).catch(error => notify(error.message, "error"));

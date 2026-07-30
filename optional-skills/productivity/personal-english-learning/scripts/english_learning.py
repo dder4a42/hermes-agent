@@ -15,6 +15,7 @@ from learning_core import (
     ExamService,
     LearningDatabase,
     LearningService,
+    PronunciationService,
     ProductionService,
     ReadingService,
     ReportService,
@@ -60,6 +61,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     import_parser = commands.add_parser("import-jsonl", help="Import word senses")
     import_parser.add_argument("path", type=Path)
+
+    pronunciation_import = commands.add_parser(
+        "pronunciations-import-cmudict",
+        help="Import US pronunciations for vocabulary lemmas from CMUdict",
+    )
+    pronunciation_import.add_argument("path", type=Path)
+    pronunciation_import.add_argument("--source-version", default="cmudict-current")
+    pronunciation_import.add_argument(
+        "--source-license", default="CMUdict permissive license"
+    )
+
+    pronunciation_lookup = commands.add_parser(
+        "pronunciation-lookup", help="Look up stored pronunciations"
+    )
+    pronunciation_lookup.add_argument("word")
+    pronunciation_lookup.add_argument("--part-of-speech")
+    pronunciation_lookup.add_argument("--dialect", default="en-US")
 
     add = commands.add_parser("add-sense", help="Add or update one word sense")
     add.add_argument("--lemma", required=True)
@@ -239,6 +257,19 @@ def run(args: argparse.Namespace) -> dict:
         return {"ok": True, "database": str(args.db)}
     if args.command == "import-jsonl":
         return service.import_jsonl(args.path)
+    if args.command == "pronunciations-import-cmudict":
+        return PronunciationService(service.database).import_cmudict(
+            args.path,
+            source_version=args.source_version,
+            source_license=args.source_license,
+        )
+    if args.command == "pronunciation-lookup":
+        pronunciations = PronunciationService(service.database).lookup(
+            args.word,
+            part_of_speech=args.part_of_speech,
+            dialect=args.dialect,
+        )
+        return {"word": args.word, "count": len(pronunciations), "items": pronunciations}
     if args.command == "add-sense":
         return service.upsert_vocabulary(
             VocabularyEntry(

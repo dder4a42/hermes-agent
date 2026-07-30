@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .database import LearningDatabase
+from .pronunciation import PronunciationService
 
 
 ASSESSMENT_VALUES = {"known": 0.9, "unsure": 0.45, "unknown": 0.05}
@@ -333,6 +334,7 @@ class LearningService:
                     item = self._sense_dict(row)
                     item["frequency_band"] = f"{lower}-{upper}"
                     samples.append(item)
+        self._attach_pronunciations(samples)
         return {
             "count": len(samples),
             "collection_id": collection_id,
@@ -567,6 +569,9 @@ class LearningService:
                 item.update({"card_id": card_id, "card_type": "recognition"})
                 new_items.append(item)
 
+        review_items = [self._card_dict(row) for row in due_rows]
+        self._attach_pronunciations(review_items)
+        self._attach_pronunciations(new_items)
         return {
             "generated_at": now_text,
             "due_count": due_count,
@@ -575,7 +580,7 @@ class LearningService:
             "effective_new_limit": effective_new_limit,
             "collection_id": collection_id,
             "collection_selection": collection_selection,
-            "reviews": [self._card_dict(row) for row in due_rows],
+            "reviews": review_items,
             "new_items": new_items,
         }
 
@@ -668,6 +673,9 @@ class LearningService:
         now = now or utc_now()
         with self.database.connect() as connection:
             vocabulary = int(connection.execute("SELECT COUNT(*) FROM word_senses").fetchone()[0])
+            pronunciations = int(
+                connection.execute("SELECT COUNT(*) FROM word_pronunciations").fetchone()[0]
+            )
             assessed = int(
                 connection.execute("SELECT COUNT(DISTINCT sense_id) FROM assessment_events").fetchone()[0]
             )
@@ -701,6 +709,7 @@ class LearningService:
             ).fetchall()
         return {
             "vocabulary_senses": vocabulary,
+            "pronunciations": pronunciations,
             "assessed_senses": assessed,
             "tracked_senses": int(states["tracked"]),
             "due_reviews": due,
@@ -772,7 +781,19 @@ class LearningService:
                 production_score=round(float(row["production_score"]), 4),
             )
             items.append(item)
+        self._attach_pronunciations(items)
         return {"query": query, "count": len(items), "items": items}
+
+    def _attach_pronunciations(self, items: list[dict]) -> None:
+        pronunciation_service = PronunciationService(self.database)
+        cache: dict[tuple[str, str | None], list[dict]] = {}
+        for item in items:
+            key = (item["lemma"], item.get("part_of_speech"))
+            if key not in cache:
+                cache[key] = pronunciation_service.lookup(
+                    key[0], part_of_speech=key[1]
+                )
+            item["pronunciations"] = cache[key]
 
     @staticmethod
     def _resolve_collection_id(

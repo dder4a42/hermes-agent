@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 
 KNOWLEDGE_EVIDENCE_TABLE = """
@@ -47,6 +47,29 @@ CREATE TABLE IF NOT EXISTS word_senses (
 
 CREATE INDEX IF NOT EXISTS idx_word_senses_frequency
     ON word_senses(frequency_rank, normalized_lemma);
+
+CREATE TABLE IF NOT EXISTS word_pronunciations (
+    id TEXT PRIMARY KEY,
+    normalized_form TEXT NOT NULL,
+    display_form TEXT NOT NULL,
+    part_of_speech TEXT,
+    dialect TEXT NOT NULL CHECK (dialect IN ('en-US', 'en-GB', 'other')),
+    ipa TEXT,
+    respelling TEXT,
+    arpabet TEXT,
+    stress_pattern TEXT,
+    variant_rank INTEGER NOT NULL DEFAULT 1 CHECK (variant_rank > 0),
+    source TEXT NOT NULL,
+    source_version TEXT NOT NULL,
+    source_license TEXT NOT NULL,
+    source_entry_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (source, source_entry_id),
+    CHECK (ipa IS NOT NULL OR respelling IS NOT NULL OR arpabet IS NOT NULL)
+);
+
+CREATE INDEX IF NOT EXISTS idx_word_pronunciations_lookup
+    ON word_pronunciations(normalized_form, part_of_speech, dialect, variant_rank);
 
 CREATE TABLE IF NOT EXISTS vocabulary_collections (
     id TEXT PRIMARY KEY,

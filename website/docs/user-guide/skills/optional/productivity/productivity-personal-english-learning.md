@@ -190,6 +190,25 @@ One OEWN sense may belong to both collections. The importer stores one sense
 and two memberships; academic rank never overwrites general frequency. A daily
 plan introduces at most one new sense of the same lemma at a time.
 
+Import American pronunciations from a pinned CMUdict `cmudict.dict` file after
+the vocabulary is present. The importer keeps only forms used by the local
+vocabulary, preserves CMU variants, and deterministically derives Unicode IPA,
+stress, and beginner respelling from ARPABET:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  pronunciations-import-cmudict /data/cmudict.dict \
+  --source-version COMMIT_SHA \
+  --source-license "CMUdict unrestricted use; acknowledgement requested"
+```
+
+Verify a result with `pronunciation-lookup derive --part-of-speech verb`.
+Pronunciation belongs to a word form and may have multiple variants; do not
+store it as a property of one WordNet sense. CMUdict is American English and
+does not label part of speech, so POS-specific dictionary IPA may supersede a
+generic CMU variant when such a source is added later. The web UI displays IPA,
+respelling, or both; primary stress is capitalized in respelling.
+
 For a basic learner, draw new items from the general collection first:
 
 ```bash

@@ -30,6 +30,7 @@ from learning_core import (
     ExamService,
     LearningDatabase,
     LearningService,
+    PronunciationService,
     ProductionService,
     ReadingService,
     ReportService,
@@ -39,6 +40,7 @@ from learning_core import (
     load_ranked_lemmas,
 )
 from learning_core.reading import lemma_candidates
+from learning_core.pronunciation import arpabet_to_ipa, arpabet_to_respelling
 from learning_core.vocabulary_builder import normalize_part_of_speech
 from learning_web import SESSION_HEADER, create_app
 from tools.blueprints import blueprint_to_job_spec, parse_blueprint
@@ -783,6 +785,63 @@ def test_vocabulary_search_returns_mastery_and_collection_metadata(
     assert result["items"][0]["lemma"] == "derive"
     assert result["items"][0]["collection_rank"] == 12
     assert result["items"][0]["recognition_score"] == 0.9
+
+
+def test_cmudict_import_adds_ipa_respelling_and_variants(
+    service: LearningService, tmp_path: Path
+) -> None:
+    for lemma, rank in (("derive", 900), ("record", 901)):
+        service.upsert_vocabulary(
+            VocabularyEntry(
+                lemma=lemma,
+                part_of_speech="verb",
+                definition_en=f"definition for {lemma}",
+                definition_zh=None,
+                frequency_rank=rank,
+                source="fixture",
+                source_sense_id=f"{lemma}.v",
+            ),
+            now=NOW,
+        )
+    cmudict = tmp_path / "cmudict.dict"
+    cmudict.write_text(
+        ";;; fixture\n"
+        "derive D IH0 R AY1 V\n"
+        "record R EH1 K ER0 D\n"
+        "record(2) R IH0 K AO1 R D\n"
+        "ignored IH0 G N AO1 R D\n",
+        encoding="utf-8",
+    )
+    pronunciations = PronunciationService(service.database)
+
+    imported = pronunciations.import_cmudict(cmudict, source_version="fixture-1")
+    repeated = pronunciations.import_cmudict(cmudict, source_version="fixture-1")
+    derive = pronunciations.lookup("derive", part_of_speech="verb")
+    record = pronunciations.lookup("record", part_of_speech="verb")
+
+    assert imported == {"created": 3, "updated": 0, "skipped": 1, "errors": []}
+    assert repeated == {"created": 0, "updated": 3, "skipped": 1, "errors": []}
+    assert derive[0]["ipa"] == "dɪˈraɪv"
+    assert derive[0]["respelling"] == "dih-RĪV"
+    assert derive[0]["stress_pattern"] == "01"
+    assert [item["ipa"] for item in record] == ["ˈrɛkɚd", "rɪˈkɔrd"]
+    assert service.stats()["pronunciations"] == 3
+    assert service.search_vocabulary("derive")["items"][0]["pronunciations"] == derive
+
+
+@pytest.mark.parametrize(
+    ("arpabet", "ipa", "respelling"),
+    (
+        ("D IH0 R AY1 V", "dɪˈraɪv", "dih-RĪV"),
+        ("R EH1 K ER0 D", "ˈrɛkɚd", "REH-kerd"),
+        ("IH0 K S T R IY1 M", "ɪkˈstriːm", "ihk-STRĒM"),
+    ),
+)
+def test_arpabet_display_conversion(
+    arpabet: str, ipa: str, respelling: str
+) -> None:
+    assert arpabet_to_ipa(arpabet) == ipa
+    assert arpabet_to_respelling(arpabet) == respelling
 
 
 def test_learning_web_is_session_gated_and_host_restricted(tmp_path: Path) -> None:

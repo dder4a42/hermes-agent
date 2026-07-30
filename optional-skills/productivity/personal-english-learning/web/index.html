@@ -27,9 +27,18 @@
     <main>
       <header class="topbar">
         <div><p class="eyebrow">PERSONAL ENGLISH LEARNING</p><h1 id="page-title">今日学习</h1></div>
-        <label class="collection-picker">学习集合
-          <select id="collection-select"></select>
-        </label>
+        <div class="topbar-controls">
+          <label class="collection-picker">学习集合
+            <select id="collection-select"></select>
+          </label>
+          <label class="collection-picker">发音显示
+            <select id="pronunciation-mode">
+              <option value="both">IPA + 拼读</option>
+              <option value="ipa">仅 IPA</option>
+              <option value="respelling">仅拼读</option>
+            </select>
+          </label>
+        </div>
       </header>
 
       <div id="notice" class="notice" role="status" hidden></div>
@@ -62,6 +71,7 @@
         <article id="assessment-card" class="study-card" hidden>
           <div class="card-meta"><span id="assessment-band"></span><span id="assessment-progress"></span></div>
           <h2 id="assessment-lemma"></h2><p id="assessment-pos" class="part-of-speech"></p>
+          <p id="assessment-pronunciation" class="pronunciation"></p>
           <p class="prompt">看到这个词时，你能理解它的常见含义吗？</p>
           <div class="three-actions">
             <button data-assessment="unknown">1 · 不认识</button>
@@ -78,8 +88,9 @@
         <article id="review-card" class="study-card" hidden>
           <div class="card-meta"><span id="review-type"></span><span id="review-progress"></span></div>
           <p id="review-prompt-label" class="prompt-label"></p><h2 id="review-front"></h2>
+          <p id="review-pronunciation" class="pronunciation"></p>
           <button id="reveal-answer" class="secondary wide">显示答案</button>
-          <div id="review-answer" class="answer" hidden><p id="review-answer-main"></p><small id="review-answer-extra"></small></div>
+          <div id="review-answer" class="answer" hidden><p id="review-answer-main"></p><div id="review-answer-pronunciation" class="pronunciation"></div><small id="review-answer-extra"></small></div>
           <div id="review-ratings" class="four-actions" hidden>
             <button data-rating="again">Again</button><button data-rating="hard">Hard</button>
             <button data-rating="good">Good</button><button data-rating="easy">Easy</button>
