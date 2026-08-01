@@ -3,6 +3,7 @@
 from .database import LearningDatabase
 from .exam import ExamService
 from .lexical_analysis import LexicalAnalysisService
+from .etymology_import import KaikkiEtymologyImporter
 from .lexical_inference import (
     HermesLexicalGenerator,
     LexicalInferenceJobs,
@@ -27,6 +28,7 @@ from .writing_coach import HermesWritingGenerator, WritingCoachService
 __all__ = [
     "LearningDatabase",
     "ExamService",
+    "KaikkiEtymologyImporter",
     "LearningService",
     "LexicalAnalysisService",
     "LexicalInferenceService",

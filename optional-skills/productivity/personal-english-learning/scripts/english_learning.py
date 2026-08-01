@@ -13,6 +13,7 @@ from pathlib import Path
 from learning_core import (
     CollectionSpec,
     ExamService,
+    KaikkiEtymologyImporter,
     LexicalAnalysisService,
     LearningDatabase,
     LearningService,
@@ -87,6 +88,16 @@ def build_parser() -> argparse.ArgumentParser:
     relation_import.add_argument("path", type=Path)
     relation_import.add_argument("--source-version", default="2025")
     relation_import.add_argument("--source-license", default="CC-BY-4.0")
+
+    etymology_import = commands.add_parser(
+        "etymology-import-kaikki",
+        help="Import source-backed English etymologies from Kaikki JSONL",
+    )
+    etymology_import.add_argument("path", type=Path)
+    etymology_import.add_argument("--source-version", required=True)
+    etymology_import.add_argument(
+        "--source-license", default="CC-BY-SA-4.0 / GFDL"
+    )
 
     analysis_upsert = commands.add_parser(
         "analysis-upsert",
@@ -299,6 +310,14 @@ def run(args: argparse.Namespace) -> dict:
         return {"word": args.word, "count": len(pronunciations), "items": pronunciations}
     if args.command == "relations-import-oewn":
         return LexicalAnalysisService(service.database).import_oewn_derivations(
+            args.path,
+            source_version=args.source_version,
+            source_license=args.source_license,
+        )
+    if args.command == "etymology-import-kaikki":
+        return KaikkiEtymologyImporter(
+            LexicalAnalysisService(service.database)
+        ).import_file(
             args.path,
             source_version=args.source_version,
             source_license=args.source_license,

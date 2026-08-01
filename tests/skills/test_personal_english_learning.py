@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import sqlite3
 import subprocess
@@ -29,6 +30,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from learning_core import (
     CollectionSpec,
     ExamService,
+    KaikkiEtymologyImporter,
     LearningDatabase,
     LexicalAnalysisService,
     LexicalInferenceService,
@@ -949,6 +951,183 @@ def test_oewn_derivations_are_imported_as_source_aware_word_family(
     searched = service.search_vocabulary("derive")["items"][0]
     assert len(searched["lexical_analysis"]["word_family"]) == 2
     assert service.stats()["lexical_relations"] == 2
+
+
+def test_kaikki_etymologies_stream_filter_cache_and_preserve_ambiguity(
+    service: LearningService, tmp_path: Path
+) -> None:
+    for lemma, part_of_speech in (("derive", "verb"), ("study", "verb")):
+        service.upsert_vocabulary(
+            VocabularyEntry(
+                lemma=lemma,
+                part_of_speech=part_of_speech,
+                definition_en=f"definition for {lemma}",
+                definition_zh=None,
+                frequency_rank=900,
+                source="fixture",
+                source_sense_id=f"{lemma}.v",
+            ),
+            now=NOW,
+        )
+    lexical = LexicalAnalysisService(service.database)
+    lexical.upsert_analysis(
+        {
+            "form": "derive",
+            "part_of_speech": "verb",
+            "analysis_type": "historical_etymology",
+            "status": "available",
+            "source_level": "llm_inferred",
+            "content": {"summary": "AI fallback"},
+            "confidence": 0.8,
+            "model_name": "fixture-model",
+            "prompt_version": "lexical-analysis-v1",
+        }
+    )
+    records = [
+        {
+            "word": "derive",
+            "lang_code": "en",
+            "pos": "verb",
+            "etymology_text": "From Latin dērīvāre.",
+            "etymology_templates": [
+                {"name": "bor", "args": {"1": "en", "2": "la"}, "expansion": "Borrowed from Latin"}
+            ],
+        },
+        {
+            "word": "study",
+            "lang_code": "en",
+            "pos": "verb",
+            "etymology_number": 1,
+            "etymology_text": "From Middle English studien.",
+            "etymology_templates": [
+                {"name": "etymon", "args": {"1": "en"}, "expansion": "x" * 1500}
+            ],
+        },
+        {
+            "word": "study",
+            "lang_code": "en",
+            "pos": "verb",
+            "etymology_number": 2,
+            "etymology_text": "A later independent formation.",
+        },
+        {
+            "word": "derive",
+            "lang_code": "fr",
+            "pos": "verb",
+            "etymology_text": "Ignored non-English entry.",
+        },
+        {
+            "word": "not-installed",
+            "lang_code": "en",
+            "pos": "noun",
+            "etymology_text": "Ignored uninstalled entry.",
+        },
+    ]
+    source = tmp_path / "kaikki-english.jsonl.gz"
+    with gzip.open(source, "wt", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record) + "\n")
+        handle.write("{not-json}\n")
+
+    importer = KaikkiEtymologyImporter(lexical)
+    first = importer.import_file(source, source_version="2026-07-06")
+    repeated = importer.import_file(source, source_version="2026-07-06")
+    derive = lexical.lookup("derive", part_of_speech="verb")
+    study = lexical.lookup("study", part_of_speech="verb")
+
+    assert first["created"] == 2
+    assert first["updated"] == 0
+    assert first["imported_forms"] == 2
+    assert first["ambiguous_forms"] == 1
+    assert first["error_count"] == 1
+    assert repeated["created"] == 0
+    assert repeated["updated"] == 2
+    assert derive["analyses"][0]["source"] == "kaikki-enwiktionary"
+    assert derive["analyses"][0]["content"]["etymology_text"] == "From Latin dērīvāre."
+    assert derive["analyses"][0]["source_license"] == "CC-BY-SA-4.0 / GFDL"
+    assert derive["needs_inference"]["historical_etymology"] is False
+    assert study["analyses"][0]["status"] == "ambiguous"
+    assert len(study["analyses"][0]["content"]["alternatives"]) == 2
+    assert "expansion" not in study["analyses"][0]["content"]["alternatives"][0]["templates"][0]
+    assert study["needs_inference"]["historical_etymology"] is False
+
+
+def test_kaikki_etymology_cli_uses_real_sqlite(tmp_path: Path) -> None:
+    database = tmp_path / "learning.db"
+    source = tmp_path / "kaikki.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "word": "derive",
+                "lang_code": "en",
+                "pos": "verb",
+                "etymology_text": "From Latin dērīvāre.",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def invoke(*arguments: str) -> dict:
+        completed = subprocess.run(
+            [sys.executable, str(CLI_PATH), "--db", str(database), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(completed.stdout)
+
+    invoke(
+        "add-sense",
+        "--lemma", "derive",
+        "--part-of-speech", "verb",
+        "--definition-en", "obtain from a source",
+        "--source", "fixture",
+        "--source-sense-id", "derive.v",
+    )
+    imported = invoke(
+        "etymology-import-kaikki",
+        str(source),
+        "--source-version", "2026-07-06",
+    )
+    looked_up = invoke("analysis-lookup", "derive", "--part-of-speech", "verb")
+
+    assert imported["created"] == 1
+    assert imported["imported_forms"] == 1
+    assert looked_up["analyses"][0]["source"] == "kaikki-enwiktionary"
+
+
+def test_truncated_kaikki_gzip_does_not_partially_import(
+    service: LearningService, tmp_path: Path
+) -> None:
+    service.upsert_vocabulary(
+        VocabularyEntry(
+            "derive", "verb", "obtain from a source", None, 900,
+            "fixture", "derive.v",
+        ),
+        now=NOW,
+    )
+    payload = (
+        json.dumps(
+            {
+                "word": "derive",
+                "lang_code": "en",
+                "pos": "verb",
+                "etymology_text": "From Latin dērīvāre.",
+            }
+        )
+        + "\n"
+    ).encode()
+    source = tmp_path / "truncated.jsonl.gz"
+    source.write_bytes(gzip.compress(payload)[:-8])
+    importer = KaikkiEtymologyImporter(
+        LexicalAnalysisService(service.database)
+    )
+
+    with pytest.raises(ValueError, match="incomplete or invalid"):
+        importer.import_file(source, source_version="fixture")
+
+    assert LexicalAnalysisService(service.database).lookup("derive")["analyses"] == []
 
 
 def test_llm_analysis_is_validated_cached_and_identified(

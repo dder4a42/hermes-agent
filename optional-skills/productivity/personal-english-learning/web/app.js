@@ -67,9 +67,20 @@ function pronunciationHtml(item) {
 }
 
 function analysisSourceLabel(analysis) {
+  if (analysis.source === "kaikki-enwiktionary") return "Wiktionary / Kaikki 来源";
   if (analysis.source_level === "authoritative") return "权威来源";
   if (analysis.source_level === "deterministic") return "系统分析";
   return `AI 分析 ${Math.round(analysis.confidence * 100)}%`;
+}
+
+function safeHttpUrl(value) {
+  if (!value) return null;
+  try {
+    const parsed = new URL(value);
+    return ["http:", "https:"].includes(parsed.protocol) ? parsed.href : null;
+  } catch (_error) {
+    return null;
+  }
 }
 
 function lexicalAnalysisHtml(item, compact = false) {
@@ -95,11 +106,15 @@ function lexicalAnalysisHtml(item, compact = false) {
     const title = analysis.analysis_type === "modern_morphology" ? "构词分析" : "词源解读";
     const segments = Array.isArray(analysis.content?.segments) ? analysis.content.segments : [];
     const segmentHtml = segments.length ? `<div class="morpheme-chain">${segments.map(segment => `<span><strong>${escapeHtml(segment.form)}</strong><small>${escapeHtml(segment.meaning || segment.type || "")}</small></span>`).join('<b>+</b>')}</div>` : "";
-    const explanation = analysis.explanation_zh || analysis.content?.summary_zh || analysis.content?.summary || "";
-    const statusLabels = {opaque: "不宜强行拆分", ambiguous: "分析不确定", not_found: "暂无可靠资料"};
+    const explanation = analysis.explanation_zh || analysis.content?.summary_zh || analysis.content?.summary || analysis.content?.etymology_text || "";
+    const alternatives = Array.isArray(analysis.content?.alternatives) ? analysis.content.alternatives : [];
+    const alternativesHtml = alternatives.length ? `<ol class="etymology-alternatives">${alternatives.map(item => `<li><small>${item.etymology_number ? `Etymology ${escapeHtml(item.etymology_number)}` : "词源分支"}</small><p>${escapeHtml(item.text)}</p></li>`).join("")}</ol>` : "";
+    const sourceUrl = safeHttpUrl(analysis.content?.source_url);
+    const sourceLink = sourceUrl ? `<a class="analysis-link" href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener noreferrer">查看原始词条</a>` : "";
+    const statusLabels = {opaque: "不宜强行拆分", ambiguous: "存在多个词源分支", not_found: "暂无可靠资料"};
     const status = analysis.status === "available" ? "" : `<span class="analysis-status">${escapeHtml(statusLabels[analysis.status] || analysis.status)}</span>`;
     const uncertain = analysis.source_level === "llm_inferred" && analysis.confidence < 0.8 ? " · 可能的分析" : "";
-    sections.push(`<section class="lexical-section"><h4>${title}${status}</h4>${segmentHtml}${explanation ? `<p>${escapeHtml(explanation)}</p>` : ""}<small class="analysis-source">${escapeHtml(analysisSourceLabel(analysis))}${uncertain} · ${escapeHtml(analysis.source)}</small></section>`);
+    sections.push(`<section class="lexical-section"><h4>${title}${status}</h4>${segmentHtml}${explanation ? `<p>${escapeHtml(explanation)}</p>` : ""}${alternativesHtml}<small class="analysis-source">${escapeHtml(analysisSourceLabel(analysis))}${uncertain} · ${escapeHtml(analysis.source_version || analysis.source)} ${sourceLink}</small></section>`);
   }
   if (!sections.length && !compact && Object.values(lexical.needs_inference || {}).some(Boolean)) {
     sections.push('<p class="analysis-missing">暂无可靠分析；可在需要时由 AI 辅助补全。</p>');

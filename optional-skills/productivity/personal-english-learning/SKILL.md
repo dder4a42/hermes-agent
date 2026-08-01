@@ -1,7 +1,7 @@
 ---
 name: personal-english-learning
 description: Use when a learner wants to assess, expand, or review English vocabulary with a private profile-local SQLite learning history. Prioritize high-frequency concrete word senses, Chinese-supported explanations, small daily loads, and deterministic review scheduling.
-version: 0.6.0
+version: 0.7.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -228,6 +228,33 @@ python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_
   --source-version 2025 \
   --source-license CC-BY-4.0
 ```
+
+Import historical etymologies from a pinned English-only Kaikki/Wiktextract
+JSONL or JSONL.GZ export. The importer streams the file and retains only
+English lemma/POS pairs already present in the local vocabulary, so the full
+upstream dataset is never copied into SQLite:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  etymology-import-kaikki /data/kaikki.org-dictionary-English.jsonl.gz \
+  --source-version enwiktionary-2026-07-06
+```
+
+The source version must identify the pinned export or dump date. Records retain
+the cleaned `etymology_text`, bounded structured `etymology_templates`, numbered
+etymology branches, source URL, and `CC-BY-SA-4.0 / GFDL` attribution. Matching
+is deliberately limited to normalized lemma plus compatible part of speech;
+Kaikki etymologies do not identify an OEWN sense. When one lemma/POS has
+multiple distinct numbered etymologies, store one authoritative `ambiguous`
+record with every branch instead of attaching an arbitrary origin to all
+senses. Re-running a newer pinned export updates the source-backed record in
+place while preserving separately stored AI history.
+
+Kaikki historical etymology does not by itself prove a modern productive
+prefix/root/suffix split. Continue to use a separately labelled AI morphology
+analysis when no structured modern source is available. In lookup and the web
+UI, source-backed Kaikki records take precedence over AI etymology; AI remains
+available in storage as fallback provenance.
 
 Use `analysis-lookup derive --part-of-speech verb` to retrieve its word family,
 stored morphology/etymology, and the two `needs_inference` flags. Prefer an

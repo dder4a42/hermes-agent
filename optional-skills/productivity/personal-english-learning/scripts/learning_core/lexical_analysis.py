@@ -149,6 +149,20 @@ class LexicalAnalysisService:
         }
 
     def upsert_analysis(self, payload: dict[str, Any]) -> dict:
+        with self.database.connect() as connection:
+            return self._upsert_analysis(connection, payload)
+
+    def upsert_analyses(self, payloads: list[dict[str, Any]]) -> dict:
+        created = updated = 0
+        with self.database.connect() as connection:
+            for payload in payloads:
+                result = self._upsert_analysis(connection, payload)
+                created += int(result["created"])
+                updated += int(not result["created"])
+        return {"created": created, "updated": updated}
+
+    @staticmethod
+    def _upsert_analysis(connection, payload: dict[str, Any]) -> dict:
         normalized = normalize_form(str(payload.get("form", "")))
         if not normalized:
             raise ValueError("analysis form is required")
@@ -190,13 +204,12 @@ class LexicalAnalysisService:
             source_entry_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         record_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}:{source_entry_id}"))
         now_text = datetime.now(timezone.utc).isoformat()
-        with self.database.connect() as connection:
-            existed = connection.execute(
-                "SELECT 1 FROM lexical_analyses WHERE source = ? AND source_entry_id = ?",
-                (source, source_entry_id),
-            ).fetchone()
-            connection.execute(
-                """
+        existed = connection.execute(
+            "SELECT 1 FROM lexical_analyses WHERE source = ? AND source_entry_id = ?",
+            (source, source_entry_id),
+        ).fetchone()
+        connection.execute(
+            """
                 INSERT INTO lexical_analyses(
                     id, normalized_form, part_of_speech, source_sense_id,
                     analysis_type, status, source_level, content_json,
@@ -219,28 +232,28 @@ class LexicalAnalysisService:
                     model_name = excluded.model_name,
                     prompt_version = excluded.prompt_version,
                     updated_at = excluded.updated_at
-                """,
-                (
-                    record_id,
-                    normalized,
-                    payload.get("part_of_speech"),
-                    payload.get("source_sense_id"),
-                    analysis_type,
-                    status,
-                    source_level,
-                    json.dumps(content, ensure_ascii=False, sort_keys=True),
-                    payload.get("explanation_zh"),
-                    confidence,
-                    source,
-                    source_version,
-                    str(payload.get("source_license") or "generated content"),
-                    source_entry_id,
-                    model_name,
-                    prompt_version,
-                    now_text,
-                    now_text,
-                ),
-            )
+            """,
+            (
+                record_id,
+                normalized,
+                payload.get("part_of_speech"),
+                payload.get("source_sense_id"),
+                analysis_type,
+                status,
+                source_level,
+                json.dumps(content, ensure_ascii=False, sort_keys=True),
+                payload.get("explanation_zh"),
+                confidence,
+                source,
+                source_version,
+                str(payload.get("source_license") or "generated content"),
+                source_entry_id,
+                model_name,
+                prompt_version,
+                now_text,
+                now_text,
+            ),
+        )
         return {"id": record_id, "created": existed is None, "source_entry_id": source_entry_id}
 
     def lookup(
@@ -352,7 +365,7 @@ class LexicalAnalysisService:
                 item["analysis_type"]
                 for item in matching_analyses
                 if item["status"] == "available"
-                or item["source_level"] == "llm_inferred"
+                or item["source_level"] in {"authoritative", "llm_inferred"}
             }
             result[key] = {
                 "word_family": family[:24],
@@ -375,6 +388,8 @@ class LexicalAnalysisService:
             "confidence": row["confidence"],
             "source": row["source"],
             "source_version": row["source_version"],
+            "source_license": row["source_license"],
+            "source_entry_id": row["source_entry_id"],
             "model_name": row["model_name"],
             "prompt_version": row["prompt_version"],
         }
