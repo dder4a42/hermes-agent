@@ -1,6 +1,6 @@
 const sessionToken = document.querySelector('meta[name="learning-session"]').content;
 const headers = {"Content-Type": "application/json", "X-Learning-Session": sessionToken};
-const titles = {home: "今日学习", assessment: "基础评估", learn: "新词学习", review: "到期复习", notebook: "生词本", reading: "阅读私教", vocabulary: "词库查询", progress: "学习进度"};
+const titles = {home: "今日学习", assessment: "词汇定位", learn: "新词学习", review: "到期复习", notebook: "生词本", reading: "阅读私教", vocabulary: "词库查询", progress: "学习进度"};
 let collections = [];
 let assessmentItems = [];
 let assessmentIndex = 0;
@@ -118,10 +118,12 @@ async function loadStats() {
   const previous = select.value;
   select.replaceChildren(...collections.map(item => {
     const option = document.createElement("option"); option.value = item.id;
-    option.textContent = item.kind === "general" ? "通用英语" : item.kind === "academic" ? "学术英语" : item.title;
+    option.textContent = item.kind === "general" ? "通用英语" : item.kind === "academic" ? "TOEFL 方向（学术核心）" : item.title;
     return option;
   }));
+  const preferred = data.preferred_collection_id;
   if (collections.some(item => item.id === previous)) select.value = previous;
+  else if (collections.some(item => item.id === preferred)) select.value = preferred;
   document.querySelector("#collection-summary").replaceChildren(...collections.map(item => {
     const row = document.createElement("div"); row.innerHTML = `<span>${escapeHtml(item.title)}</span><strong>${formatNumber(item.sense_count)}</strong>`; return row;
   }));
@@ -157,7 +159,7 @@ async function answerAssessment(response) {
     document.querySelector("#assessment-card").hidden = true;
     document.querySelector("#assessment-empty").hidden = false;
     document.querySelector("#assessment-empty").textContent = `本轮 ${assessmentItems.length} 个词已完成。`;
-    notify("基础评估已记录。", "success"); await loadStats(); return;
+    notify("词汇定位结果已记录，后续会跳过已知词并优先安排薄弱词。", "success"); await loadStats(); return;
   }
   renderAssessment();
 }
@@ -303,7 +305,7 @@ async function rateReview(rating) {
 
 async function searchVocabulary(event) {
   event.preventDefault(); const query = document.querySelector("#search-query").value.trim(); if (!query) return;
-  const params = new URLSearchParams({q: query, limit: "30"}); if (selectedCollection()) params.set("collection_id", selectedCollection());
+  const params = new URLSearchParams({q: query, limit: "30"});
   const data = await api(`/api/vocabulary/search?${params}`);
   const container = document.querySelector("#search-results");
   lastSearchItems = data.items;
@@ -518,7 +520,16 @@ document.querySelector("#reading-form").addEventListener("submit", event => void
 document.querySelector("#writing-submit").addEventListener("click", () => void submitWriting().catch(error => notify(error.message, "error")));
 document.querySelector("#notebook-refresh").addEventListener("click", () => void loadNotebook().catch(error => notify(error.message, "error")));
 document.querySelector("#progress-refresh").addEventListener("click", () => void loadProgress().catch(error => notify(error.message, "error")));
-document.querySelector("#collection-select").addEventListener("change", () => { todayPlanPromise = null; });
+document.querySelector("#collection-select").addEventListener("change", () => {
+  todayPlanPromise = null;
+  const collectionId = selectedCollection();
+  if (!collectionId) return;
+  void api("/api/preferences/collection", {
+    method: "PUT",
+    body: JSON.stringify({collection_id: collectionId}),
+  }).then(() => notify("默认学习路线已保存，自动任务也会使用该词库。", "success"))
+    .catch(error => notify(error.message, "error"));
+});
 document.querySelector("#pronunciation-mode").addEventListener("change", () => {
   const assessmentItem = assessmentItems[assessmentIndex];
   if (assessmentItem) document.querySelector("#assessment-pronunciation").innerHTML = pronunciationHtml(assessmentItem);

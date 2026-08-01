@@ -128,6 +128,11 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--backlog-stop-at", type=int, default=60)
     plan.add_argument("--collection-id")
 
+    preference = commands.add_parser(
+        "collection-preference", help="Set the default collection for new items"
+    )
+    preference.add_argument("--collection-id", required=True)
+
     review = commands.add_parser("review", help="Record and schedule one review")
     review.add_argument("--card-id", required=True)
     review.add_argument("--rating", choices=("again", "hard", "good", "easy"), required=True)
@@ -342,6 +347,8 @@ def run(args: argparse.Namespace) -> dict:
             backlog_stop_at=args.backlog_stop_at,
             collection_id=args.collection_id,
         )
+    if args.command == "collection-preference":
+        return service.set_preferred_collection(args.collection_id)
     if args.command == "review":
         return service.record_review(
             args.card_id,

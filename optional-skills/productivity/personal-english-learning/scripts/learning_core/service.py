@@ -781,6 +781,14 @@ class LearningService:
                 ORDER BY vc.kind, vc.id
                 """
             ).fetchall()
+            preferred_collection = connection.execute(
+                """
+                SELECT vc.id AS value
+                FROM metadata m
+                JOIN vocabulary_collections vc ON vc.id = m.value
+                WHERE m.key = 'preferred_collection_id'
+                """
+            ).fetchone()
         return {
             "vocabulary_senses": vocabulary,
             "pronunciations": pronunciations,
@@ -793,7 +801,31 @@ class LearningService:
             "mean_recall": round(float(states["recall"]), 4),
             "mean_production": round(float(states["production"]), 4),
             "collections": [dict(row) for row in collections],
+            "preferred_collection_id": (
+                str(preferred_collection["value"])
+                if preferred_collection is not None
+                else None
+            ),
         }
+
+    def set_preferred_collection(self, collection_id: str) -> dict:
+        """Persist the single learner's default source for future new items."""
+
+        with self.database.connect() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM vocabulary_collections WHERE id = ?",
+                (collection_id,),
+            ).fetchone():
+                raise ValueError(f"unknown collection_id: {collection_id}")
+            connection.execute(
+                """
+                INSERT INTO metadata(key, value)
+                VALUES ('preferred_collection_id', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (collection_id,),
+            )
+        return {"preferred_collection_id": collection_id}
 
     def search_vocabulary(
         self,
@@ -1023,6 +1055,16 @@ class LearningService:
             ).fetchone():
                 raise ValueError(f"unknown collection_id: {collection_id}")
             return collection_id, "explicit"
+        preferred = connection.execute(
+            """
+            SELECT vc.id
+            FROM metadata m
+            JOIN vocabulary_collections vc ON vc.id = m.value
+            WHERE m.key = 'preferred_collection_id'
+            """
+        ).fetchone()
+        if preferred:
+            return str(preferred["id"]), "preferred"
         general = connection.execute(
             """
             SELECT id FROM vocabulary_collections

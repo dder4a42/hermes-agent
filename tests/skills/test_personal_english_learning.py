@@ -1270,10 +1270,15 @@ def test_learning_web_is_session_gated_and_host_restricted(tmp_path: Path) -> No
                     headers={SESSION_HEADER: "test-session-token"},
                     json={"per_band": 1, "seed": 3},
                 ),
+                await client.put(
+                    "/api/preferences/collection",
+                    headers={SESSION_HEADER: "test-session-token"},
+                    json={"collection_id": "missing"},
+                ),
             )
 
-    page, unauthorized, authorized, hostile_host, sampled = asyncio.run(
-        exercise_app()
+    page, unauthorized, authorized, hostile_host, sampled, invalid_preference = (
+        asyncio.run(exercise_app())
     )
 
     assert page.status_code == 200
@@ -1285,6 +1290,8 @@ def test_learning_web_is_session_gated_and_host_restricted(tmp_path: Path) -> No
     assert hostile_host.status_code == 400
     assert sampled.status_code == 200
     assert sampled.json()["count"] == 4
+    assert invalid_preference.status_code == 400
+    assert "词汇定位（可选）" in page.text
 
 
 def test_reading_tutor_uses_profile_targets_and_caches_generation(
@@ -1751,6 +1758,56 @@ def test_academic_collection_reuses_senses_and_preserves_general_frequency(
         "academic",
         "general",
     ]
+
+
+def test_preferred_collection_drives_implicit_assessment_and_daily_plan(
+    service: LearningService,
+) -> None:
+    for collection_id, kind, lemma in (
+        ("general", "general", "simple"),
+        ("academic", "academic", "derive"),
+    ):
+        service.upsert_vocabulary(
+            VocabularyEntry.from_mapping(
+                {
+                    "lemma": lemma,
+                    "part_of_speech": "verb",
+                    "definition_en": f"definition for {lemma}",
+                    "source": "fixture",
+                    "source_sense_id": f"{lemma}.v",
+                    "collection": {
+                        "id": collection_id,
+                        "title": collection_id.title(),
+                        "kind": kind,
+                        "source": "fixture",
+                        "version": "1",
+                        "license": "test",
+                        "rank": 1,
+                        "sense_rank": 1,
+                        "source_lemma": lemma,
+                    },
+                }
+            ),
+            now=NOW,
+        )
+
+    saved = service.set_preferred_collection("academic")
+    sample = service.assessment_sample(
+        per_band=1, bands=((1, 10),), seed=0
+    )
+    plan = service.daily_plan(new_limit=1, review_limit=0, now=NOW)
+
+    assert saved == {"preferred_collection_id": "academic"}
+    assert service.stats()["preferred_collection_id"] == "academic"
+    assert sample["collection_selection"] == "preferred"
+    assert [item["lemma"] for item in sample["items"]] == ["derive"]
+    assert plan["collection_selection"] == "preferred"
+    assert [item["lemma"] for item in plan["new_items"]] == ["derive"]
+
+
+def test_preferred_collection_rejects_unknown_id(service: LearningService) -> None:
+    with pytest.raises(ValueError, match="unknown collection_id"):
+        service.set_preferred_collection("missing")
 
 
 def test_vocabulary_builder_cli_creates_importable_general_collection(

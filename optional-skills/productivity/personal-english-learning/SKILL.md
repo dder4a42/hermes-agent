@@ -1,7 +1,7 @@
 ---
 name: personal-english-learning
 description: Use when a learner wants to assess, expand, or review English vocabulary with a private profile-local SQLite learning history. Prioritize high-frequency concrete word senses, Chinese-supported explanations, small daily loads, and deterministic review scheduling.
-version: 0.5.0
+version: 0.6.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -286,10 +286,21 @@ python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_
   daily-plan --collection-id general-core-oewn-2025 --new-limit 8
 ```
 
-When `--collection-id` is omitted, assessment and daily planning automatically
-select the lexically first installed `general` collection. If no general
-collection exists, legacy uncollected behavior is retained. The JSON response
-reports `collection_selection` so the caller never has to guess which path ran.
+Set a persistent single-user learning route when the learner wants academic or
+TOEFL-oriented vocabulary by default:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  collection-preference --collection-id academic-core-oewn-2025
+```
+
+When `--collection-id` is omitted, assessment and daily planning first use this
+saved preference, then fall back to the lexically first installed `general`
+collection. If no collection applies, legacy uncollected behavior is retained.
+The JSON response reports `collection_selection` so the caller never has to
+guess which path ran. The web label `TOEFL 方向（学术核心）` is deliberately a
+learning route built from the academic source list, not a claim that it is an
+official ETS vocabulary list.
 Collection-based baseline assessment samples only `sense_rank = 1`; secondary
 senses are introduced from real reading context instead of random testing.
 

@@ -16,7 +16,7 @@
       </div>
       <nav aria-label="学习导航">
         <button class="nav-item active" data-view="home">今日学习</button>
-        <button class="nav-item" data-view="assessment">基础评估</button>
+        <button class="nav-item" data-view="assessment">词汇定位（可选）</button>
         <button class="nav-item" data-view="learn">新词学习</button>
         <button class="nav-item" data-view="review">到期复习</button>
         <button class="nav-item" data-view="notebook">生词本</button>
@@ -31,7 +31,7 @@
       <header class="topbar">
         <div><p class="eyebrow">PERSONAL ENGLISH LEARNING</p><h1 id="page-title">今日学习</h1></div>
         <div class="topbar-controls">
-          <label class="collection-picker">学习集合
+          <label class="collection-picker">学习路线
             <select id="collection-select"></select>
           </label>
           <label class="collection-picker">发音显示
@@ -49,7 +49,7 @@
       <section class="view active" id="view-home">
         <div class="hero">
           <div><p class="eyebrow">DAILY FOCUS</p><h2>少量、准确、持续。</h2>
-            <p>先确认认识程度，再开始今天的复习。基础阶段默认每天最多 8 个新词义。</p></div>
+            <p>当前可直接使用 TOEFL 方向的学术核心词。每天最多 8 个新词义，到期复习仍优先。</p></div>
           <button class="primary" data-go="learn">开始今日学习</button>
         </div>
         <div class="metrics" id="home-metrics">
@@ -59,9 +59,9 @@
           <article><span>词库规模</span><strong id="metric-vocabulary">—</strong><small>个去重词义</small></article>
         </div>
         <div class="two-column">
-          <article class="panel"><p class="eyebrow">START HERE</p><h3>还没有基线？</h3>
-            <p>从不同频率区间抽样主词义，用“认识 / 不确定 / 不认识”建立初始能力画像。</p>
-            <button class="secondary" data-go="assessment">开始基础评估</button></article>
+          <article class="panel"><p class="eyebrow">OPTIONAL PLACEMENT</p><h3>词汇定位不是入门门槛</h3>
+            <p>它不估算 TOEFL 分数，只用于跳过已知词、优先安排“不确定 / 不认识”的词。你可以直接开始 TOEFL 方向的新词学习。</p>
+            <button class="secondary" data-go="assessment">做一次快速定位</button></article>
           <article class="panel"><p class="eyebrow">COLLECTIONS</p><h3>已安装词库</h3>
             <div id="collection-summary" class="collection-summary"></div></article>
           <article class="panel"><p class="eyebrow">READING TUTOR</p><h3>由私教准备今天的短文</h3>
@@ -71,9 +71,9 @@
       </section>
 
       <section class="view" id="view-assessment">
-        <div class="section-intro"><div><h2>基础词汇评估</h2><p>只评估每个 lemma 的主候选义；不确定也是有效数据。</p></div>
-          <button id="assessment-start" class="primary">生成评估样本</button></div>
-        <div id="assessment-empty" class="empty-state">点击生成样本，每个频率区间抽取 5 个词。</div>
+        <div class="section-intro"><div><h2>可选词汇定位</h2><p>它只影响选词排序：已知词会被跳过，薄弱词会优先；不会生成 CEFR 或 TOEFL 分数。</p></div>
+          <button id="assessment-start" class="primary">按当前路线抽样</button></div>
+        <div id="assessment-empty" class="empty-state">当前选择 TOEFL 方向时，会从学术核心集合的不同优先级区间抽样主词义。</div>
         <article id="assessment-card" class="study-card" hidden>
           <div class="card-meta"><span id="assessment-band"></span><span id="assessment-progress"></span></div>
           <h2 id="assessment-lemma"></h2><p id="assessment-pos" class="part-of-speech"></p>
@@ -154,7 +154,7 @@
       </section>
 
       <section class="view" id="view-vocabulary">
-        <div class="section-intro"><div><h2>词库查询</h2><p>查询具体词义、来源以及当前掌握状态。</p></div></div>
+        <div class="section-intro"><div><h2>词库查询</h2><p>查询全部已安装词库中的具体词义，不受当前学习路线限制。</p></div></div>
         <form id="search-form" class="search-bar"><input id="search-query" autocomplete="off" placeholder="输入 lemma，例如 derive" maxlength="80"><button class="primary">查询</button></form>
         <div id="search-results" class="results"></div>
       </section>

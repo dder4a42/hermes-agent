@@ -68,6 +68,10 @@ class DailyPlanRequest(BaseModel):
     collection_id: str | None = None
 
 
+class CollectionPreferenceRequest(BaseModel):
+    collection_id: str
+
+
 class ReviewRequest(BaseModel):
     rating: str
     idempotency_key: str
@@ -171,6 +175,10 @@ def create_app(
     @app.get("/api/stats")
     async def stats() -> dict:
         return {"ok": True, **service.stats()}
+
+    @app.put("/api/preferences/collection")
+    async def collection_preference(body: CollectionPreferenceRequest) -> dict:
+        return {"ok": True, **service.set_preferred_collection(body.collection_id)}
 
     @app.get("/api/reports/weekly")
     async def weekly_report(days: int = Query(default=7, ge=1, le=90)) -> dict:
