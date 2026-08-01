@@ -47,7 +47,7 @@ from learning_core import (
     load_ranked_lemmas,
 )
 from learning_core.reading import lemma_candidates
-from learning_core.reading_tutor import _parse_json_object
+from learning_core.reading_tutor import _generation_prompt, _parse_json_object
 from learning_core.pronunciation import arpabet_to_ipa, arpabet_to_respelling
 from learning_core.vocabulary_builder import normalize_part_of_speech
 from learning_web import SESSION_HEADER, create_app
@@ -309,6 +309,28 @@ def test_daily_plan_is_idempotent_for_date_and_collection(
     with service.database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM daily_plans").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM review_cards").fetchone()[0] == 8
+
+
+def test_saved_daily_new_limit_drives_future_implicit_plans(
+    service: LearningService,
+) -> None:
+    seed(service, list(range(1, 21)))
+
+    assert service.set_daily_new_limit(5) == {"daily_new_limit": 5}
+    first = service.daily_plan(review_limit=0, now=NOW)
+    explicit = service.daily_plan(
+        new_limit=2, review_limit=0, now=NOW + timedelta(days=1)
+    )
+
+    assert service.stats()["daily_new_limit"] == 5
+    assert first["requested_new_limit"] == 5
+    assert len(first["new_items"]) == 5
+    assert explicit["requested_new_limit"] == 2
+
+
+def test_saved_daily_new_limit_is_bounded(service: LearningService) -> None:
+    with pytest.raises(ValueError, match="between 0 and 20"):
+        service.set_daily_new_limit(21)
 
 
 def test_concurrent_daily_plan_requests_create_one_plan(
@@ -1473,6 +1495,27 @@ def test_learning_web_is_session_gated_and_host_restricted(tmp_path: Path) -> No
     assert "词汇定位（可选）" in page.text
 
 
+def test_learning_web_persists_daily_new_limit(tmp_path: Path) -> None:
+    app = create_app(tmp_path / "learning.db", session_token="test-session-token")
+
+    async def exercise_app():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1",
+            headers={SESSION_HEADER: "test-session-token"},
+        ) as client:
+            saved = await client.put(
+                "/api/preferences/daily-plan", json={"new_limit": 5}
+            )
+            stats = await client.get("/api/stats")
+            return saved, stats
+
+    saved, stats = asyncio.run(exercise_app())
+
+    assert saved.json()["daily_new_limit"] == 5
+    assert stats.json()["daily_new_limit"] == 5
+
+
 def test_reading_tutor_uses_profile_targets_and_caches_generation(
     service: LearningService,
 ) -> None:
@@ -1543,6 +1586,28 @@ def test_reading_tutor_falls_back_to_curated_seed_when_generation_fails(
     assert "model unavailable" not in json.dumps(result)
 
 
+def test_reading_tutor_mixed_mode_avoids_recent_seed_repetition(
+    service: LearningService,
+) -> None:
+    tutor = ReadingTutorService(service.database, generator=None)
+
+    lessons = [
+        tutor.today(topic="mixed", now=NOW + timedelta(days=offset))
+        for offset in range(3)
+    ]
+
+    assert len({lesson["seed_id"] for lesson in lessons}) == 3
+    assert len({lesson["topic"] for lesson in lessons}) >= 2
+
+
+def test_reading_generation_prompt_includes_payload_once() -> None:
+    payload = {"source_seed": {"id": "unique-seed-marker"}}
+    prompt = _generation_prompt(payload)
+
+    assert prompt.count("unique-seed-marker") == 1
+    assert "do not default to AI" in prompt
+
+
 def test_learning_web_serves_proactive_reading_and_distinct_review_front_style(
     tmp_path: Path,
 ) -> None:
@@ -1586,6 +1651,9 @@ def test_learning_web_serves_proactive_reading_and_distinct_review_front_style(
     assert reading.json()["source_mode"] == "source_adapted"
     assert 'data-view="reading"' in page.text
     assert 'id="review-front" class="review-front' in page.text
+    assert 'id="learning-generate-lexical"' in page.text
+    script = (SKILL_DIR / "web" / "app.js").read_text(encoding="utf-8")
+    assert "if (needsLexicalInference(item)) void enrichLexicalItem" not in script
 
 
 def test_writing_coach_persists_feedback_and_links_revision(

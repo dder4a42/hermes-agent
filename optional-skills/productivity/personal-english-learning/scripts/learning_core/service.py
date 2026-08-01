@@ -18,6 +18,7 @@ from .pronunciation import PronunciationService
 
 
 ASSESSMENT_VALUES = {"known": 0.9, "unsure": 0.45, "unknown": 0.05}
+DEFAULT_DAILY_NEW_LIMIT = 8
 REVIEW_VALUES = {"again": 0.0, "hard": 0.35, "good": 0.75, "easy": 0.95}
 DEFAULT_BANDS = ((1, 1000), (1001, 2000), (2001, 3000), (3001, 5000))
 RATINGS = frozenset(REVIEW_VALUES)
@@ -396,13 +397,13 @@ class LearningService:
         self,
         *,
         review_limit: int = 30,
-        new_limit: int = 8,
+        new_limit: int | None = None,
         backlog_reduce_at: int = 30,
         backlog_stop_at: int = 60,
         collection_id: str | None = None,
         now: datetime | None = None,
     ) -> dict:
-        if review_limit < 0 or new_limit < 0:
+        if review_limit < 0 or (new_limit is not None and new_limit < 0):
             raise ValueError("review_limit and new_limit cannot be negative")
         if not 0 <= backlog_reduce_at <= backlog_stop_at:
             raise ValueError("backlog thresholds are invalid")
@@ -410,6 +411,7 @@ class LearningService:
         now_text = iso(now)
         with self.database.connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            new_limit = self._resolve_daily_new_limit(connection, new_limit)
             collection_id, collection_selection = self._resolve_collection_id(
                 connection, collection_id
             )
@@ -789,6 +791,7 @@ class LearningService:
                 WHERE m.key = 'preferred_collection_id'
                 """
             ).fetchone()
+            daily_new_limit = self._resolve_daily_new_limit(connection, None)
         return {
             "vocabulary_senses": vocabulary,
             "pronunciations": pronunciations,
@@ -806,6 +809,7 @@ class LearningService:
                 if preferred_collection is not None
                 else None
             ),
+            "daily_new_limit": daily_new_limit,
         }
 
     def set_preferred_collection(self, collection_id: str) -> dict:
@@ -826,6 +830,20 @@ class LearningService:
                 (collection_id,),
             )
         return {"preferred_collection_id": collection_id}
+
+    def set_daily_new_limit(self, new_limit: int) -> dict:
+        if not 0 <= new_limit <= 20:
+            raise ValueError("daily new limit must be between 0 and 20")
+        with self.database.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO metadata(key, value)
+                VALUES ('daily_new_limit', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(new_limit),),
+            )
+        return {"daily_new_limit": new_limit}
 
     def search_vocabulary(
         self,
@@ -1076,6 +1094,24 @@ class LearningService:
         if general:
             return str(general["id"]), "auto_general"
         return None, "unfiltered"
+
+    @staticmethod
+    def _resolve_daily_new_limit(
+        connection: sqlite3.Connection,
+        explicit_limit: int | None,
+    ) -> int:
+        if explicit_limit is not None:
+            return explicit_limit
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'daily_new_limit'"
+        ).fetchone()
+        if row is None:
+            return DEFAULT_DAILY_NEW_LIMIT
+        try:
+            value = int(row["value"])
+        except (TypeError, ValueError):
+            return DEFAULT_DAILY_NEW_LIMIT
+        return value if 0 <= value <= 20 else DEFAULT_DAILY_NEW_LIMIT
 
     @staticmethod
     def _schedule(step: int, rating: str) -> tuple[int, int, str]:

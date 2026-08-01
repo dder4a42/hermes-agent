@@ -64,12 +64,16 @@ class AssessmentRecordRequest(BaseModel):
 
 class DailyPlanRequest(BaseModel):
     review_limit: int = Field(default=30, ge=0, le=100)
-    new_limit: int = Field(default=8, ge=0, le=20)
+    new_limit: int | None = Field(default=None, ge=0, le=20)
     collection_id: str | None = None
 
 
 class CollectionPreferenceRequest(BaseModel):
     collection_id: str
+
+
+class DailyPreferenceRequest(BaseModel):
+    new_limit: int = Field(ge=0, le=20)
 
 
 class ReviewRequest(BaseModel):
@@ -83,7 +87,7 @@ class ReviewRequest(BaseModel):
 class ReadingTodayRequest(BaseModel):
     level: str = Field(default="B1", pattern="^(A2|B1|B2|C1)$")
     minutes: int = Field(default=10)
-    topic: str = Field(default="science", min_length=1, max_length=40)
+    topic: str = Field(default="mixed", min_length=1, max_length=40)
     collection_id: str | None = None
 
 
@@ -179,6 +183,10 @@ def create_app(
     @app.put("/api/preferences/collection")
     async def collection_preference(body: CollectionPreferenceRequest) -> dict:
         return {"ok": True, **service.set_preferred_collection(body.collection_id)}
+
+    @app.put("/api/preferences/daily-plan")
+    async def daily_preference(body: DailyPreferenceRequest) -> dict:
+        return {"ok": True, **service.set_daily_new_limit(body.new_limit)}
 
     @app.get("/api/reports/weekly")
     async def weekly_report(days: int = Query(default=7, ge=1, le=90)) -> dict:

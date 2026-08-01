@@ -1,7 +1,7 @@
 ---
 name: personal-english-learning
 description: Use when a learner wants to assess, expand, or review English vocabulary with a private profile-local SQLite learning history. Prioritize high-frequency concrete word senses, Chinese-supported explanations, small daily loads, and deterministic review scheduling.
-version: 0.7.0
+version: 0.8.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -16,8 +16,9 @@ metadata:
       enabled_toolsets: [terminal]
       prompt: >-
         Run the personal English learning daily check-in by following this
-        skill. Call daily-plan with new-limit 8 and review-limit 30, present due
-        reviews before new items, and never add items beyond the returned
+        skill. Call daily-plan with review-limit 30 so the saved daily new-word
+        preference applies, present due reviews before new items, and never add
+        items beyond the returned
         effective limit. If today is Monday in the user's configured timezone,
         also call weekly-report --days 7 and summarize the evidence without
         claiming an official vocabulary, CEFR, or TOEFL score. If there are no
@@ -113,7 +114,9 @@ asks the configured Hermes model for a level-adjusted lesson. The result is
 cached in the profile-local SQLite database. If model generation is unavailable
 or invalid, the UI serves the curated seed instead of failing the session.
 
-The vocabulary workflow has three separate views backed by one daily plan:
+The Reading Tutor defaults to a mixed subject rotation and avoids recently used
+seeds when alternatives are available. The vocabulary workflow has three
+separate views backed by one daily plan:
 `新词学习` presents only newly assigned senses with definitions and lexical
 analysis, `到期复习` presents only previously learned due cards, and `生词本`
 groups recognition/recall cards by concrete sense. Do not call the plan endpoint
@@ -261,11 +264,11 @@ stored morphology/etymology, and the two `needs_inference` flags. Prefer an
 authoritative source, then a deterministic analysis. When a needed analysis is
 missing or disproportionately expensive to retrieve, the active Hermes model
 may produce one structured inference and cache it with `analysis-upsert PATH`.
-The web UI automates this fallback: opening one new-word card queues at most one
-background job for that concrete sense, while vocabulary search requires an
-explicit `生成构词与词源` click to prevent a broad query from spending many model
-calls. The queue has one worker, so lexical generation never blocks loading the
-daily plan. Successful and terminal (`opaque`, `ambiguous`, `not_found`) results
+The web UI makes this fallback opt-in for each concrete sense: a new-word card
+or vocabulary result requires an explicit `使用 LLM 补充构词分析` action. Merely
+loading a daily plan never spends one model call per word. The queue has one
+worker, so lexical generation never blocks loading the daily plan. Successful
+and terminal (`opaque`, `ambiguous`, `not_found`) results
 are cached in SQLite; malformed output gets at most two schema-repair attempts and is
 otherwise shown as a retryable failure without writing partial data.
 The JSON file must contain one object like:
@@ -310,7 +313,7 @@ For a basic learner, draw new items from the general collection first:
 
 ```bash
 python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
-  daily-plan --collection-id general-core-oewn-2025 --new-limit 8
+  collection-preference --collection-id general-core-oewn-2025
 ```
 
 Set a persistent single-user learning route when the learner wants academic or
@@ -383,16 +386,26 @@ Chinese core meaning, short English definition, and one brief explanation.
 
 ### 4. Build the daily plan
 
-Use small defaults for a basic learner:
+Save the preferred daily new-word load once (0–20; 8 is the fallback when no
+preference has been saved):
 
 ```bash
 python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
-  daily-plan --new-limit 8 --review-limit 30
+  daily-preference --new-limit 5
+```
+
+Then build the plan without an explicit new limit so the saved value applies:
+
+```bash
+python3 ~/.hermes/skills/productivity/personal-english-learning/scripts/english_learning.py \
+  daily-plan --review-limit 30
 ```
 
 Always handle `reviews` before `new_items`. If the effective new limit is lower
 than requested, explain briefly that review backlog reduced today's new words.
 Never override the returned limit by adding extra words conversationally.
+The first plan for a date and collection remains immutable; changing the
+preference after it exists affects the next plan, not today's assigned cards.
 
 ### 5. Review one card at a time
 
@@ -441,7 +454,9 @@ has not supplied a text. It distinguishes these provenance modes:
 
 Treat all bundled seed passages as independently written teaching summaries,
 not quotations from the linked source. The linked source is the factual anchor.
-The model may adjust vocabulary, syntax, length, questions, and writing tasks,
+The mixed topic rotates across natural science, psychology, society, history,
+economics, computing, and health, excluding recent seeds when alternatives are
+available. The model may adjust vocabulary, syntax, length, questions, and writing tasks,
 but it must not replace source metadata or claim that generated wording is an
 original quotation. A repeated request with the same date, level, duration,
 topic, collection, target senses, and prompt version restores the cached lesson.
@@ -581,7 +596,7 @@ profile-local cron job explicitly.
 
 The daily run must:
 
-1. Call `daily-plan --new-limit 8 --review-limit 30` exactly once.
+1. Call `daily-plan --review-limit 30` exactly once so the saved preference applies.
 2. Present returned reviews before new items.
 3. Respect `effective_new_limit`; never compensate with extra conversational
    vocabulary.

@@ -34,6 +34,17 @@
           <label class="collection-picker">学习路线
             <select id="collection-select"></select>
           </label>
+          <label class="collection-picker">每日新词
+            <select id="daily-new-limit">
+              <option value="0">0 个</option>
+              <option value="3">3 个</option>
+              <option value="5">5 个</option>
+              <option value="8">8 个</option>
+              <option value="10">10 个</option>
+              <option value="15">15 个</option>
+              <option value="20">20 个</option>
+            </select>
+          </label>
           <label class="collection-picker">发音显示
             <select id="pronunciation-mode">
               <option value="both">IPA + 拼读</option>
@@ -49,7 +60,7 @@
       <section class="view active" id="view-home">
         <div class="hero">
           <div><p class="eyebrow">DAILY FOCUS</p><h2>少量、准确、持续。</h2>
-            <p>当前可直接使用 TOEFL 方向的学术核心词。每天最多 8 个新词义，到期复习仍优先。</p></div>
+            <p>当前可直接使用 TOEFL 方向的学术核心词。每日新词数量由你控制，到期复习仍优先。</p></div>
           <button class="primary" data-go="learn">开始今日学习</button>
         </div>
         <div class="metrics" id="home-metrics">
@@ -98,6 +109,7 @@
           <p id="learning-pronunciation" class="pronunciation"></p>
           <div class="learning-meaning"><p id="learning-definition-en"></p><p id="learning-definition-zh"></p></div>
           <div id="learning-lexical-analysis"></div>
+          <button id="learning-generate-lexical" class="secondary wide" hidden>使用 LLM 补充构词分析（可选）</button>
           <button id="learning-assess" class="secondary wide">学完了，进行初始自评</button>
           <div id="learning-ratings" class="four-actions" hidden>
             <button data-learning-rating="again">没记住</button><button data-learning-rating="hard">有些吃力</button>
@@ -134,7 +146,7 @@
         <form id="reading-form" class="reading-controls panel">
           <label>目标难度<select id="reading-level"><option>A2</option><option selected>B1</option><option>B2</option><option>C1</option></select></label>
           <label>学习时间<select id="reading-minutes"><option value="5">5 分钟</option><option value="10" selected>10 分钟</option><option value="15">15 分钟</option><option value="30">30 分钟</option></select></label>
-          <label>主题<select id="reading-topic"><option value="science">科学思维</option><option value="computing">计算与系统</option><option value="health">健康研究</option></select></label>
+          <label>主题<select id="reading-topic"><option value="mixed" selected>综合轮换</option><option value="science">自然科学</option><option value="psychology">心理与行为</option><option value="society">社会与文化</option><option value="history">历史与交流</option><option value="economics">经济与选择</option><option value="computing">计算与系统</option><option value="health">健康研究</option></select></label>
           <button id="reading-generate" class="primary">准备今天的阅读</button>
         </form>
         <div id="reading-empty" class="empty-state">不需要粘贴文章。选择目标后，私教会准备一篇来源清楚的短文。</div>

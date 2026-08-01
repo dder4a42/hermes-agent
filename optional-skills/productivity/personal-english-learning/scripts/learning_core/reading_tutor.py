@@ -14,7 +14,7 @@ from .database import LearningDatabase
 from .service import iso, utc_now
 
 
-PROMPT_VERSION = "reading-tutor-v1"
+PROMPT_VERSION = "reading-tutor-v2"
 QUESTION_TYPES = frozenset({"main_idea", "detail", "inference", "function"})
 
 SEEDS: tuple[dict[str, Any], ...] = (
@@ -133,6 +133,145 @@ SEEDS: tuple[dict[str, Any], ...] = (
         ],
         "writing_prompt": "In 60–90 words, explain why several studies may be stronger than one study.",
     },
+    {
+        "id": "openstax-ecosystem-resilience",
+        "topic": "science",
+        "title": "How ecosystems respond to disturbance",
+        "level": "B2",
+        "source": {
+            "title": "OpenStax Biology 2e",
+            "publisher": "OpenStax",
+            "url": "https://openstax.org/details/books/biology-2e",
+            "license": "CC BY 4.0",
+        },
+        "passage": (
+            "An ecosystem is not static. Fires, storms, droughts, and human activity can alter "
+            "the organisms and resources within it. Ecologists use the term resilience for an "
+            "ecosystem's ability to recover after such a disturbance. Recovery does not always "
+            "mean returning to exactly the same condition. Some species may become less common "
+            "while others occupy newly available space. Diversity can support resilience because "
+            "different species often respond to stress in different ways. Yet diversity alone is "
+            "not a guarantee: a disturbance may be too frequent or severe for normal recovery. "
+            "Researchers therefore study both the structure of an ecosystem and the history of "
+            "the pressures acting on it before deciding how it should be protected."
+        ),
+        "questions": [
+            {"id": "q1", "type": "main_idea", "prompt": "What does the passage explain about ecosystem resilience?", "answer": "It explains recovery after disturbance and the factors that can support or limit it."},
+            {"id": "q2", "type": "inference", "prompt": "Why may a recovered ecosystem differ from its earlier state?", "answer": "Species can respond differently and occupy newly available space."},
+        ],
+        "writing_prompt": "In 60–90 words, explain why recovery does not always mean restoration to an identical state.",
+    },
+    {
+        "id": "openstax-memory-retrieval",
+        "topic": "psychology",
+        "title": "Why retrieving a memory changes learning",
+        "level": "B1",
+        "source": {
+            "title": "OpenStax Psychology 2e",
+            "publisher": "OpenStax",
+            "url": "https://openstax.org/details/books/psychology-2e",
+            "license": "CC BY 4.0",
+        },
+        "passage": (
+            "Reading the same notes several times can create a feeling of familiarity, but "
+            "familiarity is not the same as being able to recall an idea. Retrieval practice "
+            "requires a learner to bring information to mind without first seeing the answer. "
+            "A short quiz, a blank-page summary, or an attempt to explain a concept can all serve "
+            "this purpose. The attempt may feel difficult, and mistakes are common, yet the act of "
+            "retrieval helps strengthen access to the memory. Feedback remains important because "
+            "it corrects errors before they become stable. Effective study therefore alternates "
+            "between recalling information and checking it, rather than treating repeated reading "
+            "as the only sign that learning has occurred."
+        ),
+        "questions": [
+            {"id": "q1", "type": "main_idea", "prompt": "How does retrieval practice differ from repeated reading?", "answer": "It asks learners to recall information before seeing the answer."},
+            {"id": "q2", "type": "function", "prompt": "Why does the passage mention feedback?", "answer": "Feedback corrects errors made during retrieval practice."},
+        ],
+        "writing_prompt": "In 50–80 words, compare rereading with retrieval practice.",
+    },
+    {
+        "id": "openstax-cultural-norms",
+        "topic": "society",
+        "title": "How norms guide ordinary behavior",
+        "level": "B1",
+        "source": {
+            "title": "Introduction to Sociology 3e",
+            "publisher": "OpenStax",
+            "url": "https://openstax.org/details/books/introduction-sociology-3e",
+            "license": "CC BY 4.0",
+        },
+        "passage": (
+            "People learn many social rules without receiving a written list of them. These "
+            "shared expectations, often called norms, shape ordinary actions such as taking turns, "
+            "choosing clothing, or speaking to a stranger. Some norms are supported by formal laws, "
+            "whereas others are enforced through approval, embarrassment, or exclusion. Because "
+            "norms vary between communities and change over time, behavior that seems natural in "
+            "one setting may appear unusual in another. Learning a new culture therefore involves "
+            "more than translating words. A learner must also notice which actions a group rewards, "
+            "which it discourages, and how strongly people react when an expectation is broken."
+        ),
+        "questions": [
+            {"id": "q1", "type": "main_idea", "prompt": "What role do social norms play?", "answer": "They create shared expectations that guide behavior."},
+            {"id": "q2", "type": "inference", "prompt": "Why can translation alone be insufficient in a new culture?", "answer": "A learner also needs to understand unwritten expectations and reactions."},
+        ],
+        "writing_prompt": "In 50–80 words, describe one unwritten norm and how people enforce it.",
+    },
+    {
+        "id": "openstax-trade-networks",
+        "topic": "history",
+        "title": "What moved through ancient trade networks",
+        "level": "B2",
+        "source": {
+            "title": "World History Volume 2",
+            "publisher": "OpenStax",
+            "url": "https://openstax.org/details/books/world-history-volume-2",
+            "license": "CC BY 4.0",
+        },
+        "passage": (
+            "Long-distance trade routes carried more than valuable goods. Merchants, sailors, "
+            "pilgrims, and diplomats also transported stories, technologies, artistic styles, and "
+            "religious ideas. A product could pass through several communities before reaching its "
+            "final buyer, so participants did not need to travel across an entire network themselves. "
+            "The same connections that encouraged exchange could also spread disease or intensify "
+            "competition over ports and roads. Historians therefore examine coins, shipwrecks, "
+            "letters, and borrowed words to reconstruct how regions influenced one another. These "
+            "sources reveal trade not as a simple movement between two places, but as a chain of "
+            "relationships that changed both local economies and cultural life."
+        ),
+        "questions": [
+            {"id": "q1", "type": "main_idea", "prompt": "Why were trade networks historically important beyond commerce?", "answer": "They also transmitted ideas, technologies, culture, and disease."},
+            {"id": "q2", "type": "detail", "prompt": "What evidence can historians use to reconstruct trade networks?", "answer": "Coins, shipwrecks, letters, and borrowed words."},
+        ],
+        "writing_prompt": "In 60–90 words, explain one benefit and one risk of a trade network.",
+    },
+    {
+        "id": "openstax-opportunity-cost",
+        "topic": "economics",
+        "title": "The cost hidden inside a choice",
+        "level": "B1",
+        "source": {
+            "title": "Principles of Economics 3e",
+            "publisher": "OpenStax",
+            "url": "https://openstax.org/details/books/principles-economics-3e",
+            "license": "CC BY 4.0",
+        },
+        "passage": (
+            "Every choice uses resources that could have served another purpose. Economists call "
+            "the value of the best alternative that is given up the opportunity cost. The idea "
+            "includes money, but it is not limited to money. A free public lecture may still have "
+            "a cost if attending it means missing work or giving up time with friends. Opportunity "
+            "cost also depends on the alternatives available to a particular person, so two people "
+            "can make the same visible choice while giving up very different things. Thinking in "
+            "these terms does not determine which choice is morally right. It simply makes the "
+            "trade-off explicit and helps explain why a decision that appears inexpensive may carry "
+            "a significant hidden cost."
+        ),
+        "questions": [
+            {"id": "q1", "type": "main_idea", "prompt": "What is opportunity cost?", "answer": "It is the value of the best alternative given up by a choice."},
+            {"id": "q2", "type": "inference", "prompt": "Why can a free event still have an opportunity cost?", "answer": "It may require giving up time or another valuable activity."},
+        ],
+        "writing_prompt": "In 50–80 words, explain the opportunity cost of one recent choice.",
+    },
 )
 
 
@@ -175,7 +314,7 @@ class ReadingTutorService:
         *,
         level: str = "B1",
         minutes: int = 10,
-        topic: str = "science",
+        topic: str = "mixed",
         collection_id: str | None = None,
         now: datetime | None = None,
     ) -> dict:
@@ -186,7 +325,12 @@ class ReadingTutorService:
         if minutes not in {5, 10, 15, 30}:
             raise ValueError("minutes must be 5, 10, 15, or 30")
         now = now or utc_now()
-        seed = self._select_seed(topic, now)
+        recent_lessons = self._recent_lessons(now)
+        seed = self._select_seed(
+            topic,
+            now,
+            {lesson["seed_id"] for lesson in recent_lessons},
+        )
         targets = self._target_items(collection_id, limit=4)
         request = {
             "date": now.date().isoformat(),
@@ -210,10 +354,12 @@ class ReadingTutorService:
             "lesson": {"level": level, "minutes": minutes, "topic": topic},
             "source_seed": seed,
             "learner": {"target_items": targets},
+            "recent_lessons": recent_lessons,
             "constraints": {
                 "target_word_count": {5: 100, 10: 180, 15: 260, 30: 420}[minutes],
                 "maximum_new_language_points": 4,
                 "preserve_source_facts": True,
+                "avoid_recent_subjects_and_titles": True,
             },
         }
         status = "generated"
@@ -266,11 +412,52 @@ class ReadingTutorService:
             ).fetchone()
         return json.loads(row["result_json"]) if row else None
 
+    def _recent_lessons(self, now: datetime, *, limit: int = 6) -> list[dict]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT seed_id, result_json
+                FROM reading_tutor_sessions
+                WHERE substr(created_at, 1, 10) < ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (now.date().isoformat(), limit),
+            ).fetchall()
+        lessons = []
+        for row in rows:
+            try:
+                result = json.loads(row["result_json"])
+            except (TypeError, json.JSONDecodeError):
+                result = {}
+            lessons.append(
+                {
+                    "seed_id": row["seed_id"],
+                    "title": str(result.get("title", "")),
+                    "topic": str(result.get("topic", "")),
+                }
+            )
+        return lessons
+
     @staticmethod
-    def _select_seed(topic: str, now: datetime) -> dict:
-        matches = [seed for seed in SEEDS if seed["topic"] == topic] or list(SEEDS)
-        index = int(hashlib.sha256(now.date().isoformat().encode()).hexdigest(), 16)
-        return matches[index % len(matches)]
+    def _select_seed(
+        topic: str,
+        now: datetime,
+        recent_seed_ids: set[str] | None = None,
+    ) -> dict:
+        matches = (
+            list(SEEDS)
+            if topic == "mixed"
+            else [seed for seed in SEEDS if seed["topic"] == topic]
+        )
+        if not matches:
+            matches = list(SEEDS)
+        recent_seed_ids = recent_seed_ids or set()
+        fresh = [seed for seed in matches if seed["id"] not in recent_seed_ids]
+        candidates = fresh or matches
+        key = f"{now.date().isoformat()}|{topic}"
+        index = int(hashlib.sha256(key.encode()).hexdigest(), 16)
+        return candidates[index % len(candidates)]
 
     def _target_items(self, collection_id: str | None, *, limit: int) -> list[dict]:
         collection_join = ""
@@ -356,7 +543,9 @@ def _generation_prompt(payload: dict) -> str:
         "title, passage, level, why_this_passage, target_lemmas, questions, and "
         "writing_prompt. Each question needs id, type (main_idea/detail/inference/function), "
         "prompt, and answer. Adapt wording and syntax to the learner, preserve the source "
-        "facts, and never claim the adapted passage is a quotation. Input:\n"
+        "facts, and never claim the adapted passage is a quotation. Avoid repeating recent "
+        "subjects and titles. Unless the selected source seed is about computing, do not "
+        "default to AI, machine learning, models, agents, or software examples. Input:\n"
         + json.dumps(payload, ensure_ascii=False, sort_keys=True)
     )
 

@@ -54,6 +54,7 @@ function showView(name) {
 }
 
 function selectedCollection() { return document.querySelector("#collection-select").value || null; }
+function selectedDailyNewLimit() { return Number(document.querySelector("#daily-new-limit").value || 8); }
 function formatNumber(value) { return new Intl.NumberFormat("zh-CN").format(value || 0); }
 
 function pronunciationHtml(item) {
@@ -139,6 +140,7 @@ async function loadStats() {
   const preferred = data.preferred_collection_id;
   if (collections.some(item => item.id === previous)) select.value = previous;
   else if (collections.some(item => item.id === preferred)) select.value = preferred;
+  document.querySelector("#daily-new-limit").value = String(data.daily_new_limit ?? 8);
   document.querySelector("#collection-summary").replaceChildren(...collections.map(item => {
     const row = document.createElement("div"); row.innerHTML = `<span>${escapeHtml(item.title)}</span><strong>${formatNumber(item.sense_count)}</strong>`; return row;
   }));
@@ -203,7 +205,7 @@ async function ensureTodayPlan() {
   if (!todayPlanPromise) {
     todayPlanPromise = api("/api/plans/today", {
       method: "POST",
-      body: JSON.stringify({review_limit: 30, new_limit: 8, collection_id: selectedCollection()}),
+      body: JSON.stringify({review_limit: 30, new_limit: selectedDailyNewLimit(), collection_id: selectedCollection()}),
     }).catch(error => { todayPlanPromise = null; throw error; });
   }
   return todayPlanPromise;
@@ -223,6 +225,8 @@ async function startLearning() {
     if (!learningItems.length) {
       const reason = data.effective_new_limit === 0 ? "复习积压较多，今天暂停增加新词。" : "今天的新词已经完成。";
       notify(reason, "success");
+    } else if (data.reused_plan && data.requested_new_limit !== selectedDailyNewLimit()) {
+      notify(`今天的计划已按 ${data.requested_new_limit} 个新词生成；新设置从下一个计划生效。`, "info");
     }
     renderLearning(); await loadStats();
   } finally {
@@ -241,7 +245,10 @@ function renderLearning() {
   document.querySelector("#learning-definition-zh").textContent = item.definition_zh || "暂无中文释义";
   const lexicalHolder = document.querySelector("#learning-lexical-analysis");
   lexicalHolder.innerHTML = lexicalAnalysisHtml(item);
-  if (needsLexicalInference(item)) void enrichLexicalItem(item, lexicalHolder, true);
+  const lexicalButton = document.querySelector("#learning-generate-lexical");
+  lexicalButton.hidden = !needsLexicalInference(item);
+  lexicalButton.disabled = false;
+  lexicalButton.textContent = "使用 LLM 补充构词分析（可选）";
   document.querySelector("#learning-assess").hidden = false;
   document.querySelector("#learning-ratings").hidden = true;
   learningStartedAt = performance.now();
@@ -526,6 +533,11 @@ document.querySelector("#assessment-start").addEventListener("click", () => void
 document.querySelectorAll("[data-assessment]").forEach(button => button.addEventListener("click", () => void answerAssessment(button.dataset.assessment).catch(error => notify(error.message, "error"))));
 document.querySelector("#learning-start").addEventListener("click", () => void startLearning().catch(error => notify(error.message, "error")));
 document.querySelector("#learning-assess").addEventListener("click", event => { event.currentTarget.hidden = true; document.querySelector("#learning-ratings").hidden = false; });
+document.querySelector("#learning-generate-lexical").addEventListener("click", event => {
+  const item = learningItems[learningIndex];
+  if (!item) return;
+  void enrichLexicalItem(item, document.querySelector("#learning-lexical-analysis"), false, event.currentTarget);
+});
 document.querySelectorAll("[data-learning-rating]").forEach(button => button.addEventListener("click", () => void rateLearning(button.dataset.learningRating).catch(error => notify(error.message, "error"))));
 document.querySelector("#review-start").addEventListener("click", () => void startReview().catch(error => notify(error.message, "error")));
 document.querySelector("#reveal-answer").addEventListener("click", event => { event.currentTarget.hidden = true; document.querySelector("#review-answer").hidden = false; document.querySelector("#review-ratings").hidden = false; });
@@ -543,6 +555,15 @@ document.querySelector("#collection-select").addEventListener("change", () => {
     method: "PUT",
     body: JSON.stringify({collection_id: collectionId}),
   }).then(() => notify("默认学习路线已保存，自动任务也会使用该词库。", "success"))
+    .catch(error => notify(error.message, "error"));
+});
+document.querySelector("#daily-new-limit").addEventListener("change", event => {
+  todayPlanPromise = null;
+  const newLimit = Number(event.currentTarget.value);
+  void api("/api/preferences/daily-plan", {
+    method: "PUT",
+    body: JSON.stringify({new_limit: newLimit}),
+  }).then(() => notify("每日新词数量已保存；今天已有计划时从下一个计划生效。", "success"))
     .catch(error => notify(error.message, "error"));
 });
 document.querySelector("#pronunciation-mode").addEventListener("change", () => {

@@ -134,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     plan = commands.add_parser("daily-plan", help="Return due reviews and new senses")
     plan.add_argument("--review-limit", type=int, default=30)
-    plan.add_argument("--new-limit", type=int, default=8)
+    plan.add_argument("--new-limit", type=int)
     plan.add_argument("--backlog-reduce-at", type=int, default=30)
     plan.add_argument("--backlog-stop-at", type=int, default=60)
     plan.add_argument("--collection-id")
@@ -143,6 +143,11 @@ def build_parser() -> argparse.ArgumentParser:
         "collection-preference", help="Set the default collection for new items"
     )
     preference.add_argument("--collection-id", required=True)
+
+    daily_preference = commands.add_parser(
+        "daily-preference", help="Set the default number of new senses per day"
+    )
+    daily_preference.add_argument("--new-limit", type=int, required=True)
 
     review = commands.add_parser("review", help="Record and schedule one review")
     review.add_argument("--card-id", required=True)
@@ -368,6 +373,8 @@ def run(args: argparse.Namespace) -> dict:
         )
     if args.command == "collection-preference":
         return service.set_preferred_collection(args.collection_id)
+    if args.command == "daily-preference":
+        return service.set_daily_new_limit(args.new_limit)
     if args.command == "review":
         return service.record_review(
             args.card_id,
