@@ -93,7 +93,7 @@ def build_provider_registry() -> ProviderRegistry:
         option_spec=ProviderOptionSpec(
             allowed=frozenset({
                 "host", "port", "label", "proxy_url",
-                "lookback_days", "max_messages",
+                "lookback_days", "max_messages", "from_domains",
             }),
         ),
     )

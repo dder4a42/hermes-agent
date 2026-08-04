@@ -71,10 +71,24 @@ class LibraryRepository:
             raise ValueError(f"Invalid newsletter parse status: {parse_status}")
         issue_id = f"ni_{uuid.uuid4().hex}"
         with self.connection:
-            existing = self.connection.execute(
-                "SELECT id FROM newsletter_issues WHERE source_id=? AND mailbox=? AND uid_validity=? AND uid=?",
-                (source_id, mailbox, uid_validity, uid),
-            ).fetchone()
+            # 去重键：Message-ID（全局稳定）优先，回退 body_hash，再回退旧
+            # (mailbox, uid_validity, uid) 键（schema UNIQUE 约束要求保留该键）。
+            existing = None
+            if message_id:
+                existing = self.connection.execute(
+                    "SELECT id FROM newsletter_issues WHERE source_id=? AND message_id=?",
+                    (source_id, message_id),
+                ).fetchone()
+            if existing is None and body_hash:
+                existing = self.connection.execute(
+                    "SELECT id FROM newsletter_issues WHERE source_id=? AND body_hash=?",
+                    (source_id, body_hash),
+                ).fetchone()
+            if existing is None and uid:
+                existing = self.connection.execute(
+                    "SELECT id FROM newsletter_issues WHERE source_id=? AND mailbox=? AND uid_validity=? AND uid=?",
+                    (source_id, mailbox, uid_validity, uid),
+                ).fetchone()
             if existing is not None:
                 return str(existing["id"])
             self.connection.execute(

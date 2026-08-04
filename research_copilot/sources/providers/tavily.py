@@ -8,6 +8,7 @@ import urllib.request
 from typing import Callable
 
 from research_copilot.library import ResearchItemDraft, TopicMatch
+from research_copilot.net import fetch as _net_fetch
 from research_copilot.sources.models import SourceDefinition
 
 from .base import FetchContext, ProviderError, ProviderItem, ProviderResult
@@ -16,9 +17,7 @@ HttpFetcher = Callable[[str, bytes, int, dict[str, str]], bytes]
 
 
 def _default_fetch(url: str, payload: bytes, timeout: int, headers: dict[str, str]) -> bytes:
-    request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
+    return _net_fetch(url, timeout=timeout, headers=headers, data=payload, method="POST")
 
 
 class TavilyProvider:

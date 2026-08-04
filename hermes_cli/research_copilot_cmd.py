@@ -178,11 +178,11 @@ def _health(_args: Any) -> int:
 
 
 def _scout(args: Any) -> int:
-    from research_copilot.scout import run_codex_scout, save_scout_result
+    from research_copilot.scout import newsletter_news_highlights, run_deepseek_scout, save_scout_result
 
     paths = _runtime()
     try:
-        result = run_codex_scout(
+        result = run_deepseek_scout(
             paths=paths, timeout_seconds=max(60, int(getattr(args, "timeout", 2700))),
         )
     except Exception as exc:
@@ -198,6 +198,23 @@ def _scout(args: Any) -> int:
         print("术语建议：" + ", ".join(result.payload["term_suggestions"]))
     if result.payload["source_suggestions"]:
         print("来源建议：" + ", ".join(result.payload["source_suggestions"]))
+    # 本周订阅邮件里的新闻热点（主管道的 topic 过滤会丢弃它们，周报里补回来）
+    try:
+        from research_copilot.runtime import open_library
+
+        connection, _repository = open_library(paths["database"])
+        try:
+            highlights = newsletter_news_highlights(connection, days=7)
+        finally:
+            connection.close()
+        if highlights:
+            print("\n【本周订阅新闻热点】")
+            for index, item in enumerate(highlights, start=1):
+                print(f"{index}. {item['title']}")
+                if item["url"]:
+                    print(f"   {item['url']}")
+    except Exception as exc:
+        print(f"（新闻热点读取失败：{exc}）")
     if not bool(getattr(args, "dry_run", False)):
         destination = save_scout_result(paths["data"], result.payload)
         print(f"已暂存：{destination}")

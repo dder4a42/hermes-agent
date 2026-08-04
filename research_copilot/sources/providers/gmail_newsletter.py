@@ -154,6 +154,7 @@ class GmailNewsletterProvider:
         host = str(source.options.get("host", "imap.gmail.com"))
         port = int(source.options.get("port", 993))
         label = str(source.options.get("label", "ResearchFeeds"))
+        from_domains = [str(d).strip() for d in (source.options.get("from_domains") or ()) if str(d).strip()]
         proxy_url = str(source.options.get("proxy_url", ""))
         lookback_days = int(source.options.get("lookback_days", 1))
         max_messages = min(
@@ -173,7 +174,8 @@ class GmailNewsletterProvider:
         filtered = 0
         seen: set[str] = set()
         try:
-            status, _ = client.select(f'"{label}"', readonly=True)
+            mailbox = "INBOX" if label.upper() == "INBOX" else f'"{label}"'
+            status, _ = client.select(mailbox, readonly=True)
             requests += 1
             if status != "OK":
                 raise ProviderError(
@@ -181,11 +183,26 @@ class GmailNewsletterProvider:
                     requests=requests,
                 )
             since = (context.started_at - timedelta(days=max(0, lookback_days))).strftime("%d-%b-%Y")
-            status, result = client.search(None, f"(SINCE {since})")
-            requests += 1
-            if status != "OK":
-                raise ProviderError("Gmail search failed", code="search_error", requests=requests, retryable=True)
-            message_ids = result[0].split() if result and result[0] else []
+            # 可选发件人域过滤：每个域单独 SEARCH（服务器端筛选），再合并去重。
+            # 空列表 = 拉取 mailbox 内全部邮件（ResearchFeeds label 模式）。
+            message_ids: list[bytes] = []
+            message_id_seen: set[bytes] = set()
+            if from_domains:
+                for domain in from_domains:
+                    status, result = client.search(None, f'(SINCE {since} FROM "{domain}")')
+                    requests += 1
+                    if status != "OK":
+                        raise ProviderError("Gmail search failed", code="search_error", requests=requests, retryable=True)
+                    for message_id in (result[0].split() if result and result[0] else []):
+                        if message_id not in message_id_seen:
+                            message_id_seen.add(message_id)
+                            message_ids.append(message_id)
+            else:
+                status, result = client.search(None, f"(SINCE {since})")
+                requests += 1
+                if status != "OK":
+                    raise ProviderError("Gmail search failed", code="search_error", requests=requests, retryable=True)
+                message_ids = result[0].split() if result and result[0] else []
             for message_id in message_ids[-max_messages:] if max_messages else ():
                 if len(items) >= context.remaining_items:
                     break
