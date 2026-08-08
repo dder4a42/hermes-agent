@@ -23,6 +23,7 @@ __pycache__/
 .uv-cache/
 compose.hermes.local.yml
 export*
+!research_copilot/export_obsidian.py
 __pycache__/model_tools.cpython-310.pyc
 __pycache__/web_tools.cpython-310.pyc
 logs/
