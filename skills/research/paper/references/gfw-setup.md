@@ -10,7 +10,7 @@ When running Hermes from China, some sources are blocked.
 | arXiv API | Direct | export.arxiv.org reachable |
 | Tavily API | Direct | api.tavily.com reachable |
 | Gmail IMAP | Port 993 | imap.gmail.com:993 works |
-| Semantic Scholar | Rate limited | API reachable, aggressive rate limiting |
+| Semantic Scholar | Disabled | Keep the Source Catalog entry disabled |
 | Hugging Face | Blocked | Use _fetch_via_proxy() |
 | AlphaXiv | Blocked | Use _fetch_via_proxy() |
 

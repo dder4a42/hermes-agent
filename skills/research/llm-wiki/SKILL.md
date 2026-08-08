@@ -1,7 +1,7 @@
 ---
 name: llm-wiki
 description: "Karpathy's LLM Wiki: build/query interlinked markdown KB."
-version: 2.1.0
+version: 3.0.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -35,13 +35,24 @@ Use this skill when the user:
 
 ## Wiki Location
 
-**Location:** Set via `WIKI_PATH` environment variable (e.g. in `${HERMES_HOME:-~/.hermes}/.env`).
+**Location:** Behavioral configuration belongs in the active profile's
+`config.yaml`, never `.env`:
 
-If unset, defaults to `~/wiki`.
+```yaml
+research_copilot:
+  wiki:
+    vault_path: ~/Documents/Obsidian Vault
+    library_subdir: Research Library
+```
+
+Configure it without editing YAML by hand:
 
 ```bash
-WIKI="${WIKI_PATH:-$HOME/wiki}"
+hermes research wiki configure --vault "$HOME/Documents/Obsidian Vault"
 ```
+
+Use `hermes research wiki export` to compile the profile-scoped SQLite Library
+into the vault and `hermes research wiki lint` to verify its invariants.
 
 The wiki is just a directory of markdown files — open it in Obsidian, VS Code, or
 any editor. No database, no special tooling required.
@@ -78,11 +89,10 @@ When the user has an existing wiki, **always orient yourself before doing anythi
 ③ **Scan recent `log.md`** — read the last 20-30 entries to understand recent activity.
 
 ```bash
-WIKI="${WIKI_PATH:-$HOME/wiki}"
 # Orientation reads at session start
-read_file "$WIKI/SCHEMA.md"
-read_file "$WIKI/index.md"
-read_file "$WIKI/log.md" offset=<last 30 lines>
+hermes research wiki lint
+# Then read SCHEMA.md, 00 - Index.md, and the tail of log.md under the
+# configured Research Library directory.
 ```
 
 Only after orientation should you ingest, query, or lint. This prevents:
@@ -98,7 +108,7 @@ at hand before creating anything new.
 
 When the user asks to create or start a wiki:
 
-1. Determine the wiki path (from `$WIKI_PATH` env var, or ask the user; default `~/wiki`)
+1. Configure the vault with `hermes research wiki configure --vault <path>`
 2. Create the directory structure above
 3. Ask the user what domain the wiki covers — be specific
 4. Write `SCHEMA.md` customized to the domain (see template below)
@@ -254,7 +264,37 @@ a `_meta/topic-map.md` that groups pages by theme for faster navigation.
 
 ## Core Operations
 
+### Research Copilot compilation
+
+When the wiki is backed by Hermes Research Copilot, SQLite under the active
+`HERMES_HOME` is the authoritative Layer 1: it preserves canonical identity, source evidence,
+recommendations, and profile isolation. Do not duplicate that state into an
+ad-hoc `raw/` tree. The exporter owns generated paper/news metadata and the
+index; the Agent owns `## 解读`, `## 相关笔记`, and curated concept/comparison/
+query pages.
+
+The supported workflow is:
+
+```bash
+hermes research doctor
+hermes research collect
+hermes research wiki export
+hermes research wiki lint
+hermes research wiki reconcile          # preview substantial existing analyses
+hermes research wiki reconcile --apply  # mark matched items deep_researched
+```
+
+Fix lint errors before adding more sources. Broken links, duplicate paper
+identities, and index omissions are consistency failures. Empty analysis and
+unlinked paper pages are curation backlog warnings. Reconciliation never
+changes the user's learning state and never infers `synthesized` merely from a
+filled seven-part note.
+
 ### 1. Ingest
+
+For a Research Copilot-backed wiki, ingest through `hermes research collect`
+and the Library providers; do not create a parallel `raw/` copy. The manual
+capture steps below apply to standalone wikis without a Library backend.
 
 When the user provides a source (URL, file, paste), integrate it into the wiki:
 

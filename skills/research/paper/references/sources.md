@@ -6,7 +6,7 @@
 |------|--------|------|----------|---------|-------|
 | 1 | HF Daily Papers | 1.0 | huggingface.co/api/daily_papers | None | Community upvoted, best signal |
 | 2 | Newsletters | 0.90 | Gmail IMAP (ResearchFeeds label) | GMAIL_APP_PASSWORD | Human-curated email subs |
-| 3 | Semantic Scholar | 0.85 | api.semanticscholar.org/graph/v1/paper/search | None | Citation-indexed |
+| disabled | Semantic Scholar | 0.85 | api.semanticscholar.org/graph/v1/paper/search | None | Provider retained for historical identity; keep catalog entry disabled |
 | 3 | AlphaXiv | 0.85 | alphaxiv.org | None | Discussion activity |
 | 4 | GitHub Trending | 0.80 | github.com/trending | None | Star velocity |
 | 5 | Tavily | 0.70 | api.tavily.com/search | TAVILY_API_KEY | Gated to quality domains |
@@ -14,21 +14,83 @@
 
 Tavily restricted domains: huggingface.co/papers, paperswithcode.com, semanticscholar.org, openreview.net, alphaxiv.org, blog.google, openai.com, anthropic.com, github.com.
 
-## Scoring Formula
+## Runtime configuration schemas
 
+`topics.yaml` owns discovery and classification only:
+
+```yaml
+schema_version: 2
+topics:
+  - id: research-agent
+    name: Research Agent
+    status: active
+    search_queries: [agentic research]
+    match_terms: [research agent]
+    exclude_terms: [game agent]
 ```
-final = 0.35 * relevance + 0.25 * source_tier + 0.25 * open_question_match + 0.15 * novelty
+
+`research-profile.yaml` owns research intent and links back to topics:
+
+```yaml
+schema_version: 2
+long_term_agenda:
+  - id: reliable-research-agents
+    topic_ids: [research-agent]
+    priority: 0.9
+    core_question: How should research agents maintain reliable evidence?
+    open_questions: [How should evidence-chain recovery be evaluated?]
+    knowledge_gaps: []
 ```
 
-Each dimension 0.0–1.0. Threshold: 0.65.
+Use `hermes research config validate` after edits. Use `hermes research config
+migrate` to preview a v1 conversion and add `--apply` only after reviewing the
+reported conflicts and backup behavior.
 
-When source_tier is missing from a candidate (legacy data), default to 0.5.
+The active deterministic scoring formula is defined by
+`research_copilot/ranking/scoring.py`. Do not reproduce or override its weights
+inside a skill.
 
-**⚠ Runtime override:** The formula above is the historical default. The active scoring weights are always read from `${HERMES_HOME}/research-copilot/config.json` at the start of each daily run. If config.json omits a dimension (e.g. no `source_tier` in current config), use only the dimensions present — the config is authoritative.
+Behavioral triage and promotion limits live in profile-aware `config.yaml`:
 
-Current config.json weights (as of July 2026): relevance=0.4, novelty=0.3, open_question_match=0.3 (no source_tier — all arXiv candidates share tier 0.5, making it non-discriminative at the scoring stage).
+```yaml
+research_copilot:
+  collection:
+    failure_cooldown:
+      threshold: 3
+      base_minutes: 60
+      max_hours: 24
+  ranking:
+    daily_triage_limit: 10
+    daily_recommendation_limit: 1
+    weekly_recommendation_limit: 3
+    triage_card_max_chars: 200
+    secondary_topic_bonus_cap: 0.10
+```
 
-## Data File Schemas
+RSS/Atom collection uses durable `ETag` and `Last-Modified` validators. Repeated
+failures enter exponential cooldown; inspect it with `hermes research health`
+or `hermes research doctor`. A dry run deliberately bypasses both cooldown and
+stored validators, performs a full diagnostic fetch, and writes no runtime
+state. Semantic Scholar catalog entries should remain disabled.
+
+Gmail collection uses `(mailbox, UIDVALIDITY, last_uid)` as its incremental
+cursor. UIDVALIDITY changes trigger a bounded lookback instead of trusting a
+stale UID. Never advance past a failed or partially emitted newsletter issue.
+
+RSS/Atom parsing must inspect namespaced full-content and provenance fields,
+not only `<description>`. Use a bounded dry run with `--show-items` to review
+`no_topic_match` and `excluded:*` samples. A parser that sees entries but emits
+none is `parser_degraded`; a parser that emits valid items later rejected by
+topic policy is `overfiltered` instead.
+
+Use `hermes research triage` for the cheap candidate layer. Only an item that
+survives triage should proceed to recommendation/deep reading. Secondary topic
+matches provide a bounded bonus; they never sum their full priorities.
+
+## Legacy JSON schemas
+
+The following files are migration inputs only. Current workflows must not read
+or update them.
 
 ### topics.json
 ```json
@@ -75,7 +137,7 @@ Source name values: hf_daily, semantic_scholar, alphaxiv, github_trending, tavil
 | Gmail IMAP | ✅ Reachable | Port 993 SSL only; port 143 blocked |
 | arXiv API | ✅ Reachable | export.arxiv.org |
 | Tavily API | ✅ Reachable | api.tavily.com |
-| Semantic Scholar API | ⚠ Rate-limited | 429 under burst; retry after backoff |
+| Semantic Scholar API | Disabled | Keep the Source Catalog entry disabled |
 | Hugging Face | ✗ Blocked (GFW) | Route through local Mihomo proxy (127.0.0.1:7890) |
 | AlphaXiv | ✗ Blocked | Route through same Mihomo proxy |
 

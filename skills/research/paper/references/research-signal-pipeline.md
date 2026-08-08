@@ -22,7 +22,7 @@ Candidate items should be treated as `ResearchSignal`, not only as papers. Types
 ## Source strategy
 
 Prefer community and frontier-source signals over raw arXiv:
-- HF Daily Papers, Semantic Scholar, AlphaXiv, newsletters.
+- HF Daily Papers, AlphaXiv, newsletters. Semantic Scholar remains disabled.
 - Frontier lab/company blogs: OpenAI, Anthropic, DeepMind, Google Research, Meta AI, NVIDIA, Microsoft Research, AI2.
 - Researcher/newsletter/community sources: Interconnects, Latent Space, LessWrong/Alignment Forum, BAIR, Stanford HAI/CRFM.
 - Tavily over curated domains can probe trends and fill gaps.
