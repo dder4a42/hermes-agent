@@ -380,6 +380,7 @@ def test_termux_fast_cli_launch_oneshot_uses_light_parser(monkeypatch, main_mod)
         "provider": "openai",
         "toolsets": None,
         "usage_file": None,
+        "json_output": False,
     }
 
 
@@ -619,6 +620,7 @@ def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
         "provider": None,
         "toolsets": "web,terminal",
         "usage_file": None,
+        "json_output": False,
     }
 
 
@@ -883,7 +885,59 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert not result.get("failed")
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
+    assert captured["request_overrides"] is None
     assert captured["prompt"] == "recall this"
+
+
+def test_oneshot_json_output_uses_native_response_format(monkeypatch):
+    """The opt-in stays a request override; ordinary conversations are unchanged."""
+    from hermes_cli.oneshot import _run_agent
+
+    captured = {}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.suppress_status_output = False
+            self.stream_delta_callback = object()
+            self.tool_gen_callback = object()
+
+        def run_conversation(self, prompt, **_kwargs):
+            return {"final_response": "{}", "failed": False, "partial": False}
+
+    def mod(name, **attrs):
+        module = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        return module
+
+    monkeypatch.setitem(sys.modules, "run_agent", mod("run_agent", AIAgent=FakeAgent))
+    monkeypatch.setitem(sys.modules, "hermes_state", mod("hermes_state", SessionDB=lambda: None))
+    monkeypatch.setitem(
+        sys.modules, "hermes_cli.config",
+        mod("hermes_cli.config", load_config=lambda: {"model": {"default": "m"}}),
+    )
+    monkeypatch.setitem(
+        sys.modules, "hermes_cli.models",
+        mod("hermes_cli.models", detect_provider_for_model=lambda *_args, **_kwargs: None),
+    )
+    monkeypatch.setitem(
+        sys.modules, "hermes_cli.runtime_provider",
+        mod("hermes_cli.runtime_provider", resolve_runtime_provider=lambda **_kwargs: {
+            "api_key": "k", "base_url": "u", "provider": "deepseek",
+            "api_mode": "chat_completions", "credential_pool": None,
+        }),
+    )
+    monkeypatch.setitem(
+        sys.modules, "hermes_cli.tools_config",
+        mod("hermes_cli.tools_config", _get_platform_tools=lambda *_args, **_kwargs: set()),
+    )
+
+    text, _result = _run_agent("return JSON", json_output=True)
+    assert text == "{}"
+    assert captured["request_overrides"] == {
+        "response_format": {"type": "json_object"},
+    }
 
 
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):

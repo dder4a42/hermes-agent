@@ -123,6 +123,15 @@ def build_top_level_parser():
             "can always account for spend. No effect outside -z/--oneshot."
         ),
     )
+    parser.add_argument(
+        "--json-output",
+        action="store_true",
+        help=(
+            "One-shot mode only: request a valid JSON object through the "
+            "provider's native response_format support. The prompt must still "
+            "describe and validate the expected object shape."
+        ),
+    )
     # --model / --provider are accepted at the top level so they can pair
     # with -z without needing the `chat` subcommand.  If neither -z nor a
     # subcommand consumes them, they fall through harmlessly as None.

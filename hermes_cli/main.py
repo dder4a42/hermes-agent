@@ -4245,7 +4245,7 @@ def cmd_cron(args):
     """Cron job management."""
     from hermes_cli.cron import cron_command
 
-    cron_command(args)
+    return cron_command(args)
 
 
 def cmd_webhook(args):
@@ -4359,7 +4359,7 @@ def cmd_config(args):
     """Configuration management."""
     from hermes_cli.config import config_command
 
-    config_command(args)
+    return config_command(args)
 
 
 def cmd_backup(args):
@@ -12578,6 +12578,7 @@ def _try_termux_fast_cli_launch() -> bool:
                 provider=getattr(args, "provider", None),
                 toolsets=getattr(args, "toolsets", None),
                 usage_file=getattr(args, "usage_file", None),
+                json_output=bool(getattr(args, "json_output", False)),
             )
         )
 
@@ -14694,6 +14695,7 @@ def main():
                 provider=getattr(args, "provider", None),
                 toolsets=getattr(args, "toolsets", None),
                 usage_file=getattr(args, "usage_file", None),
+                json_output=bool(getattr(args, "json_output", False)),
             )
         )
 
@@ -14732,7 +14734,7 @@ def main():
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        return args.func(args)
     else:
         parser.print_help()
 
