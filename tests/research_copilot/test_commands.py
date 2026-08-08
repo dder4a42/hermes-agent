@@ -44,6 +44,13 @@ topics:
     priority: 0.35
     status: dormant
 """)
+    (data_dir / "research-profile.yaml").write_text("""
+long_term_agenda:
+  - id: research-agent
+    priority: 0.98
+  - id: world-model
+    priority: 0.35
+""")
 
     from research_copilot.commands import handle_paper_command
 
@@ -54,7 +61,7 @@ topics:
     assert "Research Agent" in output
     assert "active" in output
     assert "world-model" in output
-    assert "dormant" in output
+    assert "inactive" in output
 
 
 def test_paper_history_lists_recent_recommendations(tmp_path, monkeypatch):
@@ -73,6 +80,40 @@ def test_paper_history_lists_recent_recommendations(tmp_path, monkeypatch):
     assert old not in output
 
 
+def test_paper_study_renders_a_bounded_learning_package(tmp_path, monkeypatch):
+    home = tmp_path / "profile-a"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    item_id = _seed_recommendation(home, title="Reliable Research Agent")
+
+    from research_copilot.commands import handle_paper_command
+
+    output = handle_paper_command("study 1")
+
+    assert "今日学习包" in output
+    assert item_id in output
+    assert "3 分钟摘要" in output
+    assert "证据边界" in output
+    assert f"/paper start {item_id}" in output
+
+
+def test_paper_start_changes_only_user_learning_state(tmp_path, monkeypatch):
+    home = tmp_path / "profile-a"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    item_id = _seed_recommendation(home)
+
+    from research_copilot.commands import handle_paper_command
+
+    assert "Marked reading" in handle_paper_command(f"start {item_id}")
+    from research_copilot.runtime import open_library
+    connection, _ = open_library(home / "research-copilot" / "library.db")
+    row = connection.execute(
+        "SELECT agent_analysis_status,user_learning_status FROM research_items WHERE id=?",
+        (item_id,),
+    ).fetchone()
+    assert tuple(row) == ("none", "reading")
+    connection.close()
+
+
 def test_paper_save_records_interaction_and_updates_candidate(tmp_path, monkeypatch):
     home = tmp_path / "profile-a"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -85,7 +126,10 @@ def test_paper_save_records_interaction_and_updates_candidate(tmp_path, monkeypa
     assert f"Saved {item_id}" in output
     from research_copilot.runtime import open_library
     connection, _ = open_library(home / "research-copilot" / "library.db")
-    assert connection.execute("SELECT status FROM research_items WHERE id=?", (item_id,)).fetchone()[0] == "saved"
+    row = connection.execute(
+        "SELECT workflow_state,user_learning_status FROM research_items WHERE id=?", (item_id,),
+    ).fetchone()
+    assert tuple(row) == ("discovered", "saved")
     assert connection.execute("SELECT kind FROM feedback_events WHERE item_id=?", (item_id,)).fetchone()[0] == "save"
     connection.close()
 
@@ -123,6 +167,25 @@ def test_paper_feedback_records_free_text(tmp_path, monkeypatch):
     row = connection.execute("SELECT kind,payload_json FROM feedback_events WHERE item_id=?", (item_id,)).fetchone()
     assert row["kind"] == "note"
     assert json.loads(row["payload_json"])["text"] == "useful for harness design"
+    connection.close()
+
+
+def test_paper_synthesize_advances_a_read_item(tmp_path, monkeypatch):
+    home = tmp_path / "profile-a"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    item_id = _seed_recommendation(home)
+
+    from research_copilot.commands import handle_paper_command
+
+    handle_paper_command(f"read {item_id}")
+    output = handle_paper_command(f"synthesize {item_id}")
+
+    assert f"Marked synthesized {item_id}" in output
+    from research_copilot.runtime import open_library
+    connection, _ = open_library(home / "research-copilot" / "library.db")
+    assert connection.execute(
+        "SELECT workflow_state FROM research_items WHERE id=?", (item_id,)
+    ).fetchone()[0] == "synthesized"
     connection.close()
 
 

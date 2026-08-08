@@ -107,11 +107,38 @@ def test_research_alias_dispatches_library_commands():
     parser = argparse.ArgumentParser(prog="hermes")
     sub = parser.add_subparsers(dest="command")
     build_research_copilot_parser(sub, cmd_research_copilot=lambda args: args)
-    ns = parser.parse_args(["research", "collect", "--source", "rss", "--dry-run"])
+    ns = parser.parse_args([
+        "research", "collect", "--source", "rss", "--dry-run",
+        "--max-requests", "2", "--max-new-items", "5", "--show-items",
+    ])
     assert ns.command == "research"
     assert ns.research_copilot_command == "collect"
     assert ns.source == "rss"
     assert ns.dry_run is True
+    assert ns.max_requests == 2
+    assert ns.max_new_items == 5
+    assert ns.show_items is True
+
+
+def test_research_parser_supports_source_toggle():
+    from hermes_cli.subcommands.research_copilot import build_research_copilot_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_research_copilot_parser(sub, cmd_research_copilot=lambda args: args)
+    ns = parser.parse_args(["research", "sources", "disable", "alphaxiv"])
+    assert ns.research_sources_command == "disable"
+    assert ns.source_id == "alphaxiv"
+    option = parser.parse_args([
+        "research", "sources", "set-option", "tavily", "require_title_match", "true",
+    ])
+    assert option.key == "require_title_match"
+    assert option.value == "true"
+    budget = parser.parse_args([
+        "research", "sources", "set-budget", "tavily", "max_requests", "8",
+    ])
+    assert budget.key == "max_requests"
+    assert budget.value == 8
 
 
 def test_research_parser_supports_preference_removal():
@@ -125,6 +152,134 @@ def test_research_parser_supports_preference_removal():
     profile = parser.parse_args(["research", "profile", "remove-agenda", "world-model-adjacent"])
     assert topics.topic_id == "world-model"
     assert profile.agenda_id == "world-model-adjacent"
+
+
+def test_research_parser_supports_preference_validation_and_migration():
+    from hermes_cli.subcommands.research_copilot import build_research_copilot_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_research_copilot_parser(sub, cmd_research_copilot=lambda args: args)
+
+    validate = parser.parse_args(["research", "config", "validate"])
+    migrate = parser.parse_args(["research", "config", "migrate", "--apply"])
+    assert validate.research_config_command == "validate"
+    assert migrate.research_config_command == "migrate"
+    assert migrate.apply is True
+
+
+def test_research_parser_supports_bounded_triage():
+    from hermes_cli.subcommands.research_copilot import build_research_copilot_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_research_copilot_parser(sub, cmd_research_copilot=lambda args: args)
+    triage = parser.parse_args(["research", "triage", "--limit", "4", "--json"])
+    assert triage.research_copilot_command == "triage"
+    assert triage.limit == 4
+    assert triage.json is True
+
+
+def test_research_parser_supports_guarded_duplicate_merge():
+    from hermes_cli.subcommands.research_copilot import build_research_copilot_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_research_copilot_parser(sub, cmd_research_copilot=lambda args: args)
+    parsed = parser.parse_args([
+        "research", "duplicates", "--merge", "ri_source", "--into", "ri_target",
+        "--reason", "verified", "--apply",
+    ])
+    assert parsed.research_copilot_command == "duplicates"
+    assert parsed.merge == "ri_source"
+    assert parsed.into == "ri_target"
+    assert parsed.apply is True
+
+
+def test_research_parser_supports_evidence_review_and_profile_proposal():
+    from hermes_cli.subcommands.research_copilot import build_research_copilot_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_research_copilot_parser(sub, cmd_research_copilot=lambda args: args)
+    add = parser.parse_args([
+        "research", "evidence", "add", "ri_1", "--belief", "belief-a",
+        "--relation", "supports", "--claim-type", "source_claim",
+        "--strength", "0.8", "--source-quality", "primary", "--claim", "Claim",
+    ])
+    review = parser.parse_args([
+        "research", "evidence", "review", "ev_1", "--accept", "--note", "checked",
+    ])
+    proposal = parser.parse_args(["research", "profile-proposal", "--dry-run"])
+    assert add.research_evidence_command == "add"
+    assert add.strength == 0.8
+    assert review.accept is True and review.reject is False
+    assert proposal.dry_run is True
+
+
+def test_research_parser_supports_structured_deep_research_import():
+    from hermes_cli.subcommands.research_copilot import build_research_copilot_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_research_copilot_parser(sub, cmd_research_copilot=lambda args: args)
+    parsed = parser.parse_args([
+        "research", "deep-research", "import", "artifact.yaml", "--apply",
+    ])
+    assert parsed.research_deep_research_command == "import"
+    assert parsed.path == "artifact.yaml"
+    assert parsed.apply is True
+
+    run = parser.parse_args([
+        "research", "deep-research", "run", "--item-id", "ri_1", "--dry-run",
+    ])
+    assert run.research_deep_research_command == "run"
+    assert run.item_id == "ri_1"
+    assert run.dry_run is True
+
+
+def test_research_parser_supports_wiki_workflow():
+    from hermes_cli.subcommands.research_copilot import build_research_copilot_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_research_copilot_parser(sub, cmd_research_copilot=lambda args: args)
+
+    configure = parser.parse_args(["research", "wiki", "configure", "--vault", "/notes"])
+    reconcile = parser.parse_args(["research", "wiki", "reconcile", "--apply"])
+    export = parser.parse_args(["research", "wiki", "export", "--full"])
+    lint = parser.parse_args(["research", "wiki", "lint", "--json"])
+    publish_check = parser.parse_args(["research", "wiki", "publish-check"])
+    assert configure.research_wiki_command == "configure"
+    assert configure.vault == "/notes"
+    assert reconcile.research_wiki_command == "reconcile"
+    assert reconcile.apply is True
+    assert export.full is True
+    assert lint.json is True
+    assert publish_check.research_wiki_command == "publish-check"
+
+
+def test_wiki_configure_persists_behavioral_settings(monkeypatch, capsys):
+    from hermes_cli import config as config_module
+    from hermes_cli.research_copilot_cmd import cmd_research_copilot
+
+    current = {}
+    saved = []
+    monkeypatch.setattr(config_module, "load_config", lambda: current)
+    monkeypatch.setattr(config_module, "save_config", lambda value: saved.append(value))
+
+    result = cmd_research_copilot(argparse.Namespace(
+        research_copilot_command="wiki",
+        research_wiki_command="configure",
+        vault="~/Notes",
+        library_subdir="Research Library",
+    ))
+    assert result == 0
+    assert saved[0]["research_copilot"]["wiki"] == {
+        "vault_path": str(Path("~/Notes").expanduser()),
+        "library_subdir": "Research Library",
+    }
+    assert "config.yaml" in capsys.readouterr().out
 
 
 def test_preference_removal_updates_yaml_and_creates_backups(tmp_path, monkeypatch, capsys):
@@ -162,6 +317,7 @@ def test_library_cli_validate_health_doctor_and_empty_recommendation(tmp_path, m
     data.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     (data / "topics.yaml").write_text("topics: []\n")
+    (data / "research-profile.yaml").write_text("long_term_agenda: []\n")
     (data / "sources.yaml").write_text("schema_version: 1\nsources: []\n")
 
     from hermes_cli.research_copilot_cmd import cmd_research_copilot
@@ -190,3 +346,79 @@ def test_library_cli_validate_health_doctor_and_empty_recommendation(tmp_path, m
         research_copilot_command="recommend", dry_run=True, threshold=0.72,
     )) == 0
     assert "No Research Item cleared" in capsys.readouterr().out
+
+
+def test_evidence_cli_reviews_claim_and_writes_non_mutating_proposal(
+    tmp_path, monkeypatch, capsys,
+):
+    from datetime import datetime, timezone
+
+    from research_copilot.library import ResearchItemDraft, SourceEvidence
+    from research_copilot.runtime import open_library
+
+    home = tmp_path / "home"
+    data = home / "research-copilot"
+    data.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (data / "topics.yaml").write_text(yaml.safe_dump({
+        "schema_version": 2,
+        "topics": [{
+            "id": "agent", "status": "active", "search_queries": ["agent"],
+            "match_terms": ["agent"], "exclude_terms": [],
+        }],
+    }))
+    profile = data / "research-profile.yaml"
+    profile.write_text(yaml.safe_dump({
+        "schema_version": 2,
+        "long_term_agenda": [{
+            "id": "agenda-a", "topic_ids": ["agent"],
+            "current_beliefs": [{
+                "id": "belief-a", "statement": "State improves reliability",
+                "confidence": 0.8,
+            }],
+        }],
+        "evidence_ledger": [],
+    }, sort_keys=False))
+    profile_before = profile.read_bytes()
+
+    connection, repository = open_library(data / "library.db")
+    now = datetime(2026, 8, 8, tzinfo=timezone.utc)
+    repository.upsert_source(
+        source_id="test", provider="test", display_name="Test",
+        source_type="paper", tier=1.0, now=now,
+    )
+    item = repository.upsert_item(
+        ResearchItemDraft(title="Agent State", url="https://example.com/paper"),
+        source=SourceEvidence("test"), discovered_at=now,
+    )
+    repository.record_feedback(item.item_id, kind="read", created_at=now)
+    connection.close()
+
+    from hermes_cli.research_copilot_cmd import cmd_research_copilot
+
+    assert cmd_research_copilot(argparse.Namespace(
+        research_copilot_command="evidence", research_evidence_command="add",
+        item_id=item.item_id, belief="belief-a", prompt=None,
+        relation="supports", claim_type="source_claim", strength=0.8,
+        source_quality="primary", claim="Controlled evidence supports the claim.",
+        rationale="Read in the results section",
+    )) == 0
+    assert "Pending evidence created" in capsys.readouterr().out
+
+    connection, repository = open_library(data / "library.db")
+    evidence_id = repository.list_evidence()[0]["id"]
+    connection.close()
+    assert cmd_research_copilot(argparse.Namespace(
+        research_copilot_command="evidence", research_evidence_command="review",
+        evidence_id=evidence_id, accept=True, reject=False, note="verified",
+    )) == 0
+    assert cmd_research_copilot(argparse.Namespace(
+        research_copilot_command="profile-proposal", dry_run=False,
+    )) == 0
+
+    proposals = list((data / "reports" / "profile-proposals").glob("*.yaml"))
+    assert len(proposals) == 1
+    proposal = yaml.safe_load(proposals[0].read_text())
+    assert proposal["policy"]["mutates_profile"] is False
+    assert proposal["belief_updates"][0]["belief_id"] == "belief-a"
+    assert profile.read_bytes() == profile_before

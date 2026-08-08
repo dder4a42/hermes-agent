@@ -10,10 +10,19 @@ restores proxy routing everywhere.
 from __future__ import annotations
 
 import os
+import http.client
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Mapping
+
+
+@dataclass(frozen=True)
+class HttpResponse:
+    body: bytes
+    status: int
+    headers: Mapping[str, str]
 
 
 def proxy_url() -> str:
@@ -34,7 +43,8 @@ def fetch(
     data: bytes | None = None,
     method: str | None = None,
     retries: int = 3,
-) -> bytes:
+    return_response: bool = False,
+) -> bytes | HttpResponse:
     """Fetch ``url`` through the configured proxy with transient retries.
 
     HTTP status errors (4xx/5xx) re-raise immediately; connection/SSL
@@ -54,13 +64,27 @@ def fetch(
     for attempt in range(max(1, retries)):
         try:
             with opener.open(request, timeout=timeout) as response:
-                return response.read()
-        except urllib.error.HTTPError:
+                body = response.read()
+                if return_response:
+                    return HttpResponse(
+                        body=body,
+                        status=int(getattr(response, "status", None) or response.getcode() or 200),
+                        headers={str(key): str(value) for key, value in response.headers.items()},
+                    )
+                return body
+        except urllib.error.HTTPError as exc:
+            if return_response and exc.code == 304:
+                return HttpResponse(
+                    body=b"", status=304,
+                    headers={str(key): str(value) for key, value in (exc.headers or {}).items()},
+                )
             raise
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.IncompleteRead) as exc:
             last_error = exc
             if attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))
     if last_error is not None:
+        if isinstance(last_error, http.client.IncompleteRead):
+            raise urllib.error.URLError(f"truncated HTTP response: {last_error}") from last_error
         raise last_error
     raise urllib.error.URLError("fetch failed")  # pragma: no cover

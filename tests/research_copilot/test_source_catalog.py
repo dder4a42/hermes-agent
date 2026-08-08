@@ -104,6 +104,20 @@ def test_rejects_duplicate_source_ids(tmp_path):
         """))
 
 
+def test_duplicate_topics_are_normalized_with_warning(tmp_path):
+    catalog = _load(_write(tmp_path, """
+        schema_version: 1
+        sources:
+          - id: x
+            provider: rss
+            display_name: X
+            type: feed
+            topics: [research-agent, research-agent]
+    """))
+    assert catalog.by_id("x").topics == ("research-agent",)
+    assert catalog.warnings == ("Duplicate topics removed for x",)
+
+
 def test_provider_registry_rejects_duplicates_and_unknown_ids():
     registry = ProviderRegistry()
     provider = object()

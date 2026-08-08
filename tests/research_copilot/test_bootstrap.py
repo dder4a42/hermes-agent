@@ -1,4 +1,5 @@
 import json
+import yaml
 
 import pytest
 
@@ -19,12 +20,35 @@ def test_initialize_research_copilot_home_copies_profile_files_without_legacy_sc
 
     assert result["data_dir"] == str(target / "research-copilot")
     assert (target / "research-copilot" / "topics.json").exists()
+    assert yaml.safe_load((target / "research-copilot" / "topics.yaml").read_text()) == {
+        "schema_version": 2, "topics": [],
+    }
+    assert yaml.safe_load((target / "research-copilot" / "research-config.yaml").read_text())["schema_version"] == 2
+    assert yaml.safe_load((target / "research-copilot" / "sources.yaml").read_text()) == {
+        "schema_version": 1, "sources": [],
+    }
     assert json.loads((target / "research-copilot" / "config.json").read_text())["pipeline"] == "test"
     assert (target / "research-copilot" / "candidates.jsonl").exists()
     assert (target / "research-copilot" / "recommendations.jsonl").exists()
     assert (target / "research-copilot" / "interactions.jsonl").exists()
     assert not (target / "scripts" / "paper-fetch.py").exists()
     assert not (target / "scripts" / "paper-health.py").exists()
+
+
+def test_initialize_renames_legacy_research_profile_to_research_config(tmp_path):
+    from research_copilot.bootstrap import initialize_research_copilot_home
+
+    target = tmp_path / "profiles" / "alice"
+    data = target / "research-copilot"
+    data.mkdir(parents=True)
+    legacy = data / "research-profile.yaml"
+    legacy.write_text("schema_version: 2\nlong_term_agenda:\n  - id: retained\n")
+
+    initialize_research_copilot_home(target)
+
+    canonical = data / "research-config.yaml"
+    assert not legacy.exists()
+    assert yaml.safe_load(canonical.read_text())["long_term_agenda"][0]["id"] == "retained"
 
 
 def test_install_research_copilot_cron_is_profile_scoped_and_idempotent(tmp_path, monkeypatch):
@@ -41,7 +65,14 @@ def test_install_research_copilot_cron_is_profile_scoped_and_idempotent(tmp_path
     first = install_research_copilot_cron(profile_home, deliver="weixin")
     second = install_research_copilot_cron(profile_home, deliver="weixin")
 
-    expected = ["paper-fetcher", "research-library-recommend", "paper-health-report", "task-surfacer", "thought-surfacer"]
+    expected = [
+        "paper-fetcher", "research-library-recommend",
+        "research-recommend-delivery-retry",
+        "research-weekly-deep-research", "research-deep-delivery-retry",
+        "research-scout-delivery-retry",
+        "paper-health-report",
+        "task-surfacer", "thought-surfacer",
+    ]
     assert first["created"] == expected
     assert second["created"] == []
     assert second["existing"] == expected
@@ -53,6 +84,14 @@ def test_install_research_copilot_cron_is_profile_scoped_and_idempotent(tmp_path
     scripts = {job["name"]: job.get("script") for job in jobs}
     assert scripts["paper-fetcher"] == "module:research_copilot.scripts.library_collect"
     assert scripts["paper-health-report"] == "module:research_copilot.scripts.library_health"
+    assert scripts["research-weekly-deep-research"] == "module:research_copilot.scripts.library_deep_research"
+    assert scripts["research-recommend-delivery-retry"] == "module:research_copilot.scripts.library_recommend_delivery"
+    schedules = {job["name"]: job.get("schedule") for job in jobs}
+    assert schedules["research-recommend-delivery-retry"]["expr"] == "*/5 * * * *"
+    assert schedules["research-deep-delivery-retry"]["expr"] == "*/5 * * * *"
+    assert schedules["research-scout-delivery-retry"]["expr"] == "*/5 * * * *"
+    assert scripts["research-deep-delivery-retry"] == "module:research_copilot.scripts.library_deep_research_delivery"
+    assert scripts["research-scout-delivery-retry"] == "module:research_copilot.scripts.library_scout_delivery"
     recommend = next(job for job in jobs if job["name"] == "research-library-recommend")
     assert recommend["script"] == "module:research_copilot.scripts.library_recommend"
     assert recommend["no_agent"] is False
@@ -76,6 +115,7 @@ def test_repo_fallback_installs_skill_without_legacy_paper_scripts(tmp_path):
     # Neutral JSON defaults created.
     assert (target / "research-copilot" / "config.json").exists()
     assert (target / "research-copilot" / "topics.json").exists()
+    assert (target / "research-copilot" / "topics.yaml").exists()
 
     # Research business logic stays in the installed package.
     fetch_dst = target / "scripts" / "paper-fetch.py"

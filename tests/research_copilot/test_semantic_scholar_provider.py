@@ -69,6 +69,20 @@ def test_semantic_scholar_stops_at_request_budget():
     assert len(calls) == 1
 
 
+def test_semantic_scholar_unions_topics_when_queries_return_same_paper():
+    context = FetchContext(
+        started_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
+        active_topic_ids=("a", "b"), remaining_requests=2, remaining_items=10,
+        topic_queries={"a": ("query a",), "b": ("query b",)},
+    )
+    payload = json.dumps({"data": [{
+        "paperId": "same", "title": "Same Paper", "externalIds": {},
+    }]}).encode()
+    result = SemanticScholarProvider(fetcher=lambda *_: payload).fetch(_source(), context)
+    assert len(result.items) == 1
+    assert {topic.topic_id for topic in result.items[0].topics} == {"a", "b"}
+
+
 def test_semantic_scholar_429_is_structured():
     def fail(url, timeout, headers):
         raise urllib.error.HTTPError(url, 429, "limited", {}, None)

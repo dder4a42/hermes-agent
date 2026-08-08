@@ -108,6 +108,10 @@ def test_cron_bootstrap_is_scoped_per_profile(tmp_path, monkeypatch):
 
     assert alice_names == {
         "paper-fetcher", "research-library-recommend", "paper-health-report",
+        "research-recommend-delivery-retry",
+        "research-weekly-deep-research",
+        "research-deep-delivery-retry",
+        "research-scout-delivery-retry",
         "task-surfacer", "thought-surfacer",
     }
     assert bob_names == set(), "installing cron in alice must not touch bob"

@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,26 @@ def _write_jsonl(path: Path, rows):
     path.write_text("\n".join(json.dumps(r) for r in rows) + ("\n" if rows else ""))
 
 
+def _seed_recommendation(data_dir: Path, *, title: str, recommended_at: datetime) -> str:
+    from research_copilot.library import ResearchItemDraft, SourceEvidence
+    from research_copilot.runtime import open_library
+
+    connection, repository = open_library(data_dir / "library.db")
+    repository.upsert_source(
+        source_id="test", provider="test", display_name="Test", source_type="paper",
+        tier=0.9, now=recommended_at,
+    )
+    item = repository.upsert_item(
+        ResearchItemDraft(title=title, url=f"https://example.com/{title}"),
+        source=SourceEvidence("test"), discovered_at=recommended_at,
+    )
+    repository.record_recommendation(
+        item.item_id, score=0.9, score_breakdown={}, recommended_at=recommended_at,
+    )
+    connection.close()
+    return item.item_id
+
+
 def _run(cmd: str, capsys) -> str:
     DummyCLI()._handle_paper_command(cmd)
     return capsys.readouterr().out
@@ -35,14 +56,16 @@ def _run(cmd: str, capsys) -> str:
 
 def test_topics_prints_active_topics(profile, capsys):
     _, data_dir = profile
-    _write_json(data_dir / "topics.json", {
-        "topics": [
-            {"id": "research-agent", "name": "Research Agent",
-             "priority": 0.98, "status": "active"},
-            {"id": "old-topic", "name": "Old Topic",
-             "priority": 0.4, "status": "dormant"},
-        ],
-    })
+    (data_dir / "topics.yaml").write_text("""
+topics:
+  - {id: research-agent, name: Research Agent, priority: 0.98, status: active}
+  - {id: old-topic, name: Old Topic, priority: 0.4, status: dormant}
+""")
+    (data_dir / "research-profile.yaml").write_text("""
+long_term_agenda:
+  - {id: research-agent, priority: 0.98}
+  - {id: old-topic, priority: 0.4}
+""")
     out = _run("paper topics", capsys)
     assert "Research Copilot Topics" in out
     assert "research-agent" in out
@@ -52,112 +75,97 @@ def test_topics_prints_active_topics(profile, capsys):
 
 def test_history_shows_recent_recommendations(profile, capsys):
     _, data_dir = profile
-    _write_jsonl(data_dir / "recommendations.jsonl", [
-        {"id": "2607.08768", "recommended_at": "2026-07-12T09:00Z",
-         "score": 0.86, "title": "UniClawBench",
-         "topic_matches": ["Research Agent"]},
-        {"id": "2607.01083", "recommended_at": "2026-07-12T14:00Z",
-         "score": 0.9, "title": "Staleness-Learning RLHF",
-         "topic_matches": ["RL Post-Training"]},
-    ])
+    old = _seed_recommendation(
+        data_dir, title="UniClawBench",
+        recommended_at=datetime(2026, 7, 12, 9, tzinfo=timezone.utc),
+    )
+    new = _seed_recommendation(
+        data_dir, title="Staleness-Learning RLHF",
+        recommended_at=datetime(2026, 7, 12, 14, tzinfo=timezone.utc),
+    )
     out = _run("paper history 5", capsys)
     assert "Recent Research Picks" in out
-    assert "2607.08768" in out
+    assert old in out
+    assert new in out
     assert "UniClawBench" in out
     assert "Staleness-Learning" in out
 
 
 def test_save_records_interaction_and_updates_status(profile, capsys):
     _, data_dir = profile
-    _write_jsonl(data_dir / "recommendations.jsonl", [
-        {"id": "2607.08768", "recommended_at": "2026-07-12T09:00Z",
-         "score": 0.86, "title": "UniClawBench"},
-    ])
-    _write_jsonl(data_dir / "candidates.jsonl", [
-        {"id": "2607.08768", "type": "paper", "title": "UniClawBench",
-         "url": "https://arxiv.org/abs/2607.08768",
-         "discovered_at": "2026-07-12T06:00Z", "status": "recommended"},
-    ])
+    item_id = _seed_recommendation(
+        data_dir, title="UniClawBench",
+        recommended_at=datetime(2026, 7, 12, 9, tzinfo=timezone.utc),
+    )
 
-    out = _run("paper save 2607.08768", capsys)
-    assert "Saved 2607.08768" in out
-
-    ix_lines = (data_dir / "interactions.jsonl").read_text().strip().splitlines()
-    assert len(ix_lines) == 1
-    record = json.loads(ix_lines[0])
-    assert record["item_id"] == "2607.08768"
-    assert record.get("type") == "save" or record.get("kind") == "save"
-
-    # Candidate status updated.
-    for line in (data_dir / "candidates.jsonl").read_text().splitlines():
-        if not line.strip():
-            continue
-        obj = json.loads(line)
-        if obj.get("id") == "2607.08768":
-            assert obj["status"] == "saved"
+    out = _run(f"paper save {item_id}", capsys)
+    assert f"Saved {item_id}" in out
+    from research_copilot.runtime import open_library
+    connection, _ = open_library(data_dir / "library.db")
+    row = connection.execute(
+        "SELECT workflow_state,user_learning_status FROM research_items WHERE id=?", (item_id,),
+    ).fetchone()
+    assert (row["workflow_state"], row["user_learning_status"]) == ("discovered", "saved")
+    assert connection.execute(
+        "SELECT kind FROM feedback_events WHERE item_id=?", (item_id,),
+    ).fetchone()["kind"] == "save"
+    connection.close()
 
 
 def test_skip_records_reason(profile, capsys):
     _, data_dir = profile
-    _write_jsonl(data_dir / "recommendations.jsonl", [
-        {"id": "2607.99999", "recommended_at": "2026-07-12T09:00Z",
-         "score": 0.7, "title": "Off-topic"},
-    ])
-    _write_jsonl(data_dir / "candidates.jsonl", [
-        {"id": "2607.99999", "type": "paper", "title": "Off-topic",
-         "url": "u", "discovered_at": "2026-07-12T06:00Z",
-         "status": "recommended"},
-    ])
-    out = _run("paper skip 2607.99999 not relevant to current agenda", capsys)
-    assert "Skipped 2607.99999" in out
-    ix = json.loads((data_dir / "interactions.jsonl").read_text().strip())
-    assert ix["item_id"] == "2607.99999"
-    assert ix.get("reason") == "not relevant to current agenda"
+    item_id = _seed_recommendation(
+        data_dir, title="Off-topic",
+        recommended_at=datetime(2026, 7, 12, 9, tzinfo=timezone.utc),
+    )
+    out = _run(f"paper skip {item_id} not relevant to current agenda", capsys)
+    assert f"Skipped {item_id}" in out
+    from research_copilot.runtime import open_library
+    connection, _ = open_library(data_dir / "library.db")
+    row = connection.execute(
+        "SELECT payload_json FROM feedback_events WHERE item_id=?", (item_id,),
+    ).fetchone()
+    assert json.loads(row["payload_json"])["reason"] == "not relevant to current agenda"
+    connection.close()
 
 
 def test_read_marks_status(profile, capsys):
     _, data_dir = profile
-    _write_jsonl(data_dir / "recommendations.jsonl", [
-        {"id": "p1", "recommended_at": "2026-07-12T09:00Z",
-         "score": 0.9, "title": "P1"},
-    ])
-    _write_jsonl(data_dir / "candidates.jsonl", [
-        {"id": "p1", "type": "paper", "title": "P1", "url": "u",
-         "discovered_at": "2026-07-12T06:00Z", "status": "saved"},
-    ])
-    out = _run("paper read p1", capsys)
-    assert "Marked read p1" in out
+    item_id = _seed_recommendation(
+        data_dir, title="P1",
+        recommended_at=datetime(2026, 7, 12, 9, tzinfo=timezone.utc),
+    )
+    out = _run(f"paper read {item_id}", capsys)
+    assert f"Marked read {item_id}" in out
 
 
 def test_feedback_requires_text(profile, capsys):
     _, data_dir = profile
-    _write_jsonl(data_dir / "recommendations.jsonl", [
-        {"id": "p1", "recommended_at": "2026-07-12T09:00Z",
-         "score": 0.9, "title": "P1"},
-    ])
     out = _run("paper feedback p1", capsys)
     assert "Usage: /paper feedback" in out
     # No interaction should have been recorded.
-    assert not (data_dir / "interactions.jsonl").exists() or \
-        (data_dir / "interactions.jsonl").read_text().strip() == ""
+    assert not (data_dir / "library.db").exists()
 
 
 def test_feedback_records_text(profile, capsys):
     _, data_dir = profile
-    _write_jsonl(data_dir / "recommendations.jsonl", [
-        {"id": "p1", "recommended_at": "2026-07-12T09:00Z",
-         "score": 0.9, "title": "P1"},
-    ])
-    out = _run("paper feedback p1 this is exactly what I want more of", capsys)
+    item_id = _seed_recommendation(
+        data_dir, title="P1",
+        recommended_at=datetime(2026, 7, 12, 9, tzinfo=timezone.utc),
+    )
+    out = _run(f"paper feedback {item_id} this is exactly what I want more of", capsys)
     assert "Recorded feedback" in out
-    ix = json.loads((data_dir / "interactions.jsonl").read_text().strip())
-    assert ix["item_id"] == "p1"
-    assert ix.get("text") == "this is exactly what I want more of"
+    from research_copilot.runtime import open_library
+    connection, _ = open_library(data_dir / "library.db")
+    row = connection.execute(
+        "SELECT payload_json FROM feedback_events WHERE item_id=?", (item_id,),
+    ).fetchone()
+    assert json.loads(row["payload_json"])["text"] == "this is exactly what I want more of"
+    connection.close()
 
 
 def test_unknown_id_returns_helpful_message(profile, capsys):
     _, data_dir = profile
-    _write_jsonl(data_dir / "recommendations.jsonl", [])
     out = _run("paper save does-not-exist", capsys)
     assert "not found" in out.lower()
     assert "/paper history" in out
@@ -165,19 +173,12 @@ def test_unknown_id_returns_helpful_message(profile, capsys):
 
 def test_health_returns_report(profile, capsys):
     _, data_dir = profile
-    _write_json(data_dir / "state.json", {})
-    _write_json(data_dir / "topics.json", {"topics": []})
-    _write_jsonl(data_dir / "recommendations.jsonl", [])
-    _write_jsonl(data_dir / "interactions.jsonl", [])
-    _write_jsonl(data_dir / "candidates.jsonl", [])
     out = _run("paper health", capsys)
-    assert "Research Copilot" in out
-    assert "Recommendations delivered:" in out
+    assert "Research Library health" in out
 
 
 def test_bare_paper_prints_usage(profile, capsys):
     _, data_dir = profile
-    _write_json(data_dir / "topics.json", {"topics": []})
     out = _run("paper", capsys)
     assert "Research Copilot" in out
     assert "/paper topics" in out

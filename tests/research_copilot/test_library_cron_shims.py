@@ -9,6 +9,7 @@ import pytest
     ("module_name", "command"),
     [
         ("research_copilot.scripts.library_collect", "collect"),
+        ("research_copilot.scripts.library_deep_research", "deep-research"),
         ("research_copilot.scripts.library_health", "health"),
         ("research_copilot.scripts.library_recommend", "recommend"),
         ("research_copilot.scripts.library_scout", "scout"),
@@ -27,6 +28,8 @@ def test_cron_shims_only_dispatch_repository_cli(monkeypatch, module_name, comma
     assert calls[0].research_copilot_command == command
     if command == "recommend":
         assert calls[0].delivery_context is True
+    if command == "deep-research":
+        assert calls[0].delivery_context is True
 
 
 def test_bundled_cron_module_runs_through_real_scheduler_subprocess(monkeypatch, tmp_path):
@@ -40,6 +43,31 @@ def test_bundled_cron_module_runs_through_real_scheduler_subprocess(monkeypatch,
 
     assert success is True, output
     assert "Research Library" in output
+
+
+def test_deep_delivery_retry_is_silent_without_pending_work(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("cron.jobs.list_jobs", lambda include_disabled=True: [])
+
+    from research_copilot.scripts.library_deep_research_delivery import main
+
+    assert main() == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_scout_delivery_retry_is_registered_and_silent_without_pending_work(
+    monkeypatch, tmp_path, capsys,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("cron.jobs.list_jobs", lambda include_disabled=True: [])
+
+    from cron.scheduler import _run_job_script
+
+    success, output = _run_job_script(
+        "module:research_copilot.scripts.library_scout_delivery"
+    )
+    assert success is True, output
+    assert output == ""
 
 
 def test_bundled_cron_module_rejects_unregistered_import():

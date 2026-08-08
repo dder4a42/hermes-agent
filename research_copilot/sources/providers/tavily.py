@@ -6,12 +6,16 @@ import json
 import urllib.error
 import urllib.request
 from typing import Callable
+from urllib.parse import urlsplit
 
 from research_copilot.library import ResearchItemDraft, TopicMatch
+from research_copilot.library.identity import normalize_url
 from research_copilot.net import fetch as _net_fetch
 from research_copilot.sources.models import SourceDefinition
+from research_copilot.sources.query_plan import build_query_plan
+from research_copilot.sources.topic_matching import match_topic_content
 
-from .base import FetchContext, ProviderError, ProviderItem, ProviderResult
+from .base import FetchContext, ProviderError, ProviderItem, ProviderResult, merge_provider_item_topics
 
 HttpFetcher = Callable[[str, bytes, int, dict[str, str]], bytes]
 
@@ -32,19 +36,25 @@ class TavilyProvider:
             raise ProviderError("Tavily API key is not configured", code="missing_credential")
         timeout = int(source.options.get("timeout_seconds", 20))
         search_depth = str(source.options.get("search_depth", "advanced"))
+        require_title_match = bool(source.options.get("require_title_match", False))
         domains = source.options.get("domains", ())
+        blocked_hosts = source.options.get("blocked_hosts", ())
         if not isinstance(domains, (list, tuple)) or not all(isinstance(d, str) for d in domains):
             raise ProviderError("Tavily options.domains must be a list of strings", code="invalid_config")
-        queries = [
-            (topic_id, query.strip())
-            for topic_id in context.active_topic_ids
-            for query in context.topic_queries.get(topic_id, ())
-            if query.strip()
-        ]
+        if not isinstance(blocked_hosts, (list, tuple)) or not all(
+            isinstance(host, str) for host in blocked_hosts
+        ):
+            raise ProviderError(
+                "Tavily options.blocked_hosts must be a list of strings",
+                code="invalid_config",
+            )
+        queries = build_query_plan(context, source_id=source.id)
         items: list[ProviderItem] = []
         requests = 0
-        seen: set[str] = set()
-        for topic_id, query in queries:
+        seen: dict[str, int] = {}
+        title_rejected = 0
+        for planned in queries:
+            query = planned.query
             if requests >= context.remaining_requests or len(items) >= context.remaining_items:
                 break
             body = {
@@ -92,20 +102,52 @@ class TavilyProvider:
             for rank, result in enumerate(data.get("results", []), start=1):
                 title = str(result.get("title") or "").strip()
                 url = str(result.get("url") or "").strip()
-                if not title or not url or url in seen:
+                if not title or not url:
                     continue
-                seen.add(url)
+                hostname = (urlsplit(url).hostname or "").casefold()
+                if any(
+                    hostname == blocked.casefold()
+                    or hostname.endswith("." + blocked.casefold())
+                    for blocked in blocked_hosts
+                ):
+                    title_rejected += 1
+                    continue
+                if require_title_match:
+                    title_matches = any(
+                        match_topic_content(
+                            title,
+                            include_terms=context.topic_match_terms.get(topic_id, ()),
+                            exclude_terms=context.topic_excludes.get(topic_id, ()),
+                        ).accepted
+                        for topic_id in planned.topic_ids
+                    )
+                    if not title_matches:
+                        title_rejected += 1
+                        continue
+                identity = normalize_url(url) or url
+                planned_topics = tuple(
+                    TopicMatch(topic_id, 0.5, (query,))
+                    for topic_id in planned.topic_ids
+                )
+                if identity in seen:
+                    index = seen[identity]
+                    items[index] = merge_provider_item_topics(items[index], planned_topics)
+                    continue
+                seen[identity] = len(items)
                 items.append(ProviderItem(
                     item=ResearchItemDraft(
                         title=title,
                         summary=str(result.get("content") or "")[:4000],
                         url=url,
                     ),
-                    topics=(TopicMatch(topic_id, 0.5, (query,)),),
+                    topics=planned_topics,
                     query=query,
                     rank=rank,
                     metadata={"score": result.get("score")},
                 ))
                 if len(items) >= context.remaining_items:
                     break
-        return ProviderResult(items=tuple(items), requests=requests)
+        return ProviderResult(
+            items=tuple(items), requests=requests, filtered=title_rejected,
+            metrics={"title_rejected_count": title_rejected},
+        )

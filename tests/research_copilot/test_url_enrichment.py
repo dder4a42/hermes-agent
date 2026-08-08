@@ -44,3 +44,23 @@ def test_page_metadata_prefers_json_ld_and_canonical_link():
     metadata=PageMetadataExtractor(session=Session([Response(headers={"Content-Type":"text/html"},body=body)]),dns_resolver=PUBLIC).fetch("https://example.org/x")
     assert metadata.canonical_url == "https://example.org/paper"
     assert (metadata.title,metadata.author,metadata.page_type) == ("Agent Paper","Ada","ScholarlyArticle")
+
+
+def test_page_metadata_extracts_doi_and_arxiv_from_project_page():
+    body = b'''<html><head>
+    <meta name="citation_doi" content="https://doi.org/10.1234/Agent.2026" />
+    <meta name="citation_pdf_url" content="https://arxiv.org/pdf/2607.01234v2.pdf" />
+    <script type="application/ld+json">{
+      "@type":"ScholarlyArticle",
+      "identifier":[{"propertyID":"arXiv","value":"arXiv:2607.01234v3"}]
+    }</script></head><body>
+    <a href="https://arxiv.org/abs/2607.01234">Paper</a>
+    </body></html>'''
+    metadata = PageMetadataExtractor(
+        session=Session([Response(headers={"Content-Type":"text/html"}, body=body)]),
+        dns_resolver=PUBLIC,
+    ).fetch("https://project.example/paper")
+    assert metadata.identifiers == {
+        "doi": "10.1234/agent.2026",
+        "arxiv": "2607.01234",
+    }

@@ -1983,11 +1983,16 @@ _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _BUNDLED_CRON_MODULES = frozenset({
     "research_copilot.scripts.library_collect",
     "research_copilot.scripts.library_daily_report",
+    "research_copilot.scripts.library_deep_research",
+    "research_copilot.scripts.library_deep_research_delivery",
     "research_copilot.scripts.library_enrich",
     "research_copilot.scripts.library_health",
     "research_copilot.scripts.library_promote",
     "research_copilot.scripts.library_recommend",
+    "research_copilot.scripts.library_recommend_delivery",
     "research_copilot.scripts.library_scout",
+    "research_copilot.scripts.library_scout_delivery",
+    "research_copilot.scripts.vault_git_sync",
 })
 
 

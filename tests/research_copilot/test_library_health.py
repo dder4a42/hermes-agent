@@ -78,3 +78,89 @@ def test_source_saturation_uses_new_items_not_fetched_items(tmp_path):
         assert report.source_saturation == {"a": 0.75, "b": 0.25}
     finally:
         connection.close()
+
+
+def test_health_surfaces_active_source_cooldown(tmp_path):
+    connection, repo = _setup(tmp_path)
+    try:
+        _source(repo, "offline")
+        _run(repo, "offline", status="failed", fetched=0, new=0)
+        repo.record_source_failure(
+            "offline", error_code="network_error", at=NOW,
+            threshold=1, base_seconds=3600, max_seconds=3600,
+        )
+        report = build_health_report(connection, now=NOW)
+        source = report.sources[0]
+        assert source.status == "cooldown"
+        assert source.consecutive_failures == 1
+        assert source.cooldown_until == "2026-07-17T01:00:00+00:00"
+        assert "cooldown_until=2026-07-17T01:00:00+00:00" in render_health_report(report)
+    finally:
+        connection.close()
+
+
+def test_health_surfaces_incremental_cursor_without_exposing_validator_values(tmp_path):
+    connection, repo = _setup(tmp_path)
+    try:
+        _source(repo, "gmail")
+        _run(repo, "gmail", fetched=1, new=1)
+        repo.record_source_success(
+            "gmail", at=NOW,
+            provider_state_updates={"uid_validity": "777", "last_uid": "42"},
+        )
+        report = build_health_report(connection, now=NOW, noisy_min_new=999)
+        assert report.sources[0].incremental_cursor == "imap-uid:42@777"
+        assert "cursor=imap-uid:42@777" in render_health_report(report)
+    finally:
+        connection.close()
+
+
+def test_health_marks_high_volume_fully_rejected_source_overfiltered(tmp_path):
+    connection, repo = _setup(tmp_path)
+    try:
+        _source(repo, "rss")
+        run_id = repo.start_source_run(source_id="rss", started_at=NOW)
+        repo.finish_source_run(
+            run_id, status="success", finished_at=NOW,
+            counts=SourceRunCounts(requests=1, fetched=100, filtered=100),
+        )
+        report = build_health_report(connection, now=NOW)
+        assert report.sources[0].status == "overfiltered"
+    finally:
+        connection.close()
+
+
+def test_health_does_not_call_gmail_staging_overfiltered(tmp_path):
+    connection, repo = _setup(tmp_path)
+    try:
+        repo.upsert_source(
+            source_id="gmail", provider="gmail_newsletter", display_name="Gmail",
+            source_type="newsletter", tier=0.8, now=NOW,
+        )
+        run_id = repo.start_source_run(source_id="gmail", started_at=NOW)
+        repo.finish_source_run(
+            run_id, status="success", finished_at=NOW,
+            counts=SourceRunCounts(requests=2, fetched=100, filtered=100),
+        )
+        report = build_health_report(connection, now=NOW)
+        assert report.sources[0].status == "healthy"
+    finally:
+        connection.close()
+
+
+def test_health_distinguishes_parser_empty_from_quiet_feed(tmp_path):
+    connection, repo = _setup(tmp_path)
+    try:
+        _source(repo, "rss")
+        run_id = repo.start_source_run(source_id="rss", started_at=NOW)
+        repo.finish_source_run(
+            run_id, status="success", finished_at=NOW,
+            counts=SourceRunCounts(requests=1),
+            metrics={"parsed_entry_count": 10, "emitted_item_count": 0},
+        )
+        report = build_health_report(connection, now=NOW)
+        assert report.sources[0].status == "parser_degraded"
+        assert report.sources[0].parser_empty_runs == 1
+        assert "parser_empty_runs=1" in render_health_report(report)
+    finally:
+        connection.close()

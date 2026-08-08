@@ -20,13 +20,17 @@ Usage
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sqlite3
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 # Old topic ids seen in historical item_topics rows -> current active ids.
 TOPIC_ID_MAP = {
@@ -39,7 +43,16 @@ TOPIC_ID_MAP = {
 
 SEVEN_PARTS = ["背景", "现象", "观点", "方法", "实验设计", "观察结论", "局限"]
 
-DEFAULT_VAULT = Path.home() / "Documents" / "Obsidian Vault"
+STRUCTURED_ANALYSIS_FIELDS = {
+    "背景": "background",
+    "现象": "phenomenon",
+    "观点": "thesis",
+    "方法": "method",
+    "实验设计": "experiment_design",
+    "观察结论": "findings",
+    "局限": "limitations",
+}
+
 LIBRARY_SUBDIR = "Research Library"
 
 
@@ -74,7 +87,15 @@ def _date(dt: str | None) -> str:
     m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", dt)
     if m:
         return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    return dt[:10]
+    try:
+        from email.utils import parsedate_to_datetime
+
+        parsed = parsedate_to_datetime(dt)
+        if parsed is not None:
+            return parsed.strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return ""
 
 
 def _read_topics(conn: sqlite3.Connection, item_id: str) -> list[str]:
@@ -114,25 +135,139 @@ def _read_recommendation(conn: sqlite3.Connection, item_id: str) -> dict[str, An
     }
 
 
+def _read_structured_analysis(
+    conn: sqlite3.Connection, item_ids: list[str],
+) -> dict[str, str] | None:
+    rows = []
+    for item_id in item_ids:
+        row = conn.execute(
+            """SELECT artifact_json FROM deep_research_artifacts
+               WHERE item_id=? ORDER BY generated_at DESC,id DESC LIMIT 1""",
+            (item_id,),
+        ).fetchone()
+        if row is not None:
+            rows.append(row)
+    if not rows:
+        return None
+    artifact = json.loads(rows[0]["artifact_json"])
+    analysis = artifact.get("analysis") or {}
+    if not isinstance(analysis, dict):
+        return None
+    return {
+        label: str(analysis.get(field) or "").strip()
+        for label, field in STRUCTURED_ANALYSIS_FIELDS.items()
+    }
+
+
 def _frontmatter(fields: dict[str, Any]) -> str:
     lines = ["---"]
-    for key in ("type", "title", "arxiv_id", "url", "authors", "published",
-                "discovered", "topics", "status", "source", "score",
-                "recommended", "tags"):
+    preferred = ("type", "title", "aliases", "canonical_key", "canonical_keys", "arxiv_id", "url",
+                 "authors", "published", "discovered", "topics", "status",
+                 "agent_analysis_status", "user_learning_status",
+                 "source", "sources", "score", "recommended", "tags")
+    ordered = list(preferred) + sorted(key for key in fields if key not in preferred)
+    for key in ordered:
         value = fields.get(key)
         if value in (None, "", [], {}):
             continue
         if isinstance(value, list):
-            rendered = "[" + ", ".join(f'"{v}"' for v in value) + "]"
+            rendered = "[" + ", ".join(json.dumps(str(v), ensure_ascii=False) for v in value) + "]"
         elif isinstance(value, bool):
             rendered = "true" if value else "false"
         elif isinstance(value, (int, float)):
             rendered = str(value)
         else:
-            rendered = f'"{str(value).replace(chr(34), chr(39))}"'
+            rendered = json.dumps(str(value), ensure_ascii=False)
         lines.append(f"{key}: {rendered}")
     lines.append("---")
     return "\n".join(lines)
+
+
+def _split_note(text: str) -> tuple[dict[str, Any], str]:
+    if not text.startswith("---\n") or "\n---\n" not in text:
+        return {}, text
+    raw, body = text[4:].split("\n---\n", 1)
+    try:
+        fields = yaml.safe_load(raw) or {}
+    except yaml.YAMLError:
+        fields = {}
+    return (fields if isinstance(fields, dict) else {}), body
+
+
+def _body_section(body: str, heading: str, next_heading: str | None = None) -> str:
+    marker = f"## {heading}"
+    start = body.find(marker)
+    if start < 0:
+        return ""
+    if next_heading:
+        end = body.find(f"## {next_heading}", start + len(marker))
+        if end >= 0:
+            return body[start:end].rstrip() + "\n\n"
+    return body[start:].rstrip() + "\n"
+
+
+def _has_real_wikilink(text: str) -> bool:
+    without_comments = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    return bool(re.search(r"\[\[[^\]]+\]\]", without_comments))
+
+
+def _merge_curated_note(path: Path, fields: dict[str, Any], generated_body: str) -> str:
+    """Refresh generated fields while preserving curator-owned sections.
+
+    ``# title`` plus the generated summary/recommendation/source block are
+    rebuilt from SQLite.  ``## 解读`` and ``## 相关笔记`` are selected from the
+    existing note when they contain Agent work.  This avoids the old all-or-
+    nothing behavior where protecting one analysis line froze stale metadata.
+    """
+    if not path.exists():
+        return _frontmatter(fields) + "\n" + generated_body
+    existing = path.read_text(encoding="utf-8", errors="replace")
+    old_fields, old_body = _split_note(existing)
+    merged_fields = {**old_fields, **fields}
+    generated_analysis = _body_section(generated_body, "解读", "相关笔记")
+    generated_related = _body_section(generated_body, "相关笔记")
+    old_analysis = _body_section(old_body, "解读", "相关笔记")
+    old_related = _body_section(old_body, "相关笔记")
+    prefix = generated_body.split("## 解读", 1)[0].rstrip() + "\n\n"
+    analysis = old_analysis if _has_analysis(path) else generated_analysis
+    related = old_related if _has_real_wikilink(old_related) else generated_related
+    return _frontmatter(merged_fields) + "\n" + prefix + analysis + related
+
+
+def _merge_stale_curated_sections(target: Path, stale: Path) -> bool:
+    """Copy curator-owned work from an obsolete generated path into its target.
+
+    Old exporter versions truncated slugs and sometimes emitted malformed date
+    prefixes.  Those files are safe to retire only after preserving the two
+    sections explicitly owned by the curator contract.
+    """
+    target_text = target.read_text(encoding="utf-8", errors="replace")
+    stale_text = stale.read_text(encoding="utf-8", errors="replace")
+    target_fields, target_body = _split_note(target_text)
+    stale_fields, stale_body = _split_note(stale_text)
+    target_analysis = _body_section(target_body, "解读", "相关笔记")
+    stale_analysis = _body_section(stale_body, "解读", "相关笔记")
+    target_related = _body_section(target_body, "相关笔记")
+    stale_related = _body_section(stale_body, "相关笔记")
+    analysis = target_analysis
+    if not any(_analysis_part_value(target_analysis, part) for part in SEVEN_PARTS):
+        if any(_analysis_part_value(stale_analysis, part) for part in SEVEN_PARTS):
+            analysis = stale_analysis
+    related = target_related
+    if not _has_real_wikilink(target_related) and _has_real_wikilink(stale_related):
+        related = stale_related
+    aliases = target_fields.get("aliases") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    stale_title = str(stale_fields.get("title") or "").strip()
+    if stale_title and stale_title not in aliases:
+        target_fields["aliases"] = [*aliases, stale_title]
+    prefix = target_body.split("## 解读", 1)[0].rstrip() + "\n\n"
+    merged = _frontmatter(target_fields) + "\n" + prefix + analysis + related
+    changed = merged != target_text
+    if changed:
+        target.write_text(merged, encoding="utf-8")
+    return changed
 
 
 def _has_analysis(path: Path) -> bool:
@@ -142,11 +277,21 @@ def _has_analysis(path: Path) -> bool:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return False
-    import re as _re
-    return any(
-        bool(_re.search(rf"\*\*{part}\*\*：[^\n]*\S", text))
-        for part in SEVEN_PARTS
+    return any(_analysis_part_value(text, part) for part in SEVEN_PARTS)
+
+
+def _analysis_part_value(text: str, part: str) -> str:
+    """Return one analysis value in either inline or next-line form."""
+    labels = "|".join(
+        re.escape(value) for value in (*SEVEN_PARTS, "推荐理由", "原文")
     )
+    match = re.search(
+        rf"\*\*{re.escape(part)}\*\*：(?P<value>.*?)"
+        rf"(?=\n\s*\*\*(?:{labels})\*\*：|\n## |\Z)",
+        text,
+        flags=re.DOTALL,
+    )
+    return match.group("value").strip() if match else ""
 
 
 def _summary_block(item: dict[str, Any]) -> str:
@@ -295,21 +440,51 @@ def _backfill_analysis(note_body: str, parts: dict[str, str] | None) -> str:
     return note_body
 
 
-def _index_md(papers: list[dict[str, Any]], news_count: int,
-              reports_count: int,
+def _published_report_text(text: str) -> str:
+    """Extract the final article from a Hermes CLI transcript.
+
+    Reports created by older cron jobs captured stdout wholesale.  Keeping
+    their prompt, reasoning panels, tool activity and session identifiers in
+    the knowledge vault violates the raw/derived boundary, so the exporter
+    applies the same deterministic final-response boundary used for delivery.
+    """
+    text = re.sub(r"^Query:.*?Initializing agent", "", text, flags=re.DOTALL)
+    positions = [
+        match.start()
+        for match in re.finditer(r"📚 深度科研周报 · \d{4}-\d{2}-\d{2}", text)
+    ]
+    if positions:
+        text = text[positions[-1]:]
+        text = re.split(r"Resume this session|Session:", text, maxsplit=1)[0]
+    text = re.sub(r"^[╭╰╮╯┌└┐┘─│+]+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^  ┊ .*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^Initializing agent.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*⚠ tirith.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*Reasoning\s*$", "", text, flags=re.MULTILINE)
+    return text.strip() + "\n" if text.strip() else ""
+
+
+def _wiki_link(page: dict[str, Any]) -> str:
+    stem = str(page["stem"])
+    title = str(page.get("title") or stem)
+    return f"[[{stem}]]" if title == stem else f"[[{stem}|{title}]]"
+
+
+def _index_md(papers: list[dict[str, Any]], news: list[dict[str, Any]],
+              reports: list[dict[str, Any]],
               extra_dirs: dict[str, list[str]] | None = None) -> str:
     lines = [
         "# Research Library Index",
         "",
         f"> 自动生成于 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} — 由 export_obsidian.py 维护",
         "",
-        f"- 论文笔记：{len(papers)} · 新闻：{news_count} · 周报归档：{reports_count}",
+        f"- 论文笔记：{len(papers)} · 新闻：{len(news)} · 周报归档：{len(reports)}",
         "",
     ]
     # Curated wiki layers (concepts / comparisons) — maintained by the agent,
     # listed here so the index is a single navigation entry point.
     extra_dirs = extra_dirs or {}
-    section_titles = {"concepts": "## 概念", "comparisons": "## 对比"}
+    section_titles = {"concepts": "## 概念", "comparisons": "## 对比", "queries": "## 查询与综合"}
     for dirname, files in extra_dirs.items():
         if not files:
             continue
@@ -319,16 +494,24 @@ def _index_md(papers: list[dict[str, Any]], news_count: int,
             stem = f[:-3] if f.endswith(".md") else f
             lines.append(f"- [[{stem}]]")
         lines.append("")
+    if news:
+        lines.extend(["## 新闻", ""])
+        lines.extend(f"- {_wiki_link(page)}" for page in sorted(news, key=lambda page: str(page["title"])))
+        lines.append("")
+    if reports:
+        lines.extend(["## 周报", ""])
+        lines.extend(f"- {_wiki_link(page)}" for page in sorted(reports, key=lambda page: str(page["title"])))
+        lines.append("")
     lines.append("## 按主题")
     lines.append("")
-    by_topic: dict[str, list[str]] = {}
+    by_topic: dict[str, list[dict[str, Any]]] = {}
     for p in papers:
         for t in p.get("topics") or ["untagged"]:
-            by_topic.setdefault(t, []).append(p["title"])
+            by_topic.setdefault(t, []).append(p)
     for topic in sorted(by_topic):
         lines.append(f"### {topic} ({len(by_topic[topic])})")
-        for title in sorted(by_topic[topic]):
-            lines.append(f"- [[{title}]]")
+        for page in sorted(by_topic[topic], key=lambda page: str(page["title"])):
+            lines.append(f"- {_wiki_link(page)}")
         lines.append("")
     lines += [
         "## 按状态",
@@ -346,55 +529,150 @@ def _index_md(papers: list[dict[str, Any]], news_count: int,
 
 def export(vault_path: Path | str, db_path: Path | str,
            reports_dir: Path | str | None = None,
-           full: bool = False) -> dict[str, int]:
+           full: bool = False, library_subdir: str = LIBRARY_SUBDIR) -> dict[str, int]:
     """Export library items to the Obsidian vault. Returns export stats."""
     vault = Path(vault_path)
-    lib = vault / LIBRARY_SUBDIR
+    lib = vault / library_subdir
     papers_dir = lib / "01 - Papers"
     news_dir = lib / "02 - News"
     reports_out_dir = lib / "03 - Weekly Reports"
     templates_dir = lib / "99 - Templates"
-    for d in (papers_dir, news_dir, reports_out_dir, templates_dir):
+    concepts_dir = lib / "concepts"
+    comparisons_dir = lib / "comparisons"
+    queries_dir = lib / "queries"
+    for d in (papers_dir, news_dir, reports_out_dir, templates_dir,
+              concepts_dir, comparisons_dir, queries_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(db_path))
+    schema_path = lib / "SCHEMA.md"
+    if not schema_path.exists():
+        schema_path.write_text(
+            "# Wiki Schema — Research Library\n\n"
+            "> SQLite is the authoritative evidence layer; this directory is the compiled, curated wiki.\n\n"
+            "## Ownership\n\n"
+            "- `01 - Papers/` and `02 - News/`: generated metadata and summaries; Agent owns `## 解读` and `## 相关笔记`.\n"
+            "- `concepts/`, `comparisons/`, `queries/`: Agent-curated synthesis pages.\n"
+            "- `00 - Index.md`: generated navigation; never edit manually.\n"
+            "- `log.md`: append-only curation and export history.\n\n"
+            "## Curated page contract\n\n"
+            "Required frontmatter: `type`, `title`, `created`, `updated`, `tags`, `sources`.\n"
+            "Every curated page needs at least two outbound `[[wikilinks]]`. Conflicts are recorded, not overwritten.\n",
+            encoding="utf-8",
+        )
+    log_path = lib / "log.md"
+    if not log_path.exists():
+        log_path.write_text(
+            "# Wiki Log\n\n> Append-only Research Wiki activity.\n\n",
+            encoding="utf-8",
+        )
+
+    database = Path(db_path).resolve()
+    conn = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
 
     reports = _parse_report_analyses(Path(reports_dir)) if reports_dir else []
     analyses = reports
 
-    stats = {"papers": 0, "news": 0, "updated": 0, "created": 0}
+    stats = {
+        "papers": 0, "news": 0, "updated": 0, "created": 0,
+        "merged_records": 0, "retired_duplicates": 0,
+    }
     papers_meta: list[dict[str, Any]] = []
+    exported_paths: set[Path] = set()
+    exported_identities: dict[str, Path] = {}
 
-    for row in conn.execute(
+    raw_items = [dict(row) for row in conn.execute(
         "SELECT * FROM research_items ORDER BY first_discovered_at"
-    ):
-        item = dict(row)
+    )]
+    grouped_items: dict[tuple[bool, str, str], list[dict[str, Any]]] = {}
+    for candidate in raw_items:
+        candidate_is_news = candidate.get("item_type") in (
+            "research_news", "business_news", "product_release", "opinion",
+        )
+        grouped_items.setdefault((
+            candidate_is_news,
+            _note_filename(candidate),
+            str(candidate.get("title") or "").strip().casefold(),
+        ), []).append(candidate)
+
+    items: list[dict[str, Any]] = []
+    for group in grouped_items.values():
+        # Prefer canonical paper metadata over a project/home-page discovery,
+        # while retaining every backing Library identity for provenance.
+        primary = max(
+            group,
+            key=lambda value: (
+                str(value.get("canonical_key") or "").startswith("arxiv:"),
+                bool(value.get("summary")),
+                bool(value.get("authors_json") and value.get("authors_json") != "[]"),
+            ),
+        ).copy()
+        primary["_merged_item_ids"] = [str(value["id"]) for value in group]
+        primary["_canonical_keys"] = (
+            [str(value.get("canonical_key") or "") for value in group if value.get("canonical_key")]
+            if len(group) > 1 else []
+        )
+        stats["merged_records"] += len(group) - 1
+        items.append(primary)
+    items.sort(key=lambda value: str(value.get("first_discovered_at") or ""))
+    filename_counts = Counter(_note_filename(item) for item in items)
+    for item in items:
+        filename = _note_filename(item)
+        if filename_counts[filename] > 1:
+            identity = str(item.get("canonical_key") or item.get("id") or item.get("title") or "")
+            suffix = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+            item["_export_filename"] = f"{Path(filename).stem}-{suffix}.md"
+        else:
+            item["_export_filename"] = filename
+
+    for item in items:
         item_id = item["id"]
-        topics = _read_topics(conn, item_id)
-        sources = _read_sources(conn, item_id)
-        rec = _read_recommendation(conn, item_id)
+        backing_ids = item.get("_merged_item_ids") or [item_id]
+        topics = list(dict.fromkeys(
+            topic for backing_id in backing_ids for topic in _read_topics(conn, str(backing_id))
+        ))
+        sources = list(dict.fromkeys(
+            source for backing_id in backing_ids for source in _read_sources(conn, str(backing_id))
+        ))
+        recommendations = [
+            recommendation for backing_id in backing_ids
+            if (recommendation := _read_recommendation(conn, str(backing_id))) is not None
+        ]
+        rec = max(recommendations, key=lambda value: float(value.get("score") or 0)) if recommendations else None
         arxiv_id = _extract_arxiv_id(item)
         title = item.get("title") or arxiv_id or item_id
         date = _date(item.get("published_at") or item.get("first_discovered_at"))
         prefix = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        fname = _note_filename(item)
+        fname = str(item["_export_filename"])
         is_news = item.get("item_type") in ("research_news", "business_news",
                                             "product_release", "opinion")
         dest_dir = news_dir if is_news else papers_dir
         path = dest_dir / fname
+        exported_paths.add(path)
+        canonical_identity = str(item.get("canonical_key") or "").strip()
+        url_identity = str(item.get("url") or "").strip()
+        if canonical_identity:
+            exported_identities[canonical_identity] = path
+        if url_identity:
+            exported_identities[f"url:{url_identity}"] = path
 
         fields = {
             "type": "news" if is_news else "paper",
             "title": title,
+            "aliases": [title],
+            "canonical_key": item.get("canonical_key") or "",
+            "canonical_keys": item.get("_canonical_keys") or [],
             "arxiv_id": arxiv_id,
             "url": item.get("url") or "",
             "authors": json.loads(item.get("authors_json") or "[]"),
             "published": _date(item.get("published_at")),
             "discovered": _date(item.get("first_discovered_at")),
             "topics": topics,
-            "status": item.get("status") or "discovered",
+            "status": item.get("workflow_state") or item.get("status") or "discovered",
+            "agent_analysis_status": item.get("agent_analysis_status") or "none",
+            "user_learning_status": item.get("user_learning_status") or "unseen",
             "source": sources[0] if sources else "",
+            "sources": sources,
             "score": rec["score"] if rec else None,
             "recommended": rec["recommended_at"] if rec else None,
             "tags": ["news" if is_news else "paper"] + topics,
@@ -415,73 +693,155 @@ def export(vault_path: Path | str, db_path: Path | str,
         body.append("")
 
         note_body = "\n".join(body)
-        parts = _match_analysis(title, analyses)
+        parts = _read_structured_analysis(conn, [str(value) for value in backing_ids])
+        if not parts:
+            parts = _match_analysis(title, analyses)
         note_body = _backfill_analysis(note_body, parts)
+        note_body = re.sub(r"\n+## 相关笔记", "\n\n## 相关笔记", note_body)
 
-        content = _frontmatter(fields) + "\n" + note_body
+        content = _merge_curated_note(path, fields, note_body)
+        content = re.sub(r"\n+## 相关笔记", "\n\n## 相关笔记", content)
         existed = path.exists()
-        if existed and path.read_text(encoding="utf-8") == content:
+        if existed and not full and path.read_text(encoding="utf-8") == content:
             pass  # unchanged
-        elif existed and _has_analysis(path):
-            # Agent-written analysis notes (seven-part 解读 filled in by the
-            # deep-research agent) are authoritative — do not overwrite them
-            # with the empty scaffold.
-            stats["agent_kept"] = stats.get("agent_kept", 0) + 1
         else:
             path.write_text(content, encoding="utf-8")
             stats["updated" if existed else "created"] += 1
 
         if not is_news:
             papers_meta.append({"title": title, "topics": topics,
-                                "status": fields["status"]})
+                                "status": fields["status"], "stem": path.stem})
             stats["papers"] += 1
         else:
             stats["news"] += 1
 
     # Weekly reports archive copy (deep-research outputs, cleaned).
-    reports_count = 0
+    reports_copied = 0
     if reports_dir:
         src = Path(reports_dir)
-        for rpath in sorted(src.glob("weekly-*.md")):
-            text = rpath.read_text(encoding="utf-8", errors="replace")
+        published = src / "published"
+        report_sources = published if published.is_dir() else src
+        for rpath in sorted(report_sources.glob("weekly-*.md")):
+            text = _published_report_text(
+                rpath.read_text(encoding="utf-8", errors="replace")
+            )
+            if not text:
+                continue
             out = reports_out_dir / rpath.name
             if not out.exists() or out.read_text(encoding="utf-8") != text:
                 out.write_text(text, encoding="utf-8")
-                reports_count += 1
+                reports_copied += 1
 
     # Templates.
     (templates_dir / "paper-template.md").write_text(
-        "---\ntype: paper\nstatus: unread\ntags: [paper]\n---\n\n"
+        "---\ntype: paper\nstatus: discovered\n"
+        "agent_analysis_status: none\nuser_learning_status: unseen\n"
+        "tags: [paper]\n---\n\n"
         "# {{title}}\n\n> summary\n\n## 解读\n\n"
         + "\n".join(f"**{p}**：" for p in SEVEN_PARTS) + "\n",
         encoding="utf-8",
     )
 
+    # Build the MOC from the final filesystem, not just the current database
+    # iteration.  This keeps manually researched pages visible and makes the
+    # index an honest view of the vault.
+    for existing_path in sorted((*papers_dir.glob("*.md"), *news_dir.glob("*.md"))):
+        if existing_path in exported_paths:
+            continue
+        existing_text = existing_path.read_text(encoding="utf-8", errors="replace")
+        existing_fields, existing_body = _split_note(existing_text)
+        existing_identity = str(existing_fields.get("canonical_key") or "").strip()
+        existing_url = str(existing_fields.get("url") or "").strip()
+        target_path = (
+            exported_identities.get(existing_identity)
+            if existing_identity else None
+        ) or (exported_identities.get(f"url:{existing_url}") if existing_url else None)
+        if target_path is not None and target_path != existing_path:
+            if _merge_stale_curated_sections(target_path, existing_path):
+                stats["updated"] += 1
+            existing_path.unlink()
+            stats["retired_duplicates"] += 1
+            continue
+        existing_title = str(existing_fields.get("title") or "").strip()
+        aliases = existing_fields.get("aliases") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        if existing_title and existing_title not in aliases:
+            existing_fields["aliases"] = [*aliases, existing_title]
+            normalized = _frontmatter(existing_fields) + "\n" + existing_body
+            existing_path.write_text(normalized, encoding="utf-8")
+            stats["updated"] += 1
+
+    def page_meta(path: Path, *, default_type: str) -> dict[str, Any]:
+        fields, _body = _split_note(path.read_text(encoding="utf-8", errors="replace"))
+        topics = fields.get("topics") or []
+        if isinstance(topics, str):
+            topics = [topics]
+        return {
+            "title": str(fields.get("title") or path.stem),
+            "topics": [str(topic) for topic in topics],
+            "status": str(fields.get("status") or "discovered"),
+            "type": str(fields.get("type") or default_type),
+            "stem": path.stem,
+        }
+
+    papers_meta = [page_meta(path, default_type="paper") for path in sorted(papers_dir.glob("*.md"))]
+    news_meta = [page_meta(path, default_type="news") for path in sorted(news_dir.glob("*.md"))]
+    reports_meta = [
+        {"title": path.stem, "topics": [], "status": "archived", "type": "report", "stem": path.stem}
+        for path in sorted(reports_out_dir.glob("*.md"))
+    ]
+
     # Index (MOC) — includes curated wiki layers (concepts/comparisons).
     extra_dirs: dict[str, list[str]] = {}
-    for d in ("concepts", "comparisons"):
+    for d in ("concepts", "comparisons", "queries"):
         dd = lib / d
         if dd.is_dir():
             extra_dirs[d] = sorted(
                 f.name for f in dd.glob("*.md") if f.name != "SCHEMA.md"
             )
-    index = _index_md(papers_meta, stats["news"], reports_count, extra_dirs)
+    index = _index_md(papers_meta, news_meta, reports_meta, extra_dirs)
     index_path = lib / "00 - Index.md"
     index_path.write_text(index, encoding="utf-8")
 
+    if stats["created"] or stats["updated"] or reports_copied:
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with log_path.open("a", encoding="utf-8") as log_file:
+            log_file.write(
+                f"\n## [{timestamp}] export | Research Library\n"
+                f"- created: {stats['created']}\n- updated: {stats['updated']}\n"
+                f"- retired duplicates: {stats['retired_duplicates']}\n"
+                f"- reports copied: {reports_copied}\n\n"
+            )
+    # Keep the append-only log friendly to ``git diff --check``.  Entries are
+    # separated when appending, but the file itself ends with one newline.
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    normalized_log = log_text.rstrip() + "\n"
+    if normalized_log != log_text:
+        log_path.write_text(normalized_log, encoding="utf-8")
+
     conn.close()
-    stats["reports_archived"] = reports_count
+    stats["papers"] = len(papers_meta)
+    stats["news"] = len(news_meta)
+    stats["reports_archived"] = reports_copied
     return stats
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Export Research Copilot library to Obsidian vault")
-    parser.add_argument("--vault", default=str(DEFAULT_VAULT), help="Obsidian vault path")
-    parser.add_argument("--db", default=str(Path.home() / ".hermes/research-copilot/library.db"))
-    parser.add_argument("--reports", default=str(Path.home() / ".hermes/research-copilot/reports"))
+    from .runtime import runtime_paths, wiki_config
+
+    runtime = runtime_paths()
+    configured = wiki_config()
+    parser.add_argument("--vault", default=str(configured["vault_path"]), help="Obsidian vault path")
+    parser.add_argument("--db", default=str(runtime["database"]))
+    parser.add_argument("--reports", default=str(runtime["reports"]))
     parser.add_argument("--full", action="store_true", help="force full rewrite")
     args = parser.parse_args(argv)
-    stats = export(args.vault, args.db, args.reports, full=args.full)
+    stats = export(
+        args.vault, args.db, args.reports, full=args.full,
+        library_subdir=configured["library_subdir"],
+    )
     print(f"exported: {stats}")
     return 0
 

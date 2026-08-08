@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from email.message import EmailMessage
+import re
 
 import pytest
 
@@ -14,13 +15,21 @@ S2_ID = "a" * 40
 
 
 class FakeImap:
-    def __init__(self, messages, *, select_status="OK", search_status="OK"):
+    def __init__(
+        self, messages, *, select_status="OK", search_status="OK",
+        uid_validity=None, uid_next=None, fail_uid=None,
+    ):
         self.messages = messages
         self.select_status = select_status
         self.search_status = search_status
         self.selected = None
         self.search_criteria = None
         self.logged_out = False
+        self.uid_validity = uid_validity
+        self.uid_next = uid_next or len(messages) + 1
+        self.fail_uid = fail_uid
+        self.uid_calls = []
+        self.fetched_ids = []
 
     def select(self, mailbox, readonly=False):
         self.selected = (mailbox, readonly)
@@ -32,8 +41,35 @@ class FakeImap:
         return self.search_status, [ids]
 
     def fetch(self, message_id, parts):
+        self.fetched_ids.append(int(message_id))
         index = int(message_id) - 1
         return "OK", [(b"RFC822", self.messages[index])]
+
+    def response(self, code):
+        if code == "UIDVALIDITY" and self.uid_validity is not None:
+            return code, [str(self.uid_validity).encode()]
+        if code == "UIDNEXT" and self.uid_validity is not None:
+            return code, [str(self.uid_next).encode()]
+        return code, None
+
+    def uid(self, command, *args):
+        self.uid_calls.append((command, args))
+        if command == "SEARCH":
+            criteria = str(args[-1])
+            self.search_criteria = (criteria,)
+            match = re.search(r"UID (\d+):\*", criteria)
+            floor = int(match.group(1)) if match else 1
+            ids = b" ".join(
+                str(i).encode() for i in range(floor, len(self.messages) + 1)
+            )
+            return self.search_status, [ids]
+        if command == "FETCH":
+            message_id = int(args[0])
+            self.fetched_ids.append(message_id)
+            if self.fail_uid == message_id:
+                return "NO", []
+            return "OK", [(b"RFC822", self.messages[message_id - 1])]
+        raise AssertionError(command)
 
     def logout(self):
         self.logged_out = True
@@ -139,3 +175,103 @@ def test_gmail_label_failure_logs_out_and_preserves_request_count():
     assert captured.value.code == "label_not_found"
     assert captured.value.requests == 2
     assert client.logged_out is True
+
+
+def test_gmail_first_uid_run_uses_lookback_and_returns_durable_cursor():
+    client = FakeImap([
+        _message("One", "https://arxiv.org/abs/2607.00001"),
+        _message("Two", "https://arxiv.org/abs/2607.00002"),
+    ], uid_validity=77, uid_next=3)
+    result = GmailNewsletterProvider(
+        address="a", app_password="p", client_factory=lambda *_: client,
+    ).fetch(_source(lookback_days=2), _context())
+    assert client.search_criteria == ("(SINCE 15-Jul-2026)",)
+    assert client.fetched_ids == [1, 2]
+    assert result.state_updates == {"uid_validity": "77", "last_uid": "2"}
+    assert result.metrics == {
+        "incremental": False,
+        "uid_validity_changed": False,
+        "searched_uid_count": 2,
+        "selected_uid_count": 2,
+        "last_processed_uid": 2,
+    }
+    assert result.items[0].item.metadata["newsletter_uid_validity"] == "77"
+
+
+def test_gmail_matching_uidvalidity_fetches_only_uids_after_cursor():
+    client = FakeImap([
+        _message("One", "https://arxiv.org/abs/2607.00001"),
+        _message("Two", "https://arxiv.org/abs/2607.00002"),
+        _message("Three", "https://arxiv.org/abs/2607.00003"),
+    ], uid_validity=77, uid_next=4)
+    context = FetchContext(
+        datetime(2026, 7, 17, tzinfo=timezone.utc), (), 10, 10,
+        source_state={"uid_validity": "77", "last_uid": "2"},
+    )
+    result = GmailNewsletterProvider(
+        address="a", app_password="p", client_factory=lambda *_: client,
+    ).fetch(_source(), context)
+    assert client.search_criteria == ("(UID 3:*)",)
+    assert client.fetched_ids == [3]
+    assert result.state_updates == {"uid_validity": "77", "last_uid": "3"}
+    assert result.metrics["incremental"] is True
+
+
+def test_gmail_uidvalidity_change_falls_back_to_lookback():
+    client = FakeImap([
+        _message("Current", "https://arxiv.org/abs/2607.00001"),
+    ], uid_validity=88, uid_next=2)
+    context = FetchContext(
+        datetime(2026, 7, 17, tzinfo=timezone.utc), (), 10, 10,
+        source_state={"uid_validity": "77", "last_uid": "500"},
+    )
+    result = GmailNewsletterProvider(
+        address="a", app_password="p", client_factory=lambda *_: client,
+    ).fetch(_source(lookback_days=1), context)
+    assert client.search_criteria == ("(SINCE 16-Jul-2026)",)
+    assert client.fetched_ids == [1]
+    assert result.state_updates == {"uid_validity": "88", "last_uid": "1"}
+
+
+def test_gmail_failed_uid_is_not_skipped_by_cursor():
+    client = FakeImap([
+        _message("One", "https://arxiv.org/abs/2607.00001"),
+        _message("Two", "https://arxiv.org/abs/2607.00002"),
+    ], uid_validity=77, uid_next=3, fail_uid=2)
+    context = FetchContext(
+        datetime(2026, 7, 17, tzinfo=timezone.utc), (), 10, 10,
+        source_state={"uid_validity": "77", "last_uid": "1"},
+    )
+    result = GmailNewsletterProvider(
+        address="a", app_password="p", client_factory=lambda *_: client,
+    ).fetch(_source(), context)
+    assert result.error_code == "message_fetch_error"
+    assert result.state_updates == {"uid_validity": "77", "last_uid": "1"}
+
+
+def test_gmail_empty_initial_window_uses_uidnext_as_safe_baseline():
+    client = FakeImap([], uid_validity=77, uid_next=100)
+    result = GmailNewsletterProvider(
+        address="a", app_password="p", client_factory=lambda *_: client,
+    ).fetch(_source(), _context())
+    assert result.items == ()
+    assert result.state_updates == {"uid_validity": "77", "last_uid": "99"}
+
+
+def test_gmail_does_not_advance_cursor_past_issue_larger_than_item_budget():
+    client = FakeImap([
+        _message(
+            "Two papers",
+            "https://arxiv.org/abs/2607.00001 https://arxiv.org/abs/2607.00002",
+        ),
+    ], uid_validity=77, uid_next=2)
+    context = FetchContext(
+        datetime(2026, 7, 17, tzinfo=timezone.utc), (), 10, 1,
+        source_state={"uid_validity": "77", "last_uid": "0"},
+    )
+    result = GmailNewsletterProvider(
+        address="a", app_password="p", client_factory=lambda *_: client,
+    ).fetch(_source(), context)
+    assert result.items == ()
+    assert result.error_code == "item_budget"
+    assert result.state_updates == {"uid_validity": "77", "last_uid": "0"}

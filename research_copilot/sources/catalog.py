@@ -28,6 +28,7 @@ class SourceCatalogError(ValueError):
 class SourceCatalog:
     schema_version: int
     sources: tuple[SourceDefinition, ...]
+    warnings: tuple[str, ...] = ()
 
     def by_id(self, source_id: str) -> SourceDefinition:
         for source in self.sources:
@@ -76,6 +77,7 @@ def load_source_catalog(
     known_topics = set(topic_ids)
     seen: set[str] = set()
     sources: list[SourceDefinition] = []
+    warnings: list[str] = []
     for index, value in enumerate(source_rows):
         location = f"sources[{index}]"
         data = _mapping(value, location)
@@ -92,6 +94,12 @@ def load_source_catalog(
         if not isinstance(topics_value, list) or not all(isinstance(t, str) for t in topics_value):
             raise SourceCatalogError(f"{location}.topics must be a list of strings")
         topics = tuple(topics_value)
+        if len(topics) != len(set(topics)):
+            warnings.append(f"Duplicate topics removed for {source_id or location}")
+            topics = tuple(dict.fromkeys(topics))
+        if "*" in topics and len(topics) > 1:
+            warnings.append(f"Wildcard topic overrides explicit topics for {source_id or location}")
+            topics = ("*",)
         unknown_topics = sorted(set(topics) - known_topics - {"*"})
         if unknown_topics:
             raise SourceCatalogError(f"Unknown topics for {source_id}: {', '.join(unknown_topics)}")
@@ -128,4 +136,8 @@ def load_source_catalog(
         if not isinstance(source.enabled, bool):
             raise SourceCatalogError(f"{location}.enabled must be a boolean")
         sources.append(source)
-    return SourceCatalog(schema_version=SCHEMA_VERSION, sources=tuple(sources))
+    return SourceCatalog(
+        schema_version=SCHEMA_VERSION,
+        sources=tuple(sources),
+        warnings=tuple(warnings),
+    )

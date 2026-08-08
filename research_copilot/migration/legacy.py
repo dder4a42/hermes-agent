@@ -187,7 +187,7 @@ def _backup(data_dir: Path, backup_root: Path, extra_paths: tuple[Path, ...]) ->
 def _catalog_rows(registry: dict, topic_ids: set[str]) -> list[dict]:
     rows = [
         {"id": "huggingface-daily", "provider": "huggingface_daily", "display_name": "Hugging Face Daily Papers", "type": "paper_index", "enabled": True, "tier": .9, "topics": ["*"], "budget": {"max_requests": 8, "max_items": 100}, "options": {}},
-        {"id": "semantic-scholar", "provider": "semantic_scholar", "display_name": "Semantic Scholar", "type": "paper_index", "enabled": True, "tier": .9, "topics": ["*"], "budget": {"max_requests": 30, "max_items": 100}, "options": {}},
+        {"id": "semantic-scholar", "provider": "semantic_scholar", "display_name": "Semantic Scholar", "type": "paper_index", "enabled": False, "tier": .9, "topics": ["*"], "budget": {"max_requests": 30, "max_items": 100}, "options": {}},
         {"id": "github-trending", "provider": "github_trending", "display_name": "GitHub Trending", "type": "code", "enabled": True, "tier": .75, "topics": ["*"], "budget": {"max_requests": 8, "max_items": 50}, "options": {}},
         {"id": "alphaxiv", "provider": "alphaxiv", "display_name": "AlphaXiv", "type": "paper_discussion", "enabled": True, "tier": .8, "topics": ["*"], "budget": {"max_requests": 8, "max_items": 50}, "options": {}},
         {"id": "arxiv", "provider": "arxiv", "display_name": "arXiv", "type": "paper_index", "enabled": False, "tier": .7, "topics": ["*"], "budget": {"max_requests": 12, "max_items": 100}, "options": {}},

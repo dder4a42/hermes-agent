@@ -68,6 +68,9 @@ def test_topics_lists_active(profile):
     (data_dir / "topics.yaml").write_text(
         "topics:\n  - id: research-agent\n    name: Research Agent\n    priority: 0.98\n    status: active\n"
     )
+    (data_dir / "research-profile.yaml").write_text(
+        "long_term_agenda:\n  - id: research-agent\n    priority: 0.98\n"
+    )
     out = _run("topics")
     assert "Research Copilot Topics" in out
     assert "research-agent" in out

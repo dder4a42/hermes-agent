@@ -11,8 +11,9 @@ from typing import Callable
 from research_copilot.library import ResearchItemDraft, TopicMatch
 from research_copilot.net import fetch as _net_fetch
 from research_copilot.sources.models import SourceDefinition
+from research_copilot.sources.query_plan import build_query_plan
 
-from .base import FetchContext, ProviderError, ProviderItem, ProviderResult
+from .base import FetchContext, ProviderError, ProviderItem, ProviderResult, merge_provider_item_topics
 
 HttpFetcher = Callable[[str, int], bytes]
 
@@ -33,16 +34,12 @@ class ArxivProvider:
     def fetch(self, source: SourceDefinition, context: FetchContext) -> ProviderResult:
         timeout = int(source.options.get("timeout_seconds", 20))
         per_query = min(int(source.options.get("max_results_per_query", 5)), context.remaining_items)
-        queries = [
-            (topic_id, query.strip())
-            for topic_id in context.active_topic_ids
-            for query in context.topic_queries.get(topic_id, ())
-            if query.strip()
-        ]
+        queries = build_query_plan(context, source_id=source.id)
         items: list[ProviderItem] = []
         requests = 0
-        seen: set[str] = set()
-        for topic_id, query in queries:
+        seen: dict[str, int] = {}
+        for planned in queries:
+            query = planned.query
             if requests >= context.remaining_requests or len(items) >= context.remaining_items:
                 break
             expression = f'"{query}"' if " " in query else query
@@ -89,9 +86,17 @@ class ArxivProvider:
                 raw_id = (entry.findtext(f"{atom}id") or "").strip()
                 arxiv_id = raw_id.rstrip("/").split("/")[-1].split("v")[0]
                 title = " ".join((entry.findtext(f"{atom}title") or "").split())
-                if not arxiv_id or not title or arxiv_id in seen:
+                if not arxiv_id or not title:
                     continue
-                seen.add(arxiv_id)
+                planned_topics = tuple(
+                    TopicMatch(topic_id, 0.5, (query,))
+                    for topic_id in planned.topic_ids
+                )
+                if arxiv_id in seen:
+                    index = seen[arxiv_id]
+                    items[index] = merge_provider_item_topics(items[index], planned_topics)
+                    continue
+                seen[arxiv_id] = len(items)
                 authors = tuple(
                     (author.findtext(f"{atom}name") or "").strip()
                     for author in entry.findall(f"{atom}author")
@@ -107,7 +112,7 @@ class ArxivProvider:
                         published_at=(entry.findtext(f"{atom}published") or "").strip() or None,
                         arxiv_id=arxiv_id,
                     ),
-                    topics=(TopicMatch(topic_id, 0.5, (query,)),),
+                    topics=planned_topics,
                     query=query,
                 ))
                 if len(items) >= context.remaining_items:

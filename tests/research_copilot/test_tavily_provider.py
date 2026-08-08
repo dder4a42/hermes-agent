@@ -23,6 +23,7 @@ def _context(requests=2, items=5):
     return FetchContext(
         datetime.now(timezone.utc), ("research-agent",), requests, items,
         topic_queries={"research-agent": ("deep research agent",)},
+        topic_match_terms={"research-agent": ("deep research agent",)},
     )
 
 
@@ -84,3 +85,40 @@ def test_tavily_stops_at_global_request_budget():
     ).fetch(_source(), context)
     assert result.requests == 1
     assert len(calls) == 1
+
+
+def test_tavily_can_require_topic_evidence_in_title():
+    response = {"results": [
+        {
+            "title": "Deep Research Agent benchmark",
+            "url": "https://example.com/relevant", "content": "Evidence",
+        },
+        {
+            "title": "A generic AI guide",
+            "url": "https://example.com/generic",
+            "content": "This body happens to mention a deep research agent.",
+        },
+    ]}
+    result = TavilyProvider(
+        api_key="secret", fetcher=lambda *_args: json.dumps(response).encode(),
+    ).fetch(_source(require_title_match=True), _context())
+    assert [item.item.url for item in result.items] == ["https://example.com/relevant"]
+    assert result.filtered == 1
+    assert result.metrics["title_rejected_count"] == 1
+
+
+def test_tavily_blocks_configured_subdomains_after_search():
+    response = {"results": [
+        {
+            "title": "Deep Research Agent docs",
+            "url": "https://learn.example.com/agent", "content": "Evidence",
+        },
+        {
+            "title": "Deep Research Agent paper",
+            "url": "https://research.example.com/paper", "content": "Evidence",
+        },
+    ]}
+    result = TavilyProvider(
+        api_key="secret", fetcher=lambda *_args: json.dumps(response).encode(),
+    ).fetch(_source(blocked_hosts=["learn.example.com"]), _context())
+    assert [item.item.url for item in result.items] == ["https://research.example.com/paper"]

@@ -38,7 +38,7 @@ class DailyReportService:
         since = generated_at - timedelta(days=max(1, days))
         rows = self.connection.execute(
             """SELECT * FROM research_items WHERE first_discovered_at>=?
-               AND status!='archived' ORDER BY first_discovered_at DESC,id""",
+               AND workflow_state!='archived' ORDER BY first_discovered_at DESC,id""",
             (since.isoformat(),),
         ).fetchall()
         items = []

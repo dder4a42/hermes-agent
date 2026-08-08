@@ -979,6 +979,16 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    "research_copilot": {
+        "scout": {
+            "model": "deepseek-v4-flash",
+            "timeout_seconds": 2700,
+        },
+        "wiki": {
+            "vault_path": "",
+            "library_subdir": "Research Library",
+        },
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,
@@ -5207,7 +5217,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates", "mcp_servers",
+    "sessions", "streaming", "updates", "mcp_servers", "research_copilot",
 }
 
 # Valid fields inside a custom_providers list entry
