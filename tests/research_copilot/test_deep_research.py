@@ -206,6 +206,50 @@ def test_invalid_model_output_is_preserved_as_failed_run(tmp_path, monkeypatch):
     assert payload["item_id"] == item_id
     assert payload["stdout"] == "not-json-at-all"
     assert payload["stderr"] == "provider note"
+    assert payload["repair_stdout"] == "not-json-at-all"
+
+
+def test_deep_research_repairs_unescaped_quotes_without_another_model_call():
+    from research_copilot.deep_research import _json_document
+
+    payload = _json_document(
+        '{"analysis":{"phenomenon":"最反常的是"聚焦验证与流程脱节"：仍会采纳。"}}'
+    )
+
+    assert payload["analysis"]["phenomenon"] == '最反常的是"聚焦验证与流程脱节"：仍会采纳。'
+
+
+def test_invalid_artifact_gets_one_serialization_repair_attempt(tmp_path, monkeypatch):
+    connection, repository, item_id = _library(tmp_path)
+    repository.record_recommendation(
+        item_id, score=0.9, score_breakdown={}, recommended_at=NOW,
+    )
+    target = select_deep_research_target(connection)
+    connection.close()
+    research_config_path = tmp_path / "research-config.yaml"
+    research_config_path.write_text("schema_version: 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "research_copilot.deep_research.shutil.which", lambda name: "/usr/bin/hermes",
+    )
+    calls = []
+
+    def runner(command, cwd, timeout):
+        calls.append(command)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(command, 0, "not-json", "")
+        context = json.loads(calls[0][4].split("\n\n", 1)[1])
+        document = _document(item_id)
+        document["generated_at"] = context["output_schema_example"]["generated_at"]
+        return subprocess.CompletedProcess(command, 0, json.dumps(document), "")
+
+    artifact = run_hermes_deep_research(
+        target=target, data_dir=tmp_path,
+        research_config_path=research_config_path, command_runner=runner,
+    )
+
+    assert artifact.item_id == item_id
+    assert len(calls) == 2
+    assert "Do not call tools" in calls[1][4]
 
 
 def test_weixin_learning_card_is_bounded_while_retaining_evidence_boundary():

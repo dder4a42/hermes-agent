@@ -1995,6 +1995,29 @@ _BUNDLED_CRON_MODULES = frozenset({
     "research_copilot.scripts.vault_git_sync",
 })
 
+# Repository-owned cron modules run outside the model-authored terminal
+# boundary, but most of them still need no credentials.  Grant only the
+# secrets consumed by each trusted module instead of inheriting the gateway's
+# full environment.  ``_HERMES_FORCE_`` is the explicit, audited escape hatch
+# understood by ``_sanitize_subprocess_env``; ordinary scripts never receive
+# these values.
+_BUNDLED_CRON_CREDENTIALS: dict[str, tuple[str, ...]] = {
+    "research_copilot.scripts.library_collect": (
+        "GMAIL_APP_PASSWORD",
+        "TAVILY_API_KEY",
+    ),
+}
+
+
+def _bundled_cron_credential_env(module_name: str | None) -> dict[str, str]:
+    if module_name is None:
+        return {}
+    return {
+        f"_HERMES_FORCE_{name}": value
+        for name in _BUNDLED_CRON_CREDENTIALS.get(module_name, ())
+        if (value := os.environ.get(name))
+    }
+
 
 def _get_script_timeout() -> int:
     """Resolve cron pre-run script timeout from module/env/config with a safe default."""
@@ -2156,7 +2179,10 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             text=True,
             timeout=script_timeout,
             cwd=subprocess_cwd,
-            env=_sanitize_subprocess_env(os.environ.copy()),
+            env=_sanitize_subprocess_env(
+                os.environ.copy(),
+                _bundled_cron_credential_env(module_name),
+            ),
             **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()

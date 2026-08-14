@@ -972,7 +972,10 @@ def _enrich_newsletters(args: Any) -> int:
         connection.close()
     mode = "dry-run" if summary.dry_run else "persisted"
     print(f"Newsletter enrichment ({mode}): selected={summary.selected}, resolved={summary.resolved}, metadata={summary.metadata_fetched}, failed={summary.failed}")
-    return 0 if summary.failed == 0 else 1
+    # Successful entries are committed independently.  Preserve a useful
+    # partial batch as a successful cron run; fail only when work was selected
+    # but not a single URL could be resolved.
+    return 1 if summary.selected > 0 and summary.failed == summary.selected else 0
 
 
 def _promote_newsletters(args: Any) -> int:

@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 import pytest
+import requests
 
 from research_copilot.enrichment import PageMetadataExtractor, UrlResolutionError, UrlResolver
 from research_copilot.enrichment.url_resolver import validate_public_url
@@ -29,6 +30,45 @@ def test_resolver_validates_every_redirect_and_canonicalizes_destination():
     assert result.final_url == "https://example.org/a"
     assert result.redirect_chain == ("https://short.example/x", "https://example.org/a")
     assert all(call[1]["allow_redirects"] is False for call in session.calls)
+
+
+def test_resolver_falls_back_to_ssrf_checked_direct_connection_after_proxy_tls_failure(
+    monkeypatch,
+):
+    monkeypatch.setattr("research_copilot.enrichment.url_resolver.time.sleep", lambda _: None)
+
+    class BrokenProxySession:
+        proxies = {}
+
+        def get(self, url, **kwargs):
+            raise requests.exceptions.SSLError("proxy TLS EOF")
+
+    direct = Session([Response(200, headers={"Content-Type": "text/html"})])
+    result = UrlResolver(
+        session=BrokenProxySession(), direct_session=direct, dns_resolver=PUBLIC,
+    ).resolve("https://example.org/article")
+
+    assert result.final_url == "https://example.org/article"
+    assert direct.calls[0][0] == "https://example.org/article"
+    assert direct.trust_env is False
+
+
+def test_resolver_never_uses_direct_fallback_for_private_destination(monkeypatch):
+    monkeypatch.setattr("research_copilot.enrichment.url_resolver.time.sleep", lambda _: None)
+
+    class BrokenProxySession:
+        proxies = {}
+
+        def get(self, url, **kwargs):
+            raise requests.exceptions.SSLError("proxy TLS EOF")
+
+    direct = Session([Response()])
+    with pytest.raises(UrlResolutionError, match="direct fallback"):
+        UrlResolver(
+            session=BrokenProxySession(), direct_session=direct,
+            dns_resolver=lambda *_: ("127.0.0.1",),
+        ).resolve("https://private.example/article")
+    assert direct.calls == []
 
 
 def test_ssrf_guard_rejects_private_and_credentialed_destinations():

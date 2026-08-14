@@ -171,6 +171,57 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    def test_bundled_collect_receives_only_its_required_credentials(
+        self, cron_env, monkeypatch,
+    ):
+        """Trusted collection gets its source keys without opening all cron scripts."""
+        import subprocess
+
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setenv("TAVILY_API_KEY", "tavily-secret")
+        monkeypatch.setenv("GMAIL_APP_PASSWORD", "gmail-secret")
+        monkeypatch.setenv("OPENAI_API_KEY", "must-stay-filtered")
+        captured = []
+
+        def run(argv, **kwargs):
+            captured.append(kwargs["env"])
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        monkeypatch.setattr("cron.scheduler.subprocess.run", run)
+
+        success, output = _run_job_script(
+            "module:research_copilot.scripts.library_collect"
+        )
+
+        assert (success, output) == (True, "ok")
+        assert captured[0]["TAVILY_API_KEY"] == "tavily-secret"
+        assert captured[0]["GMAIL_APP_PASSWORD"] == "gmail-secret"
+        assert "OPENAI_API_KEY" not in captured[0]
+
+    def test_other_bundled_modules_do_not_receive_collection_credentials(
+        self, cron_env, monkeypatch,
+    ):
+        import subprocess
+
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setenv("TAVILY_API_KEY", "must-stay-filtered")
+        captured = []
+
+        def run(argv, **kwargs):
+            captured.append(kwargs["env"])
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        monkeypatch.setattr("cron.scheduler.subprocess.run", run)
+
+        success, _output = _run_job_script(
+            "module:research_copilot.scripts.library_health"
+        )
+
+        assert success is True
+        assert "TAVILY_API_KEY" not in captured[0]
+
     def test_script_empty_output(self, cron_env):
         from cron.scheduler import _run_job_script
 

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import yaml
+import pytest
 
 
 def test_research_copilot_parser_dispatches_init_profile():
@@ -35,6 +36,44 @@ def test_research_copilot_parser_dispatches_init_profile():
     assert ns.create_profile is True
     assert ns.clone is True
     assert ns.func is handler
+
+
+@pytest.mark.parametrize(
+    ("selected", "resolved", "failed", "expected"),
+    [(17, 13, 4, 0), (4, 0, 4, 1), (0, 0, 0, 0)],
+)
+def test_newsletter_enrich_exit_code_distinguishes_partial_from_total_failure(
+    monkeypatch, selected, resolved, failed, expected,
+):
+    from research_copilot.enrichment import EnrichmentSummary
+    from hermes_cli.research_copilot_cmd import _enrich_newsletters
+
+    class Connection:
+        def close(self):
+            pass
+
+    class Service:
+        def __init__(self, connection):
+            pass
+
+        def enrich(self, **kwargs):
+            return EnrichmentSummary(
+                selected=selected, resolved=resolved, failed=failed,
+            )
+
+    monkeypatch.setattr(
+        "hermes_cli.research_copilot_cmd._runtime",
+        lambda: {"database": Path("unused.db")},
+    )
+    monkeypatch.setattr(
+        "research_copilot.runtime.open_library",
+        lambda _path: (Connection(), object()),
+    )
+    monkeypatch.setattr(
+        "research_copilot.enrichment.NewsletterEnrichmentService", Service,
+    )
+
+    assert _enrich_newsletters(argparse.Namespace(limit=50, dry_run=False)) == expected
 
 
 def test_cmd_research_copilot_init_profile_creates_profile_and_installs_cron(tmp_path, monkeypatch, capsys):

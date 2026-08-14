@@ -42,6 +42,8 @@ def _save_failed_run(
     error: str,
     stdout: str = "",
     stderr: str = "",
+    repair_stdout: str = "",
+    repair_stderr: str = "",
 ) -> Path:
     """Persist model output for diagnosis without storing credentials or argv."""
     runs_dir = data_dir / "runs"
@@ -56,6 +58,8 @@ def _save_failed_run(
         "error": error,
         "stdout": stdout,
         "stderr": stderr,
+        "repair_stdout": repair_stdout,
+        "repair_stderr": repair_stderr,
     }
     temporary = destination.with_suffix(".json.tmp")
     temporary.write_text(
@@ -196,6 +200,19 @@ def _json_document(value: str) -> dict[str, Any]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as json_error:
+        # Models occasionally emit typographic quotations as raw ASCII quotes
+        # inside an otherwise-valid JSON string.  Repair only quotes identified
+        # at the decoder's failure boundary, then run the strict parser and
+        # artifact validator as usual.  This recovers content without guessing
+        # at missing fields or changing factual substance.
+        repaired = _repair_unescaped_json_quotes(text)
+        if repaired != text:
+            try:
+                payload = json.loads(repaired)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                return payload
         try:
             payload = yaml.safe_load(text)
         except yaml.YAMLError as yaml_error:
@@ -224,6 +241,52 @@ def _json_document(value: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise RuntimeError("Hermes deep-research response must be one mapping")
     return payload
+
+
+def _repair_unescaped_json_quotes(text: str) -> str:
+    candidate = text
+    # Let the JSON decoder identify the exact point where a raw quote breaks
+    # string parsing. Escape only that quote (or the immediately preceding
+    # quote when the decoder points at the following non-JSON punctuation),
+    # then retry. This is substantially safer than globally guessing which
+    # quotes are structural, especially for prose containing ASCII commas.
+    for _ in range(64):
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError as exc:
+            quote_at = exc.pos if exc.pos < len(candidate) and candidate[exc.pos] == '"' else -1
+            if quote_at < 0:
+                previous = exc.pos - 1
+                while previous >= 0 and candidate[previous].isspace():
+                    previous -= 1
+                if previous >= 0 and candidate[previous] == '"':
+                    quote_at = previous
+            if quote_at < 0:
+                return text
+            backslashes = 0
+            cursor = quote_at - 1
+            while cursor >= 0 and candidate[cursor] == "\\":
+                backslashes += 1
+                cursor -= 1
+            if backslashes % 2:
+                return text
+            candidate = candidate[:quote_at] + "\\" + candidate[quote_at:]
+    return text
+
+
+def _repair_prompt(
+    *, target: DeepResearchTarget, requested_at: datetime,
+    error: Exception, stdout: str,
+) -> str:
+    return (
+        "Repair a serialization error in the attempted deep-research artifact below. "
+        "Do not call tools, browse, add evidence, remove evidence, or change factual substance. "
+        "Return only one valid JSON object with all original fields. Preserve item_id exactly as "
+        f"{target.item_id!r} and generated_at exactly as {requested_at.isoformat()!r}. "
+        "Escape quotes and control characters correctly. The normal strict artifact validator "
+        f"will run again. Parser/validator error: {error}\n\nAttempted artifact:\n{stdout}"
+    )
 
 
 def run_hermes_deep_research(
@@ -272,13 +335,57 @@ def run_hermes_deep_research(
         raise RuntimeError(f"{failure}; raw run saved to {path}")
     try:
         artifact = validate_deep_research_document(_json_document(completed.stdout))
-    except Exception as exc:
-        path = _save_failed_run(
-            data_dir, target=target, requested_at=requested_at,
-            execution_profile=profile, error=str(exc),
-            stdout=completed.stdout, stderr=completed.stderr,
-        )
-        raise RuntimeError(f"Invalid deep-research artifact; raw run saved to {path}: {exc}") from exc
+    except Exception as initial_exc:
+        repair_command = [
+            executable, "-p", profile.strip(), "-z",
+            _repair_prompt(
+                target=target, requested_at=requested_at,
+                error=initial_exc, stdout=completed.stdout,
+            ),
+            "--json-output", "-t", "web",
+        ]
+        try:
+            repaired = command_runner(repair_command, data_dir, timeout_seconds)
+        except subprocess.TimeoutExpired as repair_exc:
+            path = _save_failed_run(
+                data_dir, target=target, requested_at=requested_at,
+                execution_profile=profile,
+                error=f"{initial_exc}; repair attempt timed out",
+                stdout=completed.stdout, stderr=completed.stderr,
+                repair_stdout=str(repair_exc.stdout or ""),
+                repair_stderr=str(repair_exc.stderr or ""),
+            )
+            raise RuntimeError(
+                f"Invalid deep-research artifact; repair timed out; raw run saved to {path}"
+            ) from repair_exc
+        if repaired.returncode != 0:
+            repair_error = (
+                repaired.stderr or repaired.stdout or "unknown repair error"
+            ).strip()[:1000]
+            path = _save_failed_run(
+                data_dir, target=target, requested_at=requested_at,
+                execution_profile=profile,
+                error=f"{initial_exc}; repair command failed: {repair_error}",
+                stdout=completed.stdout, stderr=completed.stderr,
+                repair_stdout=repaired.stdout, repair_stderr=repaired.stderr,
+            )
+            raise RuntimeError(
+                f"Invalid deep-research artifact; repair failed; raw run saved to {path}"
+            ) from initial_exc
+        try:
+            artifact = validate_deep_research_document(_json_document(repaired.stdout))
+        except Exception as repair_exc:
+            path = _save_failed_run(
+                data_dir, target=target, requested_at=requested_at,
+                execution_profile=profile,
+                error=f"initial={initial_exc}; repair={repair_exc}",
+                stdout=completed.stdout, stderr=completed.stderr,
+                repair_stdout=repaired.stdout, repair_stderr=repaired.stderr,
+            )
+            raise RuntimeError(
+                f"Invalid deep-research artifact after one repair attempt; "
+                f"raw run saved to {path}: {repair_exc}"
+            ) from repair_exc
     if artifact.item_id != target.item_id:
         raise ValueError(
             f"Hermes deep research changed item_id: {artifact.item_id} != {target.item_id}"

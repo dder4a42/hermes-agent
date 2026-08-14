@@ -38,7 +38,9 @@ def test_hermes_scout_runs_profile_isolated_linear_web_research(tmp_path, monkey
             "topic_ids": ["long-horizon-agent"],
             "why_relevant": "研究持久化记忆。",
             "confidence": 0.8,
-            "evidence_urls": ["https://example.org/paper"],
+            # The primary URL is stored separately; corroborating evidence
+            # need not duplicate it (regression for the 2026-08-09 failure).
+            "evidence_urls": ["https://corroborating.example/review"],
         }],
         "term_suggestions": ["persistent execution"],
         "source_suggestions": [],
