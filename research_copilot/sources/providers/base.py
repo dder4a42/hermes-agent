@@ -17,7 +17,9 @@ class FetchContext:
     remaining_requests: int
     remaining_items: int
     topic_queries: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    topic_match_terms: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     topic_excludes: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    source_state: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,37 @@ class ProviderItem:
 
 
 @dataclass(frozen=True)
+class FilteredProviderItem:
+    provider_item: ProviderItem
+    reason: str
+
+
+def merge_provider_item_topics(
+    item: ProviderItem,
+    topics: tuple[TopicMatch, ...],
+) -> ProviderItem:
+    """Return one provider item with stable, unioned topic evidence."""
+    merged = {topic.topic_id: topic for topic in item.topics}
+    for topic in topics:
+        existing = merged.get(topic.topic_id)
+        if existing is None:
+            merged[topic.topic_id] = topic
+            continue
+        merged[topic.topic_id] = TopicMatch(
+            topic.topic_id,
+            max(existing.confidence, topic.confidence),
+            tuple(dict.fromkeys((*existing.matched_terms, *topic.matched_terms))),
+        )
+    return ProviderItem(
+        item=item.item,
+        topics=tuple(merged.values()),
+        query=item.query,
+        rank=item.rank,
+        metadata=item.metadata,
+    )
+
+
+@dataclass(frozen=True)
 class ProviderResult:
     items: tuple[ProviderItem, ...] = ()
     requests: int = 0
@@ -37,6 +70,9 @@ class ProviderResult:
     rate_limited: bool = False
     error_code: str | None = None
     error_message: str | None = None
+    state_updates: Mapping[str, Any] = field(default_factory=dict)
+    metrics: Mapping[str, Any] = field(default_factory=dict)
+    filtered_items: tuple[FilteredProviderItem, ...] = ()
 
     def __post_init__(self) -> None:
         if self.requests < 0 or self.filtered < 0:

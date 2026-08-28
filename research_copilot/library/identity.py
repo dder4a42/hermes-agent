@@ -12,15 +12,23 @@ _TRACKING_QUERY_KEYS = {"fbclid", "gclid", "mc_cid", "mc_eid"}
 
 
 def normalize_doi(value: str) -> str:
-    doi = (value or "").strip().lower()
-    doi = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", doi)
-    doi = re.sub(r"^doi:\s*", "", doi)
-    return doi.rstrip("/.,; ")
+    raw = (value or "").strip()
+    match = re.search(
+        r"(?:https?://(?:dx\.)?doi\.org/|doi:\s*)?(10\.\d{1,9}/[-._;()/:A-Z0-9]+)",
+        raw,
+        re.I,
+    )
+    return match.group(1).lower().rstrip("/.,; )]") if match else ""
 
 
 def normalize_arxiv_id(value: str) -> str:
     arxiv_id = (value or "").strip()
-    match = re.search(r"(?:arxiv:|arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5})(?:v\d+)?", arxiv_id, re.I)
+    match = re.search(
+        r"(?:arxiv:|arxiv\.org/(?:abs|pdf)/)?"
+        r"((?:\d{4}\.\d{4,5})|(?:[a-z-]+(?:\.[A-Z]{2})?/\d{7}))(?:v\d+)?",
+        arxiv_id,
+        re.I,
+    )
     return match.group(1) if match else ""
 
 
@@ -52,6 +60,8 @@ def normalize_title(value: str) -> str:
 def external_identifiers(draft: ResearchItemDraft) -> dict[str, str]:
     identifiers: dict[str, str] = {}
     if doi := normalize_doi(draft.doi):
+        identifiers["doi"] = doi
+    elif doi := normalize_doi(draft.url):
         identifiers["doi"] = doi
     arxiv = normalize_arxiv_id(draft.arxiv_id) or normalize_arxiv_id(draft.url)
     if arxiv:

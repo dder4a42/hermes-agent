@@ -1,4 +1,4 @@
-"""Cron shim for repository-owned Research Library recommendation."""
+"""Cron shim for one bounded, web-only Library deep-research run."""
 
 from __future__ import annotations
 
@@ -7,23 +7,20 @@ from datetime import datetime
 
 
 def reconcile_previous_delivery() -> str | None:
-    """Apply the previous cron run's delivery receipt before selecting work."""
+    """Acknowledge the previous cron receipt before choosing another paper."""
     from cron.jobs import list_jobs
     from research_copilot.runtime import open_library, runtime_paths
 
-    jobs = sorted(
-        (
-            value for value in list_jobs(include_disabled=True)
-            if value.get("name") in {
-                "research-library-recommend", "research-recommend-delivery-retry",
-            }
-        ),
-        key=lambda value: str(value.get("last_run_at") or ""),
-    )
+    jobs = {
+        str(value.get("name")): value for value in list_jobs(include_disabled=True)
+        if value.get("name") in {
+            "research-weekly-deep-research", "research-deep-delivery-retry",
+        }
+    }
     connection, repository = open_library(runtime_paths()["database"])
     try:
         reconciled = None
-        for job in jobs:
+        for job in sorted(jobs.values(), key=lambda value: str(value.get("last_run_at") or "")):
             if not job.get("last_run_at") or not job.get("last_status"):
                 continue
             completed_at = datetime.fromisoformat(
@@ -32,7 +29,7 @@ def reconcile_previous_delivery() -> str | None:
             delivery_error = str(job.get("last_delivery_error") or "")
             delivered = job.get("last_status") == "ok" and not delivery_error
             error = delivery_error or str(job.get("last_error") or "")
-            result = repository.reconcile_delivery_attempt(
+            result = repository.reconcile_deep_research_delivery_attempt(
                 completed_at=completed_at, delivered=delivered, error=error,
             )
             reconciled = result or reconciled
@@ -46,7 +43,12 @@ def main() -> int:
 
     reconcile_previous_delivery()
     return cmd_research_copilot(argparse.Namespace(
-        research_copilot_command="recommend", dry_run=False, threshold=0.72,
+        research_copilot_command="deep-research",
+        research_deep_research_command="run",
+        item_id=None,
+        dry_run=False,
+        timeout=None,
+        no_export=False,
         delivery_context=True,
     ))
 

@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import time
 from typing import Callable
-from typing import Mapping
+from typing import Any, Mapping
 
 from research_copilot.library import (
     LibraryRepository,
@@ -16,9 +16,25 @@ from research_copilot.library import (
 )
 
 from .catalog import SourceCatalog
-from .models import CollectionBudget, SourceDefinition
-from .providers.base import FetchContext, ProviderError, ProviderItem, ProviderResult
+from .models import CollectionBudget, FailureCooldownPolicy, SourceDefinition
+from .providers.base import (
+    FetchContext,
+    FilteredProviderItem,
+    ProviderError,
+    ProviderItem,
+    ProviderResult,
+)
 from .registry import ProviderRegistry
+from .topic_matching import match_topic_content
+
+
+@dataclass(frozen=True)
+class CandidatePreview:
+    title: str
+    url: str
+    topic_ids: tuple[str, ...]
+    disposition: str
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -33,6 +49,9 @@ class SourceSummary:
     filtered: int = 0
     error_code: str | None = None
     error_message: str | None = None
+    cooldown_until: str | None = None
+    previews: tuple[CandidatePreview, ...] = ()
+    metrics: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -56,11 +75,13 @@ class SourceRunner:
         providers: ProviderRegistry,
         repository: LibraryRepository,
         budget: CollectionBudget = CollectionBudget(),
+        cooldown_policy: FailureCooldownPolicy = FailureCooldownPolicy(),
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.providers = providers
         self.repository = repository
         self.budget = budget
+        self.cooldown_policy = cooldown_policy
         self.sleeper = sleeper
 
     def collect(
@@ -72,7 +93,9 @@ class SourceRunner:
         dry_run: bool = False,
         only_source_id: str | None = None,
         topic_queries: Mapping[str, tuple[str, ...]] | None = None,
+        topic_match_terms: Mapping[str, tuple[str, ...]] | None = None,
         topic_excludes: Mapping[str, tuple[str, ...]] | None = None,
+        run_metadata: Mapping[str, Any] | None = None,
     ) -> CollectionSummary:
         summaries: list[SourceSummary] = []
         requests_used = 0
@@ -92,7 +115,9 @@ class SourceRunner:
                 remaining_items=remaining_items,
                 dry_run=dry_run,
                 topic_queries=topic_queries or {},
+                topic_match_terms=topic_match_terms or topic_queries or {},
                 topic_excludes=topic_excludes or {},
+                run_metadata=run_metadata or {},
             )
             summaries.append(summary)
             requests_used += summary.requests
@@ -116,8 +141,22 @@ class SourceRunner:
         remaining_items: int,
         dry_run: bool,
         topic_queries: Mapping[str, tuple[str, ...]],
+        topic_match_terms: Mapping[str, tuple[str, ...]],
         topic_excludes: Mapping[str, tuple[str, ...]],
+        run_metadata: Mapping[str, Any],
     ) -> SourceSummary:
+        runtime_state = self.repository.get_source_runtime_state(source.id) if not dry_run else {}
+        cooldown_until = runtime_state.get("cooldown_until")
+        if cooldown_until:
+            parsed_cooldown = datetime.fromisoformat(str(cooldown_until).replace("Z", "+00:00"))
+            if parsed_cooldown.tzinfo is None:
+                parsed_cooldown = parsed_cooldown.replace(tzinfo=timezone.utc)
+            if parsed_cooldown > started_at.astimezone(timezone.utc):
+                return SourceSummary(
+                    source_id=source.id, status="cooldown",
+                    error_code=runtime_state.get("last_error_code"),
+                    cooldown_until=str(cooldown_until),
+                )
         allowed_requests = min(source.budget.max_requests, remaining_requests)
         allowed_items = min(source.budget.max_items, remaining_items)
         scoped_topics = (
@@ -134,10 +173,15 @@ class SourceRunner:
                 topic_id: tuple(topic_queries.get(topic_id, ()))
                 for topic_id in scoped_topics
             },
+            topic_match_terms={
+                topic_id: tuple(topic_match_terms.get(topic_id, ()))
+                for topic_id in scoped_topics
+            },
             topic_excludes={
                 topic_id: tuple(topic_excludes.get(topic_id, ()))
                 for topic_id in scoped_topics
             },
+            source_state=runtime_state.get("provider_state", {}),
         )
         run_id: str | None = None
         if not dry_run:
@@ -153,10 +197,15 @@ class SourceRunner:
             )
             run_id = self.repository.start_source_run(
                 source_id=source.id, started_at=started_at,
+                metrics=dict(run_metadata),
             )
         requests_spent = 0
+        provider_state_updates: dict[str, Any] = {}
+        provider_metrics: dict[str, Any] = {}
         try:
             result = self._fetch_with_retry(source, context)
+            provider_state_updates = dict(result.state_updates)
+            provider_metrics = dict(result.metrics)
             requests_spent = result.requests
             upstream_fetched = len(result.items)
             if not dry_run and source.provider == "gmail_newsletter":
@@ -168,6 +217,9 @@ class SourceRunner:
                     items=(), requests=result.requests, filtered=result.filtered,
                     rate_limited=result.rate_limited,
                     error_code=result.error_code, error_message=result.error_message,
+                    state_updates=result.state_updates,
+                    metrics=result.metrics,
+                    filtered_items=result.filtered_items,
                 )
             result = self._match_topics(result, context)
             summary = self._persist_result(
@@ -204,7 +256,25 @@ class SourceRunner:
                 ),
                 error_code=summary.error_code,
                 error_message=summary.error_message,
+                metrics=provider_metrics,
             )
+            if summary.status in {"success", "partial"}:
+                self.repository.record_source_success(
+                    source.id, at=started_at,
+                    provider_state_updates=provider_state_updates,
+                )
+            else:
+                failure_state = self.repository.record_source_failure(
+                    source.id, error_code=summary.error_code or "provider_error",
+                    at=started_at,
+                    threshold=self.cooldown_policy.threshold,
+                    base_seconds=self.cooldown_policy.base_seconds,
+                    max_seconds=self.cooldown_policy.max_seconds,
+                )
+                if failure_state["cooldown_until"]:
+                    summary = SourceSummary(
+                        **{**summary.__dict__, "cooldown_until": failure_state["cooldown_until"]}
+                    )
         return summary
 
     def _stage_newsletters(
@@ -221,6 +291,7 @@ class SourceRunner:
                 source_id=source.id,
                 mailbox=str(first.get("newsletter_label") or "ResearchFeeds"),
                 uid=str(first.get("newsletter_uid") or body_hash),
+                uid_validity=str(first.get("newsletter_uid_validity") or ""),
                 message_id=str(first.get("newsletter_message_id") or ""),
                 sender=str(first.get("newsletter_sender") or ""),
                 subject=str(first.get("newsletter_subject") or ""),
@@ -257,7 +328,9 @@ class SourceRunner:
                 remaining_requests=remaining,
                 remaining_items=context.remaining_items,
                 topic_queries=context.topic_queries,
+                topic_match_terms=context.topic_match_terms,
                 topic_excludes=context.topic_excludes,
+                source_state=context.source_state,
             )
             try:
                 result = provider.fetch(source, attempt_context)
@@ -287,6 +360,9 @@ class SourceRunner:
                 rate_limited=result.rate_limited,
                 error_code=result.error_code,
                 error_message=result.error_message,
+                state_updates=result.state_updates,
+                metrics=result.metrics,
+                filtered_items=result.filtered_items,
             )
         if last_error is not None:
             raise last_error
@@ -296,43 +372,91 @@ class SourceRunner:
         )
 
     @staticmethod
+    def _topic_text(provider_item: ProviderItem) -> str:
+        categories = provider_item.item.metadata.get("feed_categories", ())
+        if not isinstance(categories, (list, tuple)):
+            categories = ()
+        return " ".join((
+            provider_item.item.title,
+            provider_item.item.summary[:2000],
+            " ".join(str(value) for value in categories),
+        ))
+
+    @staticmethod
     def _match_topics(result: ProviderResult, context: FetchContext) -> ProviderResult:
         """Apply one topic policy to non-query providers before persistence."""
         if not context.active_topic_ids:
             return result
         matched_items: list[ProviderItem] = []
+        filtered_items = list(result.filtered_items)
         rejected = 0
+        excluded = 0
         active = set(context.active_topic_ids)
         for provider_item in result.items:
+            text = SourceRunner._topic_text(provider_item)
             if provider_item.topics:
-                topics = tuple(t for t in provider_item.topics if t.topic_id in active)
+                topics = []
+                excluded_terms: list[str] = []
+                for topic in provider_item.topics:
+                    if topic.topic_id not in active:
+                        continue
+                    include_terms = context.topic_match_terms.get(topic.topic_id, ())
+                    evidence = match_topic_content(
+                        text, include_terms=include_terms,
+                        exclude_terms=context.topic_excludes.get(topic.topic_id, ()),
+                    )
+                    if evidence.excluded_by or include_terms and not evidence.hits:
+                        excluded_terms.extend(evidence.excluded_by)
+                        continue
+                    topics.append(TopicMatch(
+                        topic.topic_id,
+                        max(topic.confidence, min(1.0, 0.5 + 0.1 * (len(evidence.hits) - 1)))
+                        if evidence.hits else topic.confidence,
+                        tuple(dict.fromkeys((*topic.matched_terms, *evidence.hits))),
+                    ))
                 if not topics:
                     rejected += 1
+                    if excluded_terms:
+                        excluded += 1
+                    filtered_items.append(FilteredProviderItem(
+                        provider_item,
+                        "excluded:" + ",".join(dict.fromkeys(excluded_terms))
+                        if excluded_terms else "no_topic_match",
+                    ))
                     continue
                 matched_items.append(ProviderItem(
                     item=provider_item.item,
-                    topics=topics,
+                    topics=tuple(topics),
                     query=provider_item.query,
                     rank=provider_item.rank,
                     metadata=provider_item.metadata,
                 ))
                 continue
-            text = f"{provider_item.item.title} {provider_item.item.summary}".casefold()
             inferred = []
+            excluded_terms = []
             for topic_id in context.active_topic_ids:
-                excludes = tuple(term.casefold() for term in context.topic_excludes.get(topic_id, ()) if term)
-                if any(term in text for term in excludes):
-                    continue
-                terms = tuple(term for term in context.topic_queries.get(topic_id, ()) if term)
-                hits = tuple(term for term in terms if term.casefold() in text)
-                if hits:
+                terms = tuple(term for term in context.topic_match_terms.get(topic_id, ()) if term)
+                evidence = match_topic_content(
+                    text, include_terms=terms,
+                    exclude_terms=context.topic_excludes.get(topic_id, ()),
+                )
+                if evidence.accepted:
                     inferred.append(TopicMatch(
                         topic_id=topic_id,
-                        confidence=min(1.0, 0.5 + 0.1 * (len(hits) - 1)),
-                        matched_terms=hits,
+                        confidence=min(1.0, 0.5 + 0.1 * (len(evidence.hits) - 1)),
+                        matched_terms=evidence.hits,
                     ))
+                elif evidence.excluded_by:
+                    excluded_terms.extend(evidence.excluded_by)
             if not inferred:
                 rejected += 1
+                if excluded_terms:
+                    excluded += 1
+                filtered_items.append(FilteredProviderItem(
+                    provider_item,
+                    "excluded:" + ",".join(dict.fromkeys(excluded_terms))
+                    if excluded_terms else "no_topic_match",
+                ))
                 continue
             matched_items.append(ProviderItem(
                 item=provider_item.item,
@@ -341,6 +465,11 @@ class SourceRunner:
                 rank=provider_item.rank,
                 metadata=provider_item.metadata,
             ))
+        metrics = dict(result.metrics)
+        metrics.update({
+            "topic_rejected_count": rejected,
+            "topic_excluded_count": excluded,
+        })
         return ProviderResult(
             items=tuple(matched_items),
             requests=result.requests,
@@ -348,6 +477,9 @@ class SourceRunner:
             rate_limited=result.rate_limited,
             error_code=result.error_code,
             error_message=result.error_message,
+            state_updates=result.state_updates,
+            metrics=metrics,
+            filtered_items=tuple(filtered_items),
         )
 
     def _persist_result(
@@ -366,6 +498,7 @@ class SourceRunner:
         )
         filtered = result.filtered + budget_filtered
         new = merged = unchanged = 0
+        previews: list[CandidatePreview] = []
         if dry_run:
             for provider_item, topics in selected:
                 disposition = self.repository.classify_item(
@@ -377,6 +510,21 @@ class SourceRunner:
                     merged += 1
                 else:
                     unchanged += 1
+                previews.append(CandidatePreview(
+                    title=provider_item.item.title,
+                    url=provider_item.item.url,
+                    topic_ids=tuple(topic.topic_id for topic in topics),
+                    disposition=disposition,
+                ))
+            for filtered_item in result.filtered_items:
+                provider_item = filtered_item.provider_item
+                previews.append(CandidatePreview(
+                    title=provider_item.item.title,
+                    url=provider_item.item.url,
+                    topic_ids=tuple(topic.topic_id for topic in provider_item.topics),
+                    disposition="filtered",
+                    reason=filtered_item.reason,
+                ))
         else:
             for provider_item, topics in selected:
                 outcome = self.repository.upsert_item(
@@ -409,6 +557,8 @@ class SourceRunner:
             filtered=filtered,
             error_code=result.error_code,
             error_message=result.error_message,
+            previews=tuple(previews),
+            metrics=dict(result.metrics),
         )
 
     @staticmethod

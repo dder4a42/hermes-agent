@@ -3941,6 +3941,11 @@ _BUNDLED_CRON_MODULES = frozenset({
     "research_copilot.scripts.library_promote",
     "research_copilot.scripts.library_recommend",
     "research_copilot.scripts.library_scout",
+    "research_copilot.scripts.vault_git_sync",
+    "research_copilot.scripts.library_deep_research",
+    "research_copilot.scripts.library_deep_research_delivery",
+    "research_copilot.scripts.library_recommend_delivery",
+    "research_copilot.scripts.library_scout_delivery",
 })
 
 
