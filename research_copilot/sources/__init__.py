@@ -3,6 +3,7 @@
 from .catalog import SourceCatalog, SourceCatalogError, load_source_catalog
 from .models import (
     CollectionBudget,
+    FailureCooldownPolicy,
     ProviderOptionSpec,
     RetryPolicy,
     SourceBudget,
@@ -14,6 +15,7 @@ from .registry import ProviderRegistry
 __all__ = [
     "FetchContext",
     "CollectionBudget",
+    "FailureCooldownPolicy",
     "ProviderRegistry",
     "ProviderError",
     "ProviderResult",

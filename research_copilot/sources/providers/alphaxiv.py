@@ -9,6 +9,7 @@ from html import unescape
 from typing import Callable
 
 from research_copilot.library import ResearchItemDraft
+from research_copilot.net import fetch as _net_fetch
 from research_copilot.sources.models import SourceDefinition
 
 from .base import FetchContext, ProviderError, ProviderItem, ProviderResult
@@ -17,12 +18,20 @@ HttpFetcher = Callable[[str, int], bytes]
 
 
 def _default_fetch(url: str, timeout: int) -> bytes:
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Hermes-Research-Copilot/1.0", "Accept": "text/html"},
+    # AlphaXiv sits behind Cloudflare-style bot protection: the custom
+    # Hermes UA was 403'd from 2026-08-02 onward while browser UAs still
+    # get 200 (verified via web_extract). Use a realistic browser UA.
+    return _net_fetch(
+        url, timeout=timeout,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
 
 
 class AlphaXivProvider:

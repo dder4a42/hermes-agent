@@ -60,7 +60,10 @@ def build_provider_registry() -> ProviderRegistry:
         "tavily",
         TavilyProvider(api_key=os.environ.get("TAVILY_API_KEY", "")),
         option_spec=ProviderOptionSpec(
-            allowed=frozenset({"domains", "search_depth", "timeout_seconds"}),
+            allowed=frozenset({
+                "domains", "blocked_hosts", "search_depth", "timeout_seconds",
+                "require_title_match",
+            }),
         ),
     )
     registry.register(
@@ -93,7 +96,7 @@ def build_provider_registry() -> ProviderRegistry:
         option_spec=ProviderOptionSpec(
             allowed=frozenset({
                 "host", "port", "label", "proxy_url",
-                "lookback_days", "max_messages",
+                "lookback_days", "max_messages", "from_domains",
             }),
         ),
     )

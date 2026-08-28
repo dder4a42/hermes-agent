@@ -17,9 +17,12 @@ def _usage() -> str:
         "Commands:\n"
         "/paper topics\n"
         "/paper history [n]\n"
+        "/paper study [n]\n"
         "/paper save <id>\n"
+        "/paper start <id>\n"
         "/paper skip <id> [reason]\n"
         "/paper read <id>\n"
+        "/paper synthesize <id>\n"
         "/paper feedback <id> <text>\n"
         "/paper health\n"
         "/paper now\n"
@@ -30,31 +33,27 @@ def _usage() -> str:
 
 
 def _format_topics() -> str:
-    from .runtime import load_yaml, runtime_paths
+    from .preferences import load_research_preferences
+    from .runtime import runtime_paths
 
     try:
-        data = load_yaml(runtime_paths()["topics"])
+        paths = runtime_paths()
+        preferences = load_research_preferences(paths["topics"], paths["research_config"])
     except (FileNotFoundError, ValueError) as exc:
         return f"Research Copilot Topics\n\n(unavailable: {exc})"
-    topics = data.get("topics") if isinstance(data, dict) else []
+    topics = preferences.topics
     if not topics:
         return "Research Copilot Topics\n\n(no topics configured)"
 
-    def _sort_key(topic: dict) -> tuple[int, float, str]:
-        active_rank = 0 if topic.get("status", "active") == "active" else 1
-        try:
-            priority = float(topic.get("priority", 0))
-        except (TypeError, ValueError):
-            priority = 0.0
-        return (active_rank, -priority, str(topic.get("id") or ""))
+    def _sort_key(topic) -> tuple[int, float, str]:
+        active_rank = 0 if topic.status == "active" else 1
+        priority, _questions = preferences.ranking_values(topic.id)
+        return (active_rank, -priority, topic.id)
 
     lines = ["Research Copilot Topics"]
-    for topic in sorted((t for t in topics if isinstance(t, dict)), key=_sort_key):
-        tid = topic.get("id", "?")
-        name = topic.get("name", tid)
-        status = topic.get("status", "active")
-        priority = topic.get("priority", "?")
-        lines.append(f"- {tid}: {name} [{status}, priority={priority}]")
+    for topic in sorted(topics, key=_sort_key):
+        priority, _questions = preferences.ranking_values(topic.id)
+        lines.append(f"- {topic.id}: {topic.name} [{topic.status}, priority={priority}]")
     return "\n".join(lines)
 
 
@@ -117,11 +116,11 @@ def _record_action(action: str, item_id: str, **extra) -> str:
         return f"Usage: /paper {action} <id>"
     connection, repository = _open_library()
     try:
-        rec = connection.execute(
-            "SELECT 1 FROM recommendations WHERE item_id=?", (item_id,)
+        item = connection.execute(
+            "SELECT 1 FROM research_items WHERE id=?", (item_id,)
         ).fetchone()
-        if rec is None:
-            return f"Recommendation {item_id} not found. Use /paper history to see recent ids."
+        if item is None:
+            return f"Research Item {item_id} not found. Use /paper history to see recent ids."
         kind = "note" if action == "feedback" else action
         payload = {k: v for k, v in extra.items() if v not in (None, "")}
         repository.record_feedback(
@@ -131,11 +130,66 @@ def _record_action(action: str, item_id: str, **extra) -> str:
         connection.close()
     verb = {
         "save": "Saved",
+        "start": "Marked reading",
         "skip": "Skipped",
         "read": "Marked read",
+        "synthesize": "Marked synthesized",
         "feedback": "Recorded feedback for",
     }.get(action, action)
     return f"{verb} {item_id}."
+
+
+def _format_study(args: list[str]) -> str:
+    import json
+
+    from .learning import build_learning_package, render_learning_package
+    from .ranking import ScoreResult
+
+    limit = 1
+    if args:
+        try:
+            limit = max(1, min(3, int(args[0])))
+        except ValueError:
+            return "Usage: /paper study [n]"
+    connection, _repository = _open_library()
+    try:
+        rows = connection.execute(
+            """SELECT research_items.*, recommendations.score,
+                      recommendations.score_breakdown_json, recommendations.rationale
+               FROM recommendations
+               JOIN research_items ON research_items.id=recommendations.item_id
+               WHERE research_items.user_learning_status NOT IN ('read', 'skipped')
+               ORDER BY recommendations.recommended_at DESC, recommendations.id DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        packages = []
+        for row in rows:
+            item = dict(row)
+            reasons = tuple(
+                part.strip() for part in str(row["rationale"] or "").split(" · ")
+                if part.strip()
+            )
+            primary = next(
+                (part.split("=", 1)[1] for part in reasons if part.startswith("primary_topic=")),
+                None,
+            )
+            packages.append(build_learning_package(
+                item,
+                ScoreResult(
+                    item_id=str(row["id"]), score=float(row["score"]),
+                    dimensions=json.loads(row["score_breakdown_json"] or "{}"),
+                    reasons=reasons, primary_topic_id=primary,
+                ),
+            ))
+    finally:
+        connection.close()
+    if not packages:
+        return "今日学习包\n\n暂无未读推荐。可运行 /paper now 触发下一次推荐。"
+    return "今日学习包\n\n" + "\n\n---\n\n".join(
+        render_learning_package(package, index=index)
+        for index, package in enumerate(packages, start=1)
+    )
 
 
 def _format_health() -> str:
@@ -204,10 +258,16 @@ def handle_paper_command(args: str = "") -> str:
         return _format_topics()
     if subcmd == "history":
         return _format_history(rest)
+    if subcmd == "study":
+        return _format_study(rest)
     if subcmd == "save":
         return _record_action("save", rest[0] if rest else "")
+    if subcmd == "start":
+        return _record_action("start", rest[0] if rest else "")
     if subcmd == "read":
         return _record_action("read", rest[0] if rest else "")
+    if subcmd == "synthesize":
+        return _record_action("synthesize", rest[0] if rest else "")
     if subcmd == "skip":
         item_id = rest[0] if rest else ""
         reason = " ".join(rest[1:]).strip()

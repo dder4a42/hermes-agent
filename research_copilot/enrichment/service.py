@@ -37,6 +37,11 @@ class NewsletterEnrichmentService:
               AND (e.resolution_status='pending' OR
                    (e.resolution_status='failed' AND
                     (e.resolved_at IS NULL OR e.resolved_at<=?)))
+              AND NOT EXISTS (
+                  SELECT 1 FROM url_resolutions u
+                  WHERE u.input_url = COALESCE(NULLIF(e.canonical_url, ''), e.tracked_url)
+                    AND u.attempt_count >= 5
+              )
             ORDER BY CAST(i.uid AS INTEGER), e.position LIMIT ?
             """, (retry_before, max(0, limit)),
         ).fetchall()
@@ -48,8 +53,11 @@ class NewsletterEnrichmentService:
                 resolved += 1
                 metadata = None
                 if 200 <= outcome.status_code < 300 and "html" in outcome.content_type.lower():
-                    metadata = self.metadata_extractor.fetch(outcome.final_url)
-                    metadata_count += 1
+                    try:
+                        metadata = self.metadata_extractor.fetch(outcome.final_url)
+                        metadata_count += 1
+                    except (ValueError, OSError):
+                        metadata = None  # page enrichment is best-effort; URL resolution already succeeded
                 if not dry_run:
                     with self.connection:
                         self.connection.execute(
@@ -88,6 +96,21 @@ class NewsletterEnrichmentService:
                 if not dry_run:
                     code = getattr(exc, "code", "metadata_error")
                     with self.connection:
+                        # Count every attempt in url_resolutions (success path
+                        # already increments on conflict) so chronically dead
+                        # URLs drop out of the queue after 5 tries instead of
+                        # being retried forever every 6 hours. All NOT NULL
+                        # columns get placeholder values on failure (final_url
+                        # = input_url; expires_at = now = no caching).
+                        self.connection.execute(
+                            """INSERT INTO url_resolutions(input_url, final_url, redirect_chain_json,
+                               status_code, content_type, resolved_at, expires_at, error_code, attempt_count)
+                               VALUES (?, ?, '[]', 0, '', ?, ?, ?, 1)
+                               ON CONFLICT(input_url) DO UPDATE SET error_code=excluded.error_code,
+                               resolved_at=excluded.resolved_at,
+                               attempt_count=url_resolutions.attempt_count+1""",
+                            (input_url, input_url, now.isoformat(), now.isoformat(), code),
+                        )
                         self.connection.execute(
                             "UPDATE newsletter_entries SET resolution_status='failed', resolution_error=?, resolved_at=? WHERE id=?",
                             (f"{code}: {exc}"[:1000], now.isoformat(), row["id"]),

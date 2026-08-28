@@ -62,6 +62,19 @@ class CollectionBudget:
 
 
 @dataclass(frozen=True)
+class FailureCooldownPolicy:
+    threshold: int = 3
+    base_seconds: int = 3600
+    max_seconds: int = 86400
+
+    def __post_init__(self) -> None:
+        if self.threshold < 1:
+            raise ValueError("Failure cooldown threshold must be at least 1")
+        if self.base_seconds < 0 or self.max_seconds < self.base_seconds:
+            raise ValueError("Failure cooldown durations are invalid")
+
+
+@dataclass(frozen=True)
 class ProviderOptionSpec:
     allowed: frozenset[str] = frozenset()
     required: frozenset[str] = frozenset()

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 
 from research_copilot.library import LibraryRepository, ResearchItemDraft, SourceEvidence, TopicMatch
+from research_copilot.sources.topic_matching import match_topic_content, significant_tokens
 
 
 @dataclass(frozen=True)
@@ -49,6 +49,7 @@ class NewsletterPromoter:
                 title=row["page_title"] or row["title"], item_type=row["content_type"],
                 summary=row["page_description"] or row["excerpt"], url=row["canonical_url"],
                 published_at=row["page_published_at"], arxiv_id=str(identifiers.get("arxiv") or ""),
+                doi=str(identifiers.get("doi") or ""),
                 metadata={"newsletter_issue_id": row["newsletter_issue_id"], "newsletter_entry_id": row["id"], "newsletter_subject": row["issue_subject"], "evidence_level": self._evidence_level(row["content_type"])},
             )
             topics = self._match_topics(draft, topic_policies or {})
@@ -79,24 +80,16 @@ class NewsletterPromoter:
         policies: dict[str, dict[str, tuple[str, ...]]],
     ) -> tuple[TopicMatch, ...]:
         text = f"{draft.title} {draft.summary}".casefold()
-        tokens = NewsletterPromoter._tokens(text)
+        tokens = set(significant_tokens(text))
         matches = []
         for topic_id, policy in policies.items():
-            excludes = tuple(term.casefold() for term in policy.get("exclude", ()) if term)
-            if any(term in text for term in excludes):
-                continue
             terms = tuple(term for term in policy.get("include", ()) if term)
-            hits = []
-            for term in terms:
-                normalized = term.casefold()
-                term_tokens = NewsletterPromoter._tokens(normalized)
-                overlap = tokens & term_tokens
-                # Fuzzy matching tolerates word order/plural changes, but all
-                # significant words must still be present. Partial overlap
-                # made generic phrases such as "tool use" look like
-                # "tool-use trajectory" and produced misleading topic labels.
-                if normalized in text or term_tokens and overlap == term_tokens:
-                    hits.append(term)
+            evidence = match_topic_content(
+                text, include_terms=terms, exclude_terms=policy.get("exclude", ()),
+            )
+            if evidence.excluded_by:
+                continue
+            hits = list(evidence.hits)
             if not hits and NewsletterPromoter._type_fallback(topic_id, draft.item_type, tokens):
                 hits.append(f"{draft.item_type}:agent")
             if hits:
@@ -105,13 +98,7 @@ class NewsletterPromoter:
 
     @staticmethod
     def _tokens(text: str) -> set[str]:
-        ignored = {"a", "an", "the", "and", "or", "for", "from", "with", "of", "to", "in", "ai", "llm", "large", "language", "model"}
-        values = set()
-        for raw in re.findall(r"[a-z0-9]+", text.casefold()):
-            token = raw[:-1] if len(raw) > 4 and raw.endswith("s") else raw
-            if token not in ignored and len(token) > 1:
-                values.add(token)
-        return values
+        return set(significant_tokens(text))
 
     @staticmethod
     def _type_fallback(topic_id: str, item_type: str, tokens: set[str]) -> bool:

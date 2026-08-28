@@ -3,7 +3,7 @@
 These helpers are deliberately profile-home based so one Weixin bot can map to
 one Hermes profile without sharing paper state, scripts, or cron jobs.
 
-Bootstrap is idempotent by default: existing user files (JSON/JSONL under
+Bootstrap is idempotent by default: existing user files (YAML/JSON/JSONL under
 ``research-copilot/``) are never overwritten unless ``force=True`` is passed.
 Skill and script assets, which are versioned code rather than user state, are
 refreshed on every run so a profile picks up upstream fixes automatically.
@@ -21,6 +21,11 @@ _DEFAULT_JSON_FILES = {
     "source_registry.json": '{\n  "sources": []\n}\n',
     "research_profile.json": '{\n  "long_term_agenda": []\n}\n',
     "state.json": '{\n  "last_fetch_at": null,\n  "last_recommendation_at": null\n}\n',
+}
+_DEFAULT_YAML_FILES = {
+    "topics.yaml": "schema_version: 2\ntopics: []\n",
+    "research-config.yaml": "schema_version: 2\nlong_term_agenda: []\nevidence_ledger: []\n",
+    "sources.yaml": "schema_version: 1\nsources: []\n",
 }
 _JSONL_FILES = ("candidates.jsonl", "recommendations.jsonl", "interactions.jsonl")
 _SCRIPT_FILES: tuple[str, ...] = ()
@@ -42,34 +47,46 @@ _SKILL_FILES = (
     "references/gfw-setup.md",
     "references/gmail-setup.md",
     "references/world-model-inference-optimization.md",
+    "references/deep-research-artifact.md",
 )
 
 _CRON_NAMES = (
-    "paper-fetcher", "research-library-recommend", "paper-health-report",
+    "paper-fetcher", "research-library-recommend", "research-recommend-delivery-retry",
+    "research-weekly-deep-research",
+    "research-deep-delivery-retry",
+    "research-scout-delivery-retry",
+    "paper-health-report",
     "task-surfacer", "thought-surfacer",
 )
 
-_RESEARCH_RECOMMEND_PROMPT = """你是用户的科研资讯编辑。预运行脚本会提供一条 JSON 格式的候选文章、匹配话题、排序依据和科研画像。
+_RESEARCH_RECOMMEND_PROMPT = """你是用户的科研学习助手。预运行脚本会提供一条 JSON 格式的候选文章、匹配话题、排序依据、科研画像和 learning_package。
 
-请只根据这些材料写一条适合微信阅读的中文推荐，要求：
+请只根据这些材料写一条适合微信日常学习的中文学习卡，要求：
 1. 主体叙述和所有栏目标题使用中文；论文或项目的原始标题可以保留原文。
 2. 先用 2—3 句话准确概述工作，不要把摘要中没有的内容写成事实。
 3. 明确说明它对应用户的哪些兴趣、开放问题或知识缺口。
 4. 结合 current_beliefs 给出有立场的点评：它支持、挑战还是补充了什么观点；若材料不足，明确说“仅凭当前摘要尚不能判断”。
-5. 区分论文主张、证据和你的推断；指出一个最值得关注之处和一个局限或验证问题。
-6. 不展示 JSON、内部评分维度或英文模板字段，不调用工具，不自行搜索网络。
+5. 区分论文主张、证据和你的推断；必须保留 learning_package 的证据边界，不能把摘要级材料写成全文结论。
+6. 给出两个短回忆问题和一个明确的下一步动作，供用户当天学习后自测。
+7. 全文控制在 1200 个中文字符以内，不展示 JSON、内部评分维度或英文模板字段，不调用工具，不自行搜索网络。
 
 固定格式：
-🔬 今日科研推荐
+🔬 今日科研学习
 《原始标题》
 
-内容概述：……
+3 分钟摘要：……
 
 与你的研究的关系：……
 
 我的点评：……
 
-值得继续追问：……
+证据边界：……
+
+回忆问题：
+1. ……
+2. ……
+
+下一步：使用 /paper start、/paper read 或 /paper skip 中的一项
 
 原文：URL
 """
@@ -155,7 +172,7 @@ def initialize_research_copilot_home(
             When present, JSON files are copied from there (instead of the
             neutral defaults) and scripts/skills are preferred from there
             over the repo-owned canonical copies.
-        force: When ``True``, existing user JSON files are overwritten from
+        force: When ``True``, existing user YAML/JSON files are overwritten from
             the source or default. JSONL user data files (candidates,
             recommendations, interactions) are always preserved regardless
             of ``force`` to prevent history loss.
@@ -179,6 +196,12 @@ def initialize_research_copilot_home(
     removed: list[str] = []
     skipped: list[str] = []
 
+    legacy_research_config = data_dir / "research-profile.yaml"
+    canonical_research_config = data_dir / "research-config.yaml"
+    if legacy_research_config.is_file() and not canonical_research_config.exists():
+        legacy_research_config.replace(canonical_research_config)
+        refreshed.append("research-config.yaml (renamed from research-profile.yaml)")
+
     # These were versioned Research Copilot implementation files copied into
     # every profile.  Bundled cron modules now own the implementation, so the
     # profile contains state and job definitions only.
@@ -188,9 +211,13 @@ def initialize_research_copilot_home(
             legacy.unlink()
             removed.append(f"scripts/{filename}")
 
-    for filename, default_content in _DEFAULT_JSON_FILES.items():
+    for filename, default_content in {**_DEFAULT_JSON_FILES, **_DEFAULT_YAML_FILES}.items():
         dst = data_dir / filename
         src = source / "research-copilot" / filename if source else None
+        if filename == "research-config.yaml" and source and src is not None and not src.exists():
+            legacy_src = source / "research-copilot" / "research-profile.yaml"
+            if legacy_src.exists():
+                src = legacy_src
         exists = dst.exists()
         if exists and not force:
             skipped.append(f"research-copilot/{filename}")
@@ -322,6 +349,94 @@ def install_research_copilot_cron(
                 no_agent=False,
             )
             created.append("research-library-recommend")
+
+        if "research-recommend-delivery-retry" in names:
+            existing.append("research-recommend-delivery-retry")
+            job = next(
+                j for j in list_jobs(include_disabled=True)
+                if j.get("name") == "research-recommend-delivery-retry"
+            )
+            update_job(job["id"], {
+                "prompt": _RESEARCH_RECOMMEND_PROMPT,
+                "script": "module:research_copilot.scripts.library_recommend_delivery",
+                "no_agent": False,
+                "schedule": "*/5 * * * *",
+            })
+        else:
+            create_job(
+                prompt=_RESEARCH_RECOMMEND_PROMPT,
+                schedule="*/5 * * * *",
+                name="research-recommend-delivery-retry",
+                deliver=deliver,
+                script="module:research_copilot.scripts.library_recommend_delivery",
+                no_agent=False,
+            )
+            created.append("research-recommend-delivery-retry")
+
+        if "research-weekly-deep-research" in names:
+            existing.append("research-weekly-deep-research")
+            job = next(
+                j for j in list_jobs(include_disabled=True)
+                if j.get("name") == "research-weekly-deep-research"
+            )
+            update_job(job["id"], {
+                "script": "module:research_copilot.scripts.library_deep_research",
+                "no_agent": True,
+            })
+        else:
+            create_job(
+                prompt=None,
+                schedule="30 4 * * 0",
+                name="research-weekly-deep-research",
+                deliver=deliver,
+                script="module:research_copilot.scripts.library_deep_research",
+                no_agent=True,
+            )
+            created.append("research-weekly-deep-research")
+
+        if "research-deep-delivery-retry" in names:
+            existing.append("research-deep-delivery-retry")
+            job = next(
+                j for j in list_jobs(include_disabled=True)
+                if j.get("name") == "research-deep-delivery-retry"
+            )
+            update_job(job["id"], {
+                "script": "module:research_copilot.scripts.library_deep_research_delivery",
+                "no_agent": True,
+                "schedule": "*/5 * * * *",
+            })
+        else:
+            create_job(
+                prompt=None,
+                schedule="*/5 * * * *",
+                name="research-deep-delivery-retry",
+                deliver=deliver,
+                script="module:research_copilot.scripts.library_deep_research_delivery",
+                no_agent=True,
+            )
+            created.append("research-deep-delivery-retry")
+
+        if "research-scout-delivery-retry" in names:
+            existing.append("research-scout-delivery-retry")
+            job = next(
+                j for j in list_jobs(include_disabled=True)
+                if j.get("name") == "research-scout-delivery-retry"
+            )
+            update_job(job["id"], {
+                "script": "module:research_copilot.scripts.library_scout_delivery",
+                "no_agent": True,
+                "schedule": "*/5 * * * *",
+            })
+        else:
+            create_job(
+                prompt=None,
+                schedule="*/5 * * * *",
+                name="research-scout-delivery-retry",
+                deliver=deliver,
+                script="module:research_copilot.scripts.library_scout_delivery",
+                no_agent=True,
+            )
+            created.append("research-scout-delivery-retry")
 
         if "paper-health-report" in names:
             existing.append("paper-health-report")

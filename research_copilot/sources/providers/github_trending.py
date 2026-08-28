@@ -10,6 +10,7 @@ from html import unescape
 from typing import Callable
 
 from research_copilot.library import ResearchItemDraft
+from research_copilot.net import fetch as _net_fetch
 from research_copilot.sources.models import SourceDefinition
 
 from .base import FetchContext, ProviderError, ProviderItem, ProviderResult
@@ -18,12 +19,10 @@ HttpFetcher = Callable[[str, int], bytes]
 
 
 def _default_fetch(url: str, timeout: int) -> bytes:
-    request = urllib.request.Request(
-        url,
+    return _net_fetch(
+        url, timeout=timeout,
         headers={"User-Agent": "Hermes-Research-Copilot/1.0", "Accept": "text/html"},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
 
 
 def _text(value: str) -> str:

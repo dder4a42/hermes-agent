@@ -9,17 +9,17 @@ import urllib.request
 from typing import Callable
 
 from research_copilot.library import ResearchItemDraft, TopicMatch
+from research_copilot.net import fetch as _net_fetch
 from research_copilot.sources.models import SourceDefinition
+from research_copilot.sources.query_plan import build_query_plan
 
-from .base import FetchContext, ProviderError, ProviderItem, ProviderResult
+from .base import FetchContext, ProviderError, ProviderItem, ProviderResult, merge_provider_item_topics
 
 HttpFetcher = Callable[[str, int, dict[str, str]], bytes]
 
 
 def _default_fetch(url: str, timeout: int, headers: dict[str, str]) -> bytes:
-    request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
+    return _net_fetch(url, timeout=timeout, headers=headers)
 
 
 class SemanticScholarProvider:
@@ -32,12 +32,7 @@ class SemanticScholarProvider:
     def fetch(self, source: SourceDefinition, context: FetchContext) -> ProviderResult:
         timeout = int(source.options.get("timeout_seconds", 15))
         limit = min(int(source.options.get("limit_per_query", 5)), context.remaining_items)
-        queries = [
-            (topic_id, query.strip())
-            for topic_id in context.active_topic_ids
-            for query in context.topic_queries.get(topic_id, ())
-            if query.strip()
-        ]
+        queries = build_query_plan(context, source_id=source.id)
         if not queries:
             return ProviderResult()
         headers = {"User-Agent": "Hermes-Research-Copilot/1.0", "Accept": "application/json"}
@@ -45,8 +40,9 @@ class SemanticScholarProvider:
             headers["x-api-key"] = self.api_key
         items: list[ProviderItem] = []
         requests = 0
-        seen: set[str] = set()
-        for topic_id, query in queries:
+        seen: dict[str, int] = {}
+        for planned in queries:
+            query = planned.query
             if requests >= context.remaining_requests or len(items) >= context.remaining_items:
                 break
             params = urllib.parse.urlencode({
@@ -88,16 +84,24 @@ class SemanticScholarProvider:
             for paper in data.get("data", []):
                 title = str(paper.get("title") or "").strip()
                 paper_id = str(paper.get("paperId") or "").strip()
-                if not title or (paper_id and paper_id in seen):
+                if not title:
                     continue
-                if paper_id:
-                    seen.add(paper_id)
                 external_ids = paper.get("externalIds") or {}
                 arxiv_id = str(external_ids.get("ArXiv") or "")
                 doi = str(external_ids.get("DOI") or "")
                 url_value = str(paper.get("url") or "")
                 if not url_value and arxiv_id:
                     url_value = f"https://arxiv.org/abs/{arxiv_id}"
+                identity = paper_id or arxiv_id or doi or url_value or title.casefold()
+                planned_topics = tuple(
+                    TopicMatch(topic_id, 0.5, (query,))
+                    for topic_id in planned.topic_ids
+                )
+                if identity in seen:
+                    index = seen[identity]
+                    items[index] = merge_provider_item_topics(items[index], planned_topics)
+                    continue
+                seen[identity] = len(items)
                 items.append(ProviderItem(
                     item=ResearchItemDraft(
                         title=title,
@@ -114,7 +118,7 @@ class SemanticScholarProvider:
                         arxiv_id=arxiv_id,
                         semantic_scholar_id=paper_id,
                     ),
-                    topics=(TopicMatch(topic_id, 0.5, (query,)),),
+                    topics=planned_topics,
                     query=query,
                 ))
                 if len(items) >= context.remaining_items:
