@@ -11,16 +11,23 @@ def _paths(tmp_path: Path) -> dict[str, Path]:
         "data": data,
         "database": data / "library.db",
         "topics": data / "topics.yaml",
-        "profile": data / "research-profile.yaml",
+        "research_config": data / "research-config.yaml",
         "catalog": data / "sources.yaml",
     }
-    paths["topics"].write_text("topics: []\n")
-    paths["profile"].write_text("schema_version: 1\n")
+    paths["topics"].write_text(
+        "topics:\n"
+        "  - id: long-horizon-agent\n"
+        "    name: Long-horizon agents\n"
+        "    status: active\n"
+    )
+    paths["research_config"].write_text(
+        "schema_version: 2\nlong_term_agenda: []\nevidence_ledger: []\n"
+    )
     paths["catalog"].write_text("schema_version: 1\nsources: []\n")
     return paths
 
 
-def test_codex_scout_uses_read_only_ephemeral_structured_execution(tmp_path, monkeypatch):
+def test_hermes_scout_uses_isolated_profile_and_web_toolset(tmp_path, monkeypatch):
     from research_copilot import scout
 
     payload = {
@@ -39,30 +46,33 @@ def test_codex_scout_uses_read_only_ephemeral_structured_execution(tmp_path, mon
     }
     calls = []
 
-    def fake_run(command, **kwargs):
-        calls.append((command, kwargs))
-        output = Path(command[command.index("--output-last-message") + 1])
-        output.write_text(json.dumps(payload))
-        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    def fake_run(command, cwd, timeout_seconds):
+        calls.append((command, cwd, timeout_seconds))
+        return type(
+            "Result", (),
+            {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""},
+        )()
 
-    monkeypatch.setattr(scout.shutil, "which", lambda name: "/usr/bin/codex")
-    monkeypatch.setattr(scout.subprocess, "run", fake_run)
+    monkeypatch.setattr(scout.shutil, "which", lambda name: "/usr/bin/hermes")
 
-    result = scout.run_codex_scout(paths=_paths(tmp_path), timeout_seconds=120)
+    paths = _paths(tmp_path)
+    result = scout.run_hermes_scout(
+        paths=paths, timeout_seconds=120, command_runner=fake_run,
+    )
 
-    command, kwargs = calls[0]
-    assert command[:2] == ["/usr/bin/codex", "exec"]
-    assert command[command.index("--sandbox") + 1] == "read-only"
-    assert "--ephemeral" in command
-    assert "--output-schema" in command
-    assert "software engineering tasks" in command[-1]
-    assert "natural Chinese" in command[-1]
-    assert "current beliefs" in command[-1]
-    assert kwargs["timeout"] == 120
+    command, cwd, timeout_seconds = calls[0]
+    assert command[:3] == ["/usr/bin/hermes", "-p", "research-copilot"]
+    assert command[-3:] == ["--json-output", "-t", "web"]
+    prompt = command[command.index("-z") + 1]
+    assert "Do not delegate" in prompt
+    assert "natural Chinese" in prompt
+    assert '"research_config_yaml"' in prompt
+    assert cwd == paths["data"]
+    assert timeout_seconds == 120
     assert result.payload == payload
 
 
-def test_codex_scout_rejects_non_http_evidence(tmp_path, monkeypatch):
+def test_hermes_scout_rejects_non_http_evidence(tmp_path, monkeypatch):
     from research_copilot import scout
 
     payload = {
@@ -75,15 +85,16 @@ def test_codex_scout_rejects_non_http_evidence(tmp_path, monkeypatch):
         "term_suggestions": [], "source_suggestions": [],
     }
 
-    def fake_run(command, **_kwargs):
-        Path(command[command.index("--output-last-message") + 1]).write_text(json.dumps(payload))
-        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+    def fake_run(_command, _cwd, _timeout_seconds):
+        return type(
+            "Result", (),
+            {"returncode": 0, "stdout": json.dumps(payload), "stderr": ""},
+        )()
 
-    monkeypatch.setattr(scout.shutil, "which", lambda name: "/usr/bin/codex")
-    monkeypatch.setattr(scout.subprocess, "run", fake_run)
+    monkeypatch.setattr(scout.shutil, "which", lambda name: "/usr/bin/hermes")
 
     try:
-        scout.run_codex_scout(paths=_paths(tmp_path))
+        scout.run_hermes_scout(paths=_paths(tmp_path), command_runner=fake_run)
     except ValueError as exc:
         assert "evidence URL" in str(exc)
     else:

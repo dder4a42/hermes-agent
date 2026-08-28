@@ -105,7 +105,11 @@ def test_new_stronger_identifier_merges_through_existing_url(library):
     )
 
     assert second.item_id == first.item_id
-    assert second.canonical_key == first.canonical_key
+    assert first.canonical_key == "url:https://example.com/paper"
+    assert second.canonical_key == "doi:10.1/paper"
+    assert connection.execute(
+        "SELECT canonical_key FROM research_items WHERE id=?", (first.item_id,)
+    ).fetchone()[0] == second.canonical_key
     assert connection.execute("SELECT count(*) FROM research_items").fetchone()[0] == 1
     assert connection.execute("SELECT count(*) FROM item_identifiers").fetchone()[0] == 2
 
@@ -154,7 +158,7 @@ def test_source_run_rejects_negative_counts():
         SourceRunCounts(fetched=-1)
 
 
-def test_recommendation_and_status_change_are_atomic(library):
+def test_recommendation_does_not_claim_workflow_or_learning_progress(library):
     connection, repo = library
     item_id, now = _create_item(library)
     rec_id = repo.record_recommendation(
@@ -162,7 +166,13 @@ def test_recommendation_and_status_change_are_atomic(library):
         recommended_at=now, rationale="Strong match",
     )
     assert rec_id.startswith("rec_")
-    assert connection.execute("SELECT status FROM research_items WHERE id = ?", (item_id,)).fetchone()[0] == "recommended"
+    item = connection.execute(
+        "SELECT workflow_state,user_learning_status FROM research_items WHERE id=?",
+        (item_id,),
+    ).fetchone()
+    assert (item["workflow_state"], item["user_learning_status"]) == (
+        "discovered", "unseen",
+    )
     assert connection.execute("SELECT count(*) FROM recommendations").fetchone()[0] == 1
 
     with pytest.raises(Exception):
@@ -170,32 +180,54 @@ def test_recommendation_and_status_change_are_atomic(library):
             item_id, score=1.5, score_breakdown={}, recommended_at=now,
         )
     assert connection.execute("SELECT count(*) FROM recommendations").fetchone()[0] == 1
-    assert connection.execute("SELECT status FROM research_items WHERE id = ?", (item_id,)).fetchone()[0] == "recommended"
+    unchanged = connection.execute(
+        "SELECT workflow_state,user_learning_status FROM research_items WHERE id=?",
+        (item_id,),
+    ).fetchone()
+    assert tuple(unchanged) == tuple(item)
 
 
-def test_failed_recommendation_does_not_change_item_status(library):
+def test_failed_recommendation_does_not_change_item_progress(library):
     connection, repo = library
     item_id, now = _create_item(library)
     with pytest.raises(Exception):
         repo.record_recommendation(
             item_id, score=2.0, score_breakdown={}, recommended_at=now,
         )
-    assert connection.execute("SELECT status FROM research_items WHERE id = ?", (item_id,)).fetchone()[0] == "discovered"
+    item = connection.execute(
+        "SELECT workflow_state,user_learning_status FROM research_items WHERE id=?",
+        (item_id,),
+    ).fetchone()
+    assert (item["workflow_state"], item["user_learning_status"]) == (
+        "discovered", "unseen",
+    )
     assert connection.execute("SELECT count(*) FROM recommendations").fetchone()[0] == 0
 
 
-def test_feedback_and_status_change_are_atomic(library):
+def test_feedback_updates_only_user_learning_progress_atomically(library):
     connection, repo = library
     item_id, now = _create_item(library)
     event_id = repo.record_feedback(
         item_id, kind="save", created_at=now, payload={"reason": "read later"},
     )
     assert event_id.startswith("fb_")
-    assert connection.execute("SELECT status FROM research_items WHERE id = ?", (item_id,)).fetchone()[0] == "saved"
+    item = connection.execute(
+        "SELECT workflow_state,user_learning_status FROM research_items WHERE id=?",
+        (item_id,),
+    ).fetchone()
+    assert (item["workflow_state"], item["user_learning_status"]) == (
+        "discovered", "saved",
+    )
     assert connection.execute("SELECT kind FROM feedback_events").fetchone()[0] == "save"
 
     repo.record_feedback(item_id, kind="note", created_at=now, payload={"text": "important"})
-    assert connection.execute("SELECT status FROM research_items WHERE id = ?", (item_id,)).fetchone()[0] == "saved"
+    item = connection.execute(
+        "SELECT workflow_state,user_learning_status FROM research_items WHERE id=?",
+        (item_id,),
+    ).fetchone()
+    assert (item["workflow_state"], item["user_learning_status"]) == (
+        "discovered", "saved",
+    )
 
 
 def test_feedback_for_unknown_item_does_not_write_event(library):

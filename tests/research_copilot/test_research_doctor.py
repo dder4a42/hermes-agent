@@ -5,13 +5,18 @@ from datetime import datetime, timezone
 
 from research_copilot.health import build_doctor_report, render_doctor_report
 from research_copilot.library import LibraryRepository, connect_library, initialize_library
+from research_copilot.library.database import SCHEMA_VERSION
 
 
 def test_doctor_reports_code_config_database_and_override_provenance(tmp_path):
     database = tmp_path / "library.db"
     catalog = tmp_path / "sources.yaml"
     topics = tmp_path / "topics.yaml"
-    catalog.write_text("schema_version: 1\nsources: []\n")
+    catalog.write_text(
+        "schema_version: 1\nsources:\n"
+        "  - id: rss\n"
+        "    enabled: true\n"
+    )
     topics.write_text("topics: []\n")
     override = tmp_path / "home" / "skills" / "research" / "paper" / "SKILL.md"
     override.parent.mkdir(parents=True)
@@ -33,7 +38,7 @@ def test_doctor_reports_code_config_database_and_override_provenance(tmp_path):
             hermes_home=tmp_path / "home", hermes_version="1.2.3",
             git_commit="abc123",
         )
-        assert report.schema_version == 1
+        assert report.schema_version == SCHEMA_VERSION
         assert report.enabled_sources == ("rss",)
         assert report.catalog_hash == hashlib.sha256(catalog.read_bytes()).hexdigest()
         assert report.topics_hash == hashlib.sha256(topics.read_bytes()).hexdigest()

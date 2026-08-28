@@ -42,8 +42,11 @@ topics:
   - id: world-model
     name: World Model
     priority: 0.35
-    status: dormant
+    status: inactive
 """)
+    (data_dir / "research-config.yaml").write_text(
+        "schema_version: 2\nlong_term_agenda: []\nevidence_ledger: []\n"
+    )
 
     from research_copilot.commands import handle_paper_command
 
@@ -54,7 +57,7 @@ topics:
     assert "Research Agent" in output
     assert "active" in output
     assert "world-model" in output
-    assert "dormant" in output
+    assert "inactive" in output
 
 
 def test_paper_history_lists_recent_recommendations(tmp_path, monkeypatch):
@@ -85,7 +88,12 @@ def test_paper_save_records_interaction_and_updates_candidate(tmp_path, monkeypa
     assert f"Saved {item_id}" in output
     from research_copilot.runtime import open_library
     connection, _ = open_library(home / "research-copilot" / "library.db")
-    assert connection.execute("SELECT status FROM research_items WHERE id=?", (item_id,)).fetchone()[0] == "saved"
+    item = connection.execute(
+        "SELECT workflow_state,user_learning_status FROM research_items WHERE id=?",
+        (item_id,),
+    ).fetchone()
+    assert item["workflow_state"] == "discovered"
+    assert item["user_learning_status"] == "saved"
     assert connection.execute("SELECT kind FROM feedback_events WHERE item_id=?", (item_id,)).fetchone()[0] == "save"
     connection.close()
 

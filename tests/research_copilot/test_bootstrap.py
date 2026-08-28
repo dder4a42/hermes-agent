@@ -41,7 +41,17 @@ def test_install_research_copilot_cron_is_profile_scoped_and_idempotent(tmp_path
     first = install_research_copilot_cron(profile_home, deliver="weixin")
     second = install_research_copilot_cron(profile_home, deliver="weixin")
 
-    expected = ["paper-fetcher", "research-library-recommend", "paper-health-report", "task-surfacer", "thought-surfacer"]
+    expected = [
+        "paper-fetcher",
+        "research-library-recommend",
+        "research-recommend-delivery-retry",
+        "research-weekly-deep-research",
+        "research-deep-delivery-retry",
+        "research-scout-delivery-retry",
+        "paper-health-report",
+        "task-surfacer",
+        "thought-surfacer",
+    ]
     assert first["created"] == expected
     assert second["created"] == []
     assert second["existing"] == expected

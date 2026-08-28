@@ -44,9 +44,12 @@ def test_ranking_projects_library_relations_and_recommends_atomically(tmp_path):
         assert winner is not None
         assert winner.item_id == first.item_id
         assert winner.dimensions["multi_source_confirmation"] == 0.5
-        item = connection.execute("SELECT status FROM research_items").fetchone()
+        item = connection.execute(
+            "SELECT workflow_state,user_learning_status FROM research_items"
+        ).fetchone()
         recommendation = connection.execute("SELECT * FROM recommendations").fetchone()
-        assert item["status"] == "recommended"
+        assert item["workflow_state"] == "discovered"
+        assert item["user_learning_status"] == "unseen"
         assert recommendation["item_id"] == first.item_id
         assert recommendation["score"] == winner.score
     finally:
@@ -70,6 +73,11 @@ def test_recommend_top_is_silent_below_threshold(tmp_path):
         )
         assert result is None
         assert connection.execute("SELECT count(*) FROM recommendations").fetchone()[0] == 0
-        assert connection.execute("SELECT status FROM research_items").fetchone()[0] == "discovered"
+        item = connection.execute(
+            "SELECT workflow_state,user_learning_status FROM research_items"
+        ).fetchone()
+        assert (item["workflow_state"], item["user_learning_status"]) == (
+            "discovered", "unseen",
+        )
     finally:
         connection.close()
