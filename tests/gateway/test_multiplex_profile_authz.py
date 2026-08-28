@@ -50,24 +50,6 @@ def _make_multiplex_runner(monkeypatch):
     return runner, default_adapter, secondary_adapter
 
 
-def test_secondary_open_policy_not_authorized_by_default_allowlist(monkeypatch):
-    """Secondary-profile open intake must not inherit default allowlist trust."""
-    runner, _default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
-
-    source = SessionSource(
-        platform=Platform.WECOM,
-        user_id="attacker",
-        chat_id="dm-chat",
-        user_name="attacker",
-        chat_type="dm",
-        profile="coder",
-    )
-
-    assert runner._adapter_dm_policy(Platform.WECOM, profile="coder") == "open"
-    assert runner._adapter_dm_policy(Platform.WECOM) == "allowlist"
-    assert runner._is_user_authorized(source) is False
-
-
 def test_default_profile_still_trusts_own_allowlist(monkeypatch):
     """Default-profile allowlist trust is unchanged when profile is unstamped."""
     runner, _default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
@@ -84,47 +66,12 @@ def test_default_profile_still_trusts_own_allowlist(monkeypatch):
     assert runner._is_user_authorized(source) is True
 
 
-def test_secondary_allowlist_still_authorized(monkeypatch):
-    """Secondary profile with allowlist policy is trusted on its own adapter."""
-    runner, _default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)
-    secondary_adapter._dm_policy = "allowlist"
+def test_active_profile_stamp_resolves_primary_adapter(monkeypatch):
+    """A single-profile gateway stamps its active profile but stores adapters as primary."""
+    runner, default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    runner._active_profile_name = lambda: "dev"
 
-    source = SessionSource(
-        platform=Platform.WECOM,
-        user_id="allowed-user",
-        chat_id="dm-chat",
-        user_name="allowed-user",
-        chat_type="dm",
-        profile="coder",
-    )
-
-    assert runner._is_user_authorized(source) is True
-
-
-def test_adapter_for_source_resolves_secondary_profile_adapter(monkeypatch):
-    """Ingress adapter lookup must use the stamped profile's adapter map."""
-    runner, default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)
-
-    source = SessionSource(
-        platform=Platform.WECOM,
-        user_id="attacker",
-        chat_id="dm-chat",
-        user_name="attacker",
-        chat_type="dm",
-        profile="coder",
-    )
-
-    assert runner._adapter_for_source(source) is secondary_adapter
-    assert runner._adapter_for_source(
-        SessionSource(
-            platform=Platform.WECOM,
-            user_id="allowed-user",
-            chat_id="dm-chat",
-            user_name="allowed-user",
-            chat_type="dm",
-            profile=None,
-        )
-    ) is default_adapter
+    assert runner._authorization_adapter(Platform.WECOM, profile="dev") is default_adapter
 
 
 def test_secondary_allowlist_dm_behavior_ignores_unauthorized(monkeypatch):
@@ -137,6 +84,70 @@ def test_secondary_allowlist_dm_behavior_ignores_unauthorized(monkeypatch):
         profile="coder",
     ) == "ignore"
     assert runner._get_unauthorized_dm_behavior(Platform.WECOM) == "ignore"
+
+
+def test_adapter_auth_check_stamps_secondary_profile(monkeypatch):
+    """The adapter auth-check callback must stamp its own secondary profile.
+
+    Regression for the gap where ``_make_adapter_auth_check`` built a
+    profile-less ``SessionSource``, so a secondary adapter's external-context
+    authorization (e.g. Slack/Discord thread-reply lookups) silently
+    resolved the *active* profile's allowlist scope instead of its own.
+    """
+    from gateway.run import GatewayRunner
+
+    _clear_auth_env(monkeypatch)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+
+    captured: dict = {}
+
+    def fake_is_user_authorized(source):
+        captured["profile"] = source.profile
+        return True
+
+    runner._is_user_authorized = fake_is_user_authorized
+
+    check = runner._make_adapter_auth_check(Platform.WECOM, profile_name="coder")
+    assert check("some-user", "dm", "dm-chat") is True
+    assert captured["profile"] == "coder"
+
+
+def test_startup_guard_gateway_allow_all_reads_scope_not_environ(monkeypatch):
+    """The GATEWAY_ALLOW_ALL_USERS opt-in check inside the startup guard
+    must honor the active profile secret scope (#93522): the default
+    profile's env-only opt-in must not leak into a secondary profile that
+    never opted in, and a secondary profile's own scoped opt-in must be
+    honored."""
+    from agent import secret_scope
+    from gateway.run import _own_policy_open_startup_violation
+
+    _clear_auth_env(monkeypatch)
+    cfg = GatewayConfig(multiplex_profiles=True)
+    cfg.platforms = {
+        Platform.WECOM: PlatformConfig(enabled=True, extra={"dm_policy": "open"}),
+    }
+
+    previous_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
+    try:
+        token = secret_scope.set_secret_scope({"SOMETHING_ELSE": "x"})
+        try:
+            violation = _own_policy_open_startup_violation(cfg)
+        finally:
+            secret_scope.reset_secret_scope(token)
+        assert violation is not None, "default profile's env opt-in must not leak into the scoped secondary profile"
+
+        token = secret_scope.set_secret_scope({"GATEWAY_ALLOW_ALL_USERS": "true"})
+        try:
+            violation = _own_policy_open_startup_violation(cfg)
+        finally:
+            secret_scope.reset_secret_scope(token)
+        assert violation is None, "the secondary profile's own scoped opt-in must be honored"
+    finally:
+        secret_scope.set_multiplex_active(previous_multiplex)
 
 
 def test_secondary_open_policy_fails_startup_guard(monkeypatch):

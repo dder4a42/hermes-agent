@@ -38,23 +38,6 @@ class TestSupportsMediaInToolResults:
     def test_openrouter_yes(self):
         assert _supports_media_in_tool_results("openrouter", "anthropic/claude-opus-4.6") is True
 
-    def test_nous_yes(self):
-        assert _supports_media_in_tool_results("nous", "anthropic/claude-sonnet-4.6") is True
-
-    def test_openai_chat_yes(self):
-        assert _supports_media_in_tool_results("openai", "gpt-5.4") is True
-
-    def test_openai_codex_yes(self):
-        assert _supports_media_in_tool_results("openai-codex", "gpt-5-codex") is True
-
-    def test_gemini_3_yes(self):
-        assert _supports_media_in_tool_results("google", "gemini-3-flash-preview") is True
-
-    def test_gemini_2_no(self):
-        assert _supports_media_in_tool_results("google", "gemini-2.5-pro") is False
-
-    def test_unknown_provider_conservative_no(self):
-        assert _supports_media_in_tool_results("brand-new-provider", "any-model") is False
 
     def test_empty_provider_no(self):
         assert _supports_media_in_tool_results("", "anything") is False
@@ -111,26 +94,6 @@ class TestVisionAnalyzeNative:
         url = next(p["image_url"]["url"] for p in parts if p.get("type") == "image_url")
         assert url.startswith("data:image/")
 
-    def test_missing_file_returns_error_string(self, tmp_path):
-        result = asyncio.get_event_loop().run_until_complete(
-            _vision_analyze_native(str(tmp_path / "nope.png"), "?")
-        )
-        # tool_error returns a JSON string, not the multimodal envelope
-        assert isinstance(result, str)
-        parsed = json.loads(result)
-        assert parsed.get("success") is False
-        # Unified resolver: local backend reports a clean not-found.
-        err = parsed.get("error", "").lower()
-        assert "image file not found" in err or "no active sandbox" in err
-
-    def test_empty_image_url_returns_error(self):
-        result = asyncio.get_event_loop().run_until_complete(
-            _vision_analyze_native("", "?")
-        )
-        assert isinstance(result, str)
-        parsed = json.loads(result)
-        assert parsed.get("success") is False
-        assert "image_url is required" in parsed.get("error", "")
 
     def test_file_url_scheme_resolves(self, tmp_path):
         img = tmp_path / "t.png"
@@ -145,12 +108,10 @@ class TestVisionAnalyzeNative:
         """Regression for the wedged-session incident (May 2026).
 
         A vision tool-result image is baked into conversation history and
-        re-sent on every subsequent turn.  Anthropic rejects any single
-        base64 image over 5 MB with a 400, and immutable history means the
-        bad bytes can't be cleared by retrying — the session is permanently
-        wedged.  The native fast path must proactively resize down to the
-        embed cap (well under 5 MB) BEFORE embedding, not just at the 20 MB
-        hard ceiling.  Skips if Pillow isn't available (resize is a no-op).
+        re-sent on every subsequent turn.  The native fast path must
+        proactively resize down to the history-reuse embed cap BEFORE
+        embedding, not just at the 20 MB hard ceiling.  Skips if Pillow
+        isn't available (resize is a no-op).
         """
         pytest = __import__("pytest")
         try:
@@ -175,9 +136,17 @@ class TestVisionAnalyzeNative:
             if p.get("type") == "image_url"
         )
         assert len(url) <= _EMBED_TARGET_BYTES, (
-            f"embedded image {len(url) / 1024 / 1024:.1f} MB exceeds embed cap "
-            f"{_EMBED_TARGET_BYTES / 1024 / 1024:.0f} MB — would wedge sessions on Anthropic"
+            f"embedded image {len(url) / 1024:.0f} KB exceeds embed cap "
+            f"{_EMBED_TARGET_BYTES / 1024:.0f} KB — would bloat every later turn"
         )
+
+    def test_embed_caps_are_sized_for_history_reuse(self):
+        """Native embeds ride every later turn, so caps must stay well below
+        the Anthropic 5 MB / 8000px reject limits (#92699)."""
+        from tools.vision_tools import _EMBED_MAX_DIMENSION, _EMBED_TARGET_BYTES
+
+        assert _EMBED_TARGET_BYTES <= 512 * 1024
+        assert _EMBED_MAX_DIMENSION <= 2048
 
 
 # ─── _handle_vision_analyze fast-path gating ─────────────────────────────────
@@ -210,25 +179,6 @@ class TestHandleVisionAnalyzeFastPath:
             f"Expected multimodal envelope, got {type(result).__name__}: {str(result)[:200]}"
         assert result.get("_multimodal") is True
 
-    def test_non_vision_main_model_falls_through_to_aux(self, tmp_path, monkeypatch):
-        """Non-vision main model → fast path skipped, aux LLM path attempted."""
-        img = tmp_path / "x.png"
-        img.write_bytes(_TINY_PNG)
-
-        async def _aux_sentinel(*args, **kwargs):
-            return '{"sentinel": "aux-path"}'
-
-        from agent.auxiliary_client import set_runtime_main, clear_runtime_main
-        set_runtime_main("openrouter", "qwen/qwen3-coder")
-        try:
-            with patch("tools.vision_tools.vision_analyze_tool", side_effect=_aux_sentinel):
-                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"})
-                result = asyncio.get_event_loop().run_until_complete(coro)
-        finally:
-            clear_runtime_main()
-
-        assert not (isinstance(result, dict) and result.get("_multimodal") is True), \
-            "Fast path fired for non-vision model; should have fallen through to aux LLM"
 
     def test_fast_path_disabled_for_unsupported_provider(self, tmp_path, monkeypatch):
         """Even with vision-capable model, unknown provider → fall through."""

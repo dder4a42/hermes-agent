@@ -513,6 +513,8 @@ class RaftAdapter(BasePlatformAdapter):
         logger.info("[raft] Raft channel listening on %s:%d%s", self._host, bound_port, self._path)
 
         self._spawn_bridge(bound_port)
+        # Plugin-registered native handlers (ctx.register_platform_handler).
+        self._wire_plugin_handlers(None)
         return True
 
     async def disconnect(self) -> None:
@@ -692,7 +694,9 @@ class RaftAdapter(BasePlatformAdapter):
     def _validate_bridge_token(self, token: str) -> bool:
         if not self._bridge_token or not token:
             return False
-        return hmac.compare_digest(token, self._bridge_token)
+        # Compare as bytes: compare_digest raises TypeError on a str with
+        # non-ASCII characters, and the token is a raw request header.
+        return hmac.compare_digest(token.encode(), self._bridge_token.encode())
 
     async def _accept_wake(self, payload: Dict[str, Any]) -> bool:
         if not self._message_handler:
@@ -739,6 +743,7 @@ class RaftAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=self._session_key_profile(event.source),
         )
 
         if session_key in self._active_sessions:
