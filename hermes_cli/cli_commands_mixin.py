@@ -1756,6 +1756,376 @@ class CLICommandsMixin:
         _set_active(result.slug)
         print(f"(^_^)b {result.display_name} hatched and adopted — it'll pop in shortly!")
 
+    def _handle_s_command(self, cmd: str):
+        """Handle /s (schedule) — manage timed reminders."""
+        import shlex
+        from tools.thought_tools import (
+            add_task, done_task, remove_task,
+            pause_task, resume_task, list_tasks,
+        )
+
+        tokens = shlex.split(cmd)
+        subcmd = tokens[1].strip().lower() if len(tokens) > 1 else "status"
+
+        # Route ask / discuss / end through shared domain-discussion module.
+        if subcmd in {"ask", "discuss", "end"}:
+            try:
+                from gateway.domain_discussion import handle_domain_subcommand
+            except ImportError:
+                print("❌ discussion module unavailable")
+                return
+            args_str = cmd[len("s "):].strip() if cmd.lower().startswith("s ") else " ".join(tokens[1:])
+            response = handle_domain_subcommand("s", args_str)
+            if response is not None:
+                print(response)
+                return
+
+        if subcmd == "status":
+            tasks = list_tasks(state="active")
+            print()
+            print("+" + "-" * 60 + "+")
+            print("|" + " " * 16 + "(^.^) Timed Reminders" + " " * 19 + "|")
+            print("+" + "-" * 60 + "+")
+            if not tasks:
+                print("  No active reminders.")
+            else:
+                for i, t in enumerate(tasks, 1):
+                    print(f"  #{i} [{t['id']}] {t['title']}")
+                    when_display = t.get("scheduled_at") or t.get("schedule_raw", "?")
+                    print(f"      When:     {when_display}")
+                    perr = (t.get("parse") or {}).get("error")
+                    if perr:
+                        print(f"      ⚠ Fix:    {perr}")
+                    if t.get("location"):
+                        print(f"      Where:    {t['location']}")
+                    if t.get("url"):
+                        print(f"      URL:      {t['url']}")
+                    attendees = t.get("attendees") or []
+                    if attendees:
+                        print(f"      With:     {', '.join(attendees)}")
+                    if t.get("remind_before_min"):
+                        print(f"      Lead:     {t['remind_before_min']} min before")
+                    checklist = t.get("checklist") or []
+                    if checklist:
+                        print("      Checklist:")
+                        for it in checklist:
+                            box = "[x]" if it.get("done") else "[ ]"
+                            print(f"        {box} {it.get('text','')}")
+                    if t.get("notes"):
+                        print(f"      Notes:    {t['notes']}")
+                    print()
+            print("  Commands:")
+            print('    /s add "task title" --when "tomorrow 2pm"')
+            print('        [--url URL] [--where "..."] [--attendees a,b]')
+            print('        [--tags t1,t2] [--remind-before 30m] [--checklist "a;b"]')
+            print("    /s check <id> <item> / /s uncheck <id> <item>")
+            print('    /s item add <id> "text" / /s item rm <id> <item>')
+            print("    /s done <id>")
+            print("    /s pause <id> / /s resume <id>")
+            print("    /s rm <id>")
+
+        elif subcmd == "add":
+            from tools.thought_tools import parse_s_add_args
+            raw = cmd[len("s add"):].strip() if len(cmd) > 5 else ""
+            parsed = parse_s_add_args(raw)
+            if not parsed["schedule_raw"]:
+                print("(._.) Usage: /s add \"title\" --when \"tomorrow 2pm\"")
+                print("  Optional: --notes \"...\"  --url URL  --where \"...\"")
+                print("           --attendees a,b  --tags t1,t2")
+                print("           --remind-before 30m  --checklist \"a;b;c\"")
+                return
+            if not parsed["title"]:
+                print("(._.) Missing title. Put the reminder text before the flags.")
+                return
+            task = add_task(
+                title=parsed["title"],
+                schedule_raw=parsed["schedule_raw"],
+                notes=parsed["notes"],
+                url=parsed["url"],
+                location=parsed["location"],
+                attendees=parsed["attendees"],
+                tags=parsed["tags"],
+                remind_before_min=parsed["remind_before"],
+                checklist=parsed["checklist"],
+                input_raw=rest,
+            )
+            perr = (task.get("parse") or {}).get("error")
+            print(f"(^_^) Reminder set! [{task['id']}]")
+            print(f"  {parsed['title']} — {parsed['schedule_raw']}")
+            if task.get("scheduled_at"):
+                print(f"  scheduled_at: {task['scheduled_at']}")
+            if perr:
+                print(f"  ⚠ 时间解析失败: {perr}")
+            if task.get("remind_before_min"):
+                print(f"  pre-reminder: {task['remind_before_min']} minutes before")
+            if task.get("checklist"):
+                print("  checklist:")
+                for it in task["checklist"]:
+                    print(f"    [ ] {it['text']}")
+
+        elif subcmd == "list":
+            state_filter = tokens[2].strip().lower() if len(tokens) > 2 else "active"
+            tasks = list_tasks(state=state_filter)
+            print(f"\n(^_^) Tasks ({state_filter}):")
+            if not tasks:
+                print("  (none)")
+            else:
+                for t in tasks:
+                    print(f"  [{t['id']}] {t['title']} ({t.get('schedule_raw', '?')})")
+
+        elif subcmd == "done":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /s done <task_id>")
+                return
+            if done_task(tid):
+                print(f"(^_^) Task {tid} marked done!")
+            else:
+                print(f"(._.) Task {tid} not found.")
+
+        elif subcmd in ("rm", "remove"):
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /s rm <task_id>")
+                return
+            if remove_task(tid):
+                print(f"(^_^) Task {tid} removed.")
+            else:
+                print(f"(._.) Task {tid} not found.")
+
+        elif subcmd == "pause":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /s pause <task_id>")
+                return
+            if pause_task(tid):
+                print(f"(._.)zZ Task {tid} paused.")
+            else:
+                print(f"(._.) Task {tid} not found.")
+
+        elif subcmd == "resume":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /s resume <task_id>")
+                return
+            if resume_task(tid):
+                print(f"(^_^) Task {tid} resumed!")
+            else:
+                print(f"(._.) Task {tid} not found.")
+
+        elif subcmd in ("check", "uncheck"):
+            from tools.thought_tools import check_task_item, uncheck_task_item
+            if len(tokens) < 4:
+                print(f"(._.) Usage: /s {subcmd} <task_id> <item_index_or_id>")
+                return
+            tid, ref = tokens[2], tokens[3]
+            fn = check_task_item if subcmd == "check" else uncheck_task_item
+            if fn(tid, ref):
+                mark = "[x]" if subcmd == "check" else "[ ]"
+                print(f"(^_^) Item {mark} {ref} on {tid}")
+            else:
+                print(f"(._.) Item {ref!r} not found on {tid}")
+
+        elif subcmd == "item":
+            from tools.thought_tools import add_task_item, remove_task_item
+            sub2 = tokens[2].strip().lower() if len(tokens) > 2 else ""
+            if sub2 == "add":
+                if len(tokens) < 5:
+                    print('(._.) Usage: /s item add <task_id> "item text"')
+                    return
+                tid = tokens[3]
+                text = " ".join(tokens[4:]).strip().strip('"\'')
+                item = add_task_item(tid, text)
+                if item:
+                    print(f"(^_^) Added item [{item['id']}] {item['text']}")
+                else:
+                    print("(._.) Could not add (task missing, duplicate, or at cap)")
+            elif sub2 in ("rm", "remove", "delete"):
+                if len(tokens) < 5:
+                    print("(._.) Usage: /s item rm <task_id> <index_or_id>")
+                    return
+                tid, ref = tokens[3], tokens[4]
+                if remove_task_item(tid, ref):
+                    print(f"(^_^) Removed item {ref} from {tid}")
+                else:
+                    print(f"(._.) Item {ref!r} not found on {tid}")
+            else:
+                print("(._.) Usage: /s item [add|rm] <task_id> ...")
+
+        else:
+            print(f"(._.) Unknown subcommand: {subcmd}")
+            print("  Usage: /s [status|add|list|done|rm|pause|resume|check|uncheck|item]")
+
+    def _handle_end_command(self, cmd: str):
+        """Handle /end — close the active domain discussion."""
+        try:
+            from gateway.domain_discussion import clear_active_discussion
+        except ImportError:
+            print("❌ discussion module unavailable")
+            return
+        cleared = clear_active_discussion()
+        print("✅ 已结束当前讨论。" if cleared else "（当前没有进行中的讨论。）")
+
+    def _handle_paper_command(self, cmd: str):
+        """Handle /paper — manage Research Copilot state."""
+        from research_copilot.commands import handle_paper_command
+
+        raw = (cmd or "").strip()
+        if raw.startswith("/"):
+            raw = raw[1:]
+        if raw == "paper":
+            args = ""
+        elif raw.startswith("paper "):
+            args = raw[len("paper "):].strip()
+        else:
+            args = raw
+        print(handle_paper_command(args))
+
+    def _handle_th_command(self, cmd: str):
+        """Handle /th (thought) — manage thought incubation."""
+        import shlex
+        from tools.thought_tools import (
+            capture_thought_text, list_thoughts, archive_thought,
+            remove_thought, pause_thought, resume_thought, snooze_thought,
+            update_thought_action,
+        )
+
+        tokens = shlex.split(cmd)
+        subcmd = tokens[1].strip().lower() if len(tokens) > 1 else "status"
+
+        # Route ask / discuss / end through shared domain-discussion module.
+        if subcmd in {"ask", "discuss", "end"}:
+            try:
+                from gateway.domain_discussion import handle_domain_subcommand
+            except ImportError:
+                print("❌ discussion module unavailable")
+                return
+            args_str = cmd[len("th "):].strip() if cmd.lower().startswith("th ") else " ".join(tokens[1:])
+            response = handle_domain_subcommand("th", args_str)
+            if response is not None:
+                print(response)
+                return
+
+        if subcmd == "status":
+            active = list_thoughts(state="active")
+            dormant = list_thoughts(state="dormant")
+            archived = list_thoughts(state="archived")
+            print()
+            print("+" + "-" * 60 + "+")
+            print("|" + " " * 16 + "(^.^) Thought Incubator" + " " * 18 + "|")
+            print("+" + "-" * 60 + "+")
+            print(f"  Active:  {len(active)}")
+            print(f"  Dormant: {len(dormant)}")
+            print(f"  Done:    {len(archived)}")
+            print()
+            if active:
+                print("  Active thoughts:")
+                for th in active[:5]:
+                    print(f"    [{th['id']}] {th['title']}")
+            print()
+            print("  Commands: /th capture <idea>, /th list, /th show <id>, /th done <id>")
+
+        elif subcmd == "capture":
+            text = cmd[len("th capture"):].strip() if cmd.lower().startswith("th capture") else " ".join(tokens[2:])
+            if not text:
+                print("(._.) Usage: /th capture <idea>")
+                return
+            thought = capture_thought_text(text, source="cli")
+            print(f"(^_^) Thought saved! [{thought['id']}] {thought['title']}")
+
+        elif subcmd == "list":
+            sf = tokens[2].strip().lower() if len(tokens) > 2 else "active"
+            thoughts = list_thoughts(state=sf if sf != "all" else "")
+            print(f"\n(^_^) Thoughts ({sf}):")
+            if not thoughts:
+                print("  (none)")
+            else:
+                for th in thoughts:
+                    tags = ", ".join(th.get("tags", [])) or "-"
+                    surfaced = f" surfaced {th.get('surface_count', 0)}x" if th.get("surface_count", 0) else ""
+                    print(f"  [{th['id']}] {th['title']}  ({th.get('state', '?')}{surfaced})")
+
+        elif subcmd == "show":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /th show <thought_id>")
+                return
+            all_th = list_thoughts(state="") + list_thoughts(state="dormant") + list_thoughts(state="archived")
+            th = next((t for t in all_th if t["id"] == tid), None)
+            if not th:
+                print(f"(._.) Thought {tid} not found.")
+                return
+            print(f"\n[{th['id']}] {th['title']}")
+            print(f"  State:    {th.get('state', '?')}")
+            print(f"  Summary:  {th.get('summary', '-')}")
+            print(f"  Source:   {th.get('source', '-')}")
+            if th.get("tags"):
+                print(f"  Tags:     {', '.join(th['tags'])}")
+            print(f"  Created:  {th.get('created_at', '?')}")
+            if th.get("surfaced_at"):
+                print(f"  Surfaced: {th['surfaced_at']} ({th.get('surface_count', 0)}x)")
+
+        elif subcmd == "done":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /th done <thought_id>")
+                return
+            if archive_thought(tid):
+                print(f"(^_^) Thought {tid} archived.")
+            else:
+                print(f"(._.) Thought {tid} not found.")
+
+        elif subcmd in ("rm", "remove"):
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /th rm <thought_id>")
+                return
+            if remove_thought(tid):
+                print(f"(^_^) Thought {tid} removed.")
+            else:
+                print(f"(._.) Thought {tid} not found.")
+
+        elif subcmd == "pause":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /th pause <thought_id>")
+                return
+            if pause_thought(tid):
+                print(f"(._.)zZ Thought {tid} set dormant.")
+            else:
+                print(f"(._.) Thought {tid} not found.")
+
+        elif subcmd == "resume":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            if not tid:
+                print("(._.) Usage: /th resume <thought_id>")
+                return
+            if resume_thought(tid):
+                print(f"(^_^) Thought {tid} reactivated!")
+            else:
+                print(f"(._.) Thought {tid} not found.")
+
+        elif subcmd == "snooze":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            until = tokens[3].strip() if len(tokens) > 3 else ""
+            if not tid or not until:
+                print("(._.) Usage: /th snooze <thought_id> <3d|12h|ISO time>")
+                return
+            print(f"(^_^) Thought {tid} snoozed." if snooze_thought(tid, until) else f"(._.) Could not snooze {tid}.")
+
+        elif subcmd == "next":
+            tid = tokens[2].strip() if len(tokens) > 2 else ""
+            kind = tokens[3].strip().lower() if len(tokens) > 3 else ""
+            prompt = " ".join(tokens[4:])
+            if not tid or not kind:
+                print("(._.) Usage: /th next <id> <clarify|research|learn|track|defer> [prompt]")
+                return
+            print(f"(^_^) Next action for {tid}: {kind}" if update_thought_action(tid, kind, prompt) else f"(._.) Could not update {tid}.")
+
+        else:
+            print(f"(._.) Unknown subcommand: {subcmd}")
+            print("  Usage: /th [status|capture|list|show|done|rm|pause|resume|snooze|next]")
+
     def _handle_cron_command(self, cmd: str):
         """Handle the /cron command to manage scheduled tasks."""
         from cli import get_job

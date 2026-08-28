@@ -343,6 +343,16 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="[subcommand]",
                subcommands=("list", "add", "create", "edit", "pause", "resume", "run", "remove"),
                desktop="terminal"),
+    CommandDef("s", "Manage timed reminders (add, list, done, pause, resume)", "Tools & Skills",
+               aliases=("schedule",), args_hint="[subcommand]",
+               subcommands=("status", "add", "list", "done", "rm", "pause", "resume", "ask", "discuss", "end")),
+    CommandDef("th", "Manage thought incubation (capture, list, done, pause, resume)", "Tools & Skills",
+               aliases=("thought", "thoughts"), args_hint="[subcommand]",
+               subcommands=("status", "capture", "list", "show", "done", "rm", "pause", "resume", "snooze", "next", "ask", "discuss", "end")),
+    CommandDef("paper", "Manage Research Copilot topics, history, and feedback", "Tools & Skills",
+               args_hint="[now|topics|history|save|skip|read|feedback|health|ask|discuss|end]",
+               subcommands=("now", "topics", "history", "save", "skip", "read", "feedback", "health", "ask", "discuss", "end")),
+    CommandDef("end", "End the current bot discussion (paper/s/th)", "Tools & Skills"),
     CommandDef("suggestions", "Review suggested automations (accept/dismiss)",
                "Tools & Skills", aliases=("suggest",), args_hint="[accept|dismiss N | catalog]",
                subcommands=("accept", "dismiss", "catalog", "clear")),
@@ -1380,6 +1390,11 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
+#   - paper: Research Copilot control; Weixin/CLI-first, low-frequency on Slack,
+#     routed through /hermes paper to preserve native slash slots for higher-
+#     traffic commands at the 50-command cap.
+#   - s/th/end: personal reminder/thought controls; CLI + Weixin-first, routed
+#     through /hermes on Slack to avoid consuming native slash slots.
 #   - egress: Docker-only proxy status; reachable as /hermes egress on Slack.
 #   - init: repo-scan AGENTS.md bootstrap — a cwd-centric dev command that is
 #     rare from Slack; reachable as /hermes init. Without this entry, adding
@@ -1411,7 +1426,11 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform"})
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "topup", "moa", "debug", "egress", "init", "version", "diff", "update",
+    "heartbeat", "refine", "review", "pause", "whoami", "platform",
+    "paper", "s", "th", "end",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:

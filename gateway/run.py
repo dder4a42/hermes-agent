@@ -17650,6 +17650,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # simultaneous updates. Do NOT interrupt for photo-only follow-ups here;
         # let the adapter-level batching/queueing logic absorb them.
 
+        # Commands-only platforms (e.g. personal Weixin bots used for push /
+        # reminders) may forbid free-form chat for non-admin users. Before
+        # blocking, optionally run a non-persisting NL router that may rewrite
+        # the text into one allowed functional slash command. Forbidden or
+        # unrecognized input returns a denial before the main agent loop, so the
+        # user's free-form text is discarded and never appended to transcript.
+        if not event.get_command():
+            _routed = await self._route_free_text_to_allowed_command(event)
+            if _routed is not None:
+                logger.info(
+                    "Routed free text into /%s for %s:%s",
+                    _routed.get_command(),
+                    source.platform.value if source.platform else "?",
+                    source.user_id,
+                )
+                event = _routed
+            else:
+                _free_chat_denied = self._check_free_chat_access(source)
+                if _free_chat_denied is not None:
+                    return _free_chat_denied
+
         # Staleness eviction: detect leaked locks from hung/crashed handlers.
         # With inactivity-based timeout, active tasks can run for hours, so
         # wall-clock age alone isn't sufficient.  Evict only when the agent
@@ -18391,6 +18412,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
+
+        if canonical == "s":
+            return await self._handle_s_command(event)
+
+        if canonical == "paper":
+            return await self._handle_paper_command(event)
+
+        if canonical == "th":
+            return await self._handle_th_command(event)
+
+        if canonical == "end":
+            return await self._handle_end_command(event)
 
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
@@ -21729,7 +21762,433 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
 
+    def _check_free_chat_access(self, source: SessionSource) -> Optional[str]:
+        """Return a denial message when commands-only mode blocks plain chat.
 
+        Slash command access and free-chat access share the same policy object.
+        The feature is opt-in and backward-compatible: if slash gating is not
+        enabled for this platform/scope, free chat stays allowed.
+        """
+        from gateway.slash_access import policy_for_source as _policy_for_source
+
+        policy = _policy_for_source(self.config, source)
+        if not policy.enabled or policy.can_free_chat(source.user_id):
+            return None
+
+        allowed_preview = sorted(policy.user_allowed_commands)
+        floor = ["help", "whoami"]
+        allowed = []
+        seen = set()
+        for cmd in [*allowed_preview, *floor]:
+            if cmd not in seen:
+                seen.add(cmd)
+                allowed.append(cmd)
+        if allowed:
+            suffix = "可用功能：" + "、".join(f"/{c}" for c in allowed[:12])
+            if len(allowed) > 12:
+                suffix += "…"
+            suffix += "。"
+        else:
+            suffix = "当前没有为普通用户启用任何功能命令。"
+        return (
+            "⛔ 这个 bot 已开启功能限定模式，不接受自由对话。\n"
+            f"{suffix}\n"
+            "你可以用自然语言表达这些功能；如果请求不属于这些功能，我会直接拒绝且不写入对话上下文。"
+        )
+
+    def _platform_extra_for_source(self, source: SessionSource) -> dict:
+        platforms = getattr(self.config, "platforms", None) or {}
+        platform_cfg = None
+        try:
+            platform_cfg = platforms.get(source.platform)
+        except Exception:
+            platform_cfg = None
+        extra = getattr(platform_cfg, "extra", None)
+        return extra if isinstance(extra, dict) else {}
+
+    async def _route_free_text_to_allowed_command(self, event: MessageEvent) -> Optional[MessageEvent]:
+        """Route natural-language text to an allowed command, without persistence.
+
+        The router is intentionally separate from the normal gateway agent:
+        no session DB, no memory, no tools, no transcript append. It may only
+        return a slash command. The returned command is validated against the
+        same SlashAccessPolicy and will be validated again by the normal slash
+        dispatch path (defense in depth).
+        """
+        from gateway.slash_access import policy_for_source as _policy_for_source
+
+        source = event.source
+        policy = _policy_for_source(self.config, source)
+        if not policy.enabled or policy.can_free_chat(source.user_id):
+            return None
+
+        text = (event.text or "").strip()
+        if not text:
+            return None
+
+        # Preempt: if this user has an active /s draft session, route their
+        # message to /s continue so the LLM slot-filler picks it up. This
+        # runs before the domain_discussion check so a mid-draft user can
+        # finish their reminder even if a /paper or /s discussion is also
+        # active in some other channel.
+        try:
+            from gateway.task_draft import has_active as _has_active_draft
+        except ImportError:
+            _has_active_draft = None  # type: ignore
+        if _has_active_draft is not None and _has_active_draft(source.user_id or ""):
+            from dataclasses import replace
+            return replace(
+                event,
+                text=f"/s continue {text}",
+                metadata={
+                    **(event.metadata or {}),
+                    "nl_command_router": {
+                        "decision": "continue_task_draft",
+                        "original_text": text,
+                    },
+                },
+            )
+
+        # Phase B: if a discussion is active in some domain, continue plain
+        # text in that domain's ``ask`` handler instead of routing via the LLM.
+        # End-intent phrases still fall through to /end so the sticky session
+        # can be closed.
+        try:
+            from gateway.domain_discussion import (
+                DOMAINS as _DOMAINS,
+                load_active_discussion as _load_active_discussion,
+                looks_like_end_intent as _looks_like_end_intent,
+            )
+        except ImportError:
+            _load_active_discussion = None  # type: ignore
+            _looks_like_end_intent = None  # type: ignore
+            _DOMAINS = ()  # type: ignore
+        if _load_active_discussion is not None:
+            active = _load_active_discussion()
+            if active:
+                domain = str(active.get("domain") or "")
+                if _looks_like_end_intent and _looks_like_end_intent(text):
+                    from dataclasses import replace
+                    return replace(
+                        event,
+                        text="/end",
+                        metadata={
+                            **(event.metadata or {}),
+                            "nl_command_router": {
+                                "decision": "end_discussion",
+                                "original_text": text,
+                            },
+                        },
+                    )
+                if domain in _DOMAINS and policy.can_run(source.user_id, domain):
+                    from dataclasses import replace
+                    return replace(
+                        event,
+                        text=f"/{domain} ask {text}",
+                        metadata={
+                            **(event.metadata or {}),
+                            "nl_command_router": {
+                                "decision": "continue_discussion",
+                                "domain": domain,
+                                "original_text": text,
+                            },
+                        },
+                    )
+
+        extra = self._platform_extra_for_source(source)
+        mode = str(extra.get("nl_command_router", "off") or "off").strip().lower()
+        if mode in {"", "off", "none", "false", "0"}:
+            return None
+        if mode not in {"llm", "agent"}:
+            logger.warning("Unknown nl_command_router=%r; free text will be denied", mode)
+            return None
+
+        allowed_commands = sorted(set(policy.user_allowed_commands) | {"help", "whoami", "end"})
+        try:
+            route = await asyncio.to_thread(
+                self._llm_route_free_text_to_command,
+                text,
+                allowed_commands,
+                source,
+            )
+        except Exception:
+            logger.exception("NL command router failed; free text will be denied")
+            return None
+        command_text = self._validated_routed_command(route, policy, source)
+        if not command_text:
+            return None
+
+        # Defensive: the router sometimes emits a bare '/paper' / '/s' / '/th'
+        # with no subcommand args when it can't decide. That fires the bare
+        # handler which just prints Usage — unhelpful for a natural-language
+        # user. Rewrite to '<cmd> ask <original text>' which is the sandboxed
+        # Q&A subcommand always available on those domains.
+        tokens = command_text.split(maxsplit=1)
+        head = tokens[0] if tokens else ""
+        has_args = len(tokens) > 1
+        if not has_args and head in ("/paper", "/s", "/th") and text:
+            fallback = f"{head} ask {text}"
+            logger.info(
+                "NL router emitted bare %s; rewriting to %r for %s:%s",
+                head, fallback, source.platform.value if source.platform else "?",
+                source.user_id,
+            )
+            command_text = fallback
+
+        from dataclasses import replace
+        return replace(
+            event,
+            text=command_text,
+            metadata={
+                **(event.metadata or {}),
+                "nl_command_router": {
+                    "mode": mode,
+                    "original_text": text,
+                    "command": command_text,
+                },
+            },
+        )
+
+    def _llm_route_free_text_to_command(
+        self,
+        text: str,
+        allowed_commands: list[str],
+        source: SessionSource,
+    ) -> dict:
+        """Use a no-tools router agent to map text into an allowed command.
+
+        Returns a dict shaped like {decision, command, reason}. Callers must
+        validate the command before executing it. This helper deliberately uses
+        session_db=None, skip_memory=True, skip_context_files=True, and
+        enabled_toolsets=[] so router inputs/outputs don't pollute the user's
+        conversation and the model cannot take side effects.
+
+        The router's model/provider defaults to the profile's default model, but
+        can be pinned via ``platforms.<platform>.extra.nl_command_router_model``
+        (and ``nl_command_router_provider`` / ``nl_command_router_base_url``) so
+        the router stays fast and isolated from the main model's rate limits or
+        drift.
+        """
+        import json
+        from run_agent import AIAgent
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        model_cfg = cfg.get("model") or {}
+        default_model = str(model_cfg.get("default") or "")
+        default_provider = model_cfg.get("provider")
+        default_base_url = model_cfg.get("base_url")
+
+        extra = self._platform_extra_for_source(source)
+        model = str(extra.get("nl_command_router_model") or "").strip() or default_model
+        provider = extra.get("nl_command_router_provider") or default_provider
+        base_url = extra.get("nl_command_router_base_url") or default_base_url
+
+        specs = self._nl_command_router_specs(allowed_commands)
+        system = (
+            "You are a command router for a commands-only Weixin bot.\n"
+            "You do not answer the user. You only classify the message into one allowed slash command AND emit that command WITH its arguments, verbatim.\n"
+            "Return ONLY compact JSON with keys: decision, command, reason.\n"
+            "decision must be 'allow' or 'deny'.\n"
+            "\n"
+            "Prefer allow: the user is a legitimate owner of a personal research bot; only deny when the message is clearly outside every allowed function (e.g. asking for weather, general free chat, or explicitly forbidden operations like modifying system config). Ambiguity is NOT sufficient grounds to deny.\n"
+            "\n"
+            "Routing heuristics (apply in order):\n"
+            "  1. If the message directly invokes one of the structured subcommands, emit that subcommand with its arguments. Example: '推送论文' -> /paper now.\n"
+            "  2. If the message is a QUESTION about the user's research data, profile, saved papers, topics, agenda, beliefs, gaps -> /paper ask <original message verbatim>.\n"
+            "     Signals: contains 问号, 或以 '我的'/'为什么'/'怎么样'/'如何'/'为啥'/'看看'/'告诉我'/'查看'/'查询'/'介绍' 开头, 或 English '?', 'what', 'how', 'why', 'show', 'tell', 'explain'.\n"
+            "  3. If the message is a QUESTION about the user's schedule/reminders -> /s ask <original message verbatim>.\n"
+            "  4. If the message is a QUESTION about the user's thoughts/ideas -> /th ask <original message verbatim>.\n"
+            "  5. If the message describes a NEW reminder/task -> /s add <original message verbatim>.\n"
+            "  6. If the message describes a NEW thought/idea to capture -> /th capture <original message verbatim>.\n"
+            "  7. If none of the above fit AND the message is clearly not asking for anything the allowed commands can do, return deny.\n"
+            "\n"
+            "When emitting an ask command, include the user's ORIGINAL wording after the subcommand (do not paraphrase or shorten). Example:\n"
+            "  user: '我的科研画像如何？'\n"
+            "  -> {\"decision\":\"allow\",\"command\":\"/paper ask 我的科研画像如何？\",\"reason\":\"question about user\'s research profile\"}\n"
+            "\n"
+            "If decision is 'allow', command must start with '/' and its first word must be one of the allowed commands. Do not invent commands or subcommands. Do not include markdown, code fences, or preamble. Emit just the JSON.\n"
+            "\n"
+            f"Allowed command specs:\n{specs}"
+        )
+        prompt = (
+            "Route this user message.\n"
+            f"Allowed command names: {', '.join('/' + c for c in allowed_commands)}\n"
+            f"User message: {text!r}\n"
+        )
+        try:
+            agent = AIAgent(
+                model=model,
+                provider=provider,
+                base_url=base_url,
+                max_iterations=1,
+                enabled_toolsets=[],
+                disabled_toolsets=[],
+                quiet_mode=True,
+                skip_memory=True,
+                skip_context_files=True,
+                session_db=None,
+                max_tokens=1600,
+                ephemeral_system_prompt=system,
+                platform=getattr(source.platform, "value", None) if source else None,
+                user_id=getattr(source, "user_id", None) if source else None,
+                chat_id=getattr(source, "chat_id", None) if source else None,
+                chat_type=getattr(source, "chat_type", None) if source else None,
+            )
+        except Exception:
+            logger.warning(
+                "NL router: agent init failed (provider=%s model=%s); denying",
+                provider, model, exc_info=True,
+            )
+            return {"decision": "deny", "reason": "router agent init failed"}
+        try:
+            result = agent.run_conversation(prompt, conversation_history=[])
+        except Exception as exc:
+            # Router failures should be visible in gateway logs so we can tell
+            # them apart from safety denials.
+            logger.warning(
+                "NL router: model call failed (provider=%s model=%s): %s",
+                provider, model, exc,
+            )
+            return {"decision": "deny", "reason": f"router call failed: {type(exc).__name__}"}
+        raw = str((result or {}).get("final_response") or "").strip()
+        if not raw:
+            logger.warning(
+                "NL router: empty response (provider=%s model=%s); denying",
+                provider, model,
+            )
+            return {"decision": "deny", "reason": "router returned empty response"}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw, flags=re.S)
+            if not match:
+                logger.warning(
+                    "NL router: non-json response (provider=%s model=%s): %r",
+                    provider, model, raw[:200],
+                )
+                return {"decision": "deny", "reason": "router returned non-json"}
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                logger.warning(
+                    "NL router: invalid embedded json (provider=%s model=%s)",
+                    provider, model,
+                )
+                return {"decision": "deny", "reason": "router returned invalid json"}
+
+    def _nl_command_router_specs(self, allowed_commands: list[str]) -> str:
+        specs = {
+            "paper": (
+                "Research Copilot for research papers and the user's science profile.\n"
+                "  Structured subcommands:\n"
+                "    /paper topics — list active research topics.\n"
+                "    /paper history [n] — recent recommendations.\n"
+                "    /paper health — weekly feedback summary.\n"
+                "    /paper now — trigger today's paper pick and deliver it.\n"
+                "    /paper save <id> — save recommendation.\n"
+                "    /paper skip <id> [reason] — skip recommendation.\n"
+                "    /paper read <id> — mark read.\n"
+                "    /paper feedback <id> <text> — free-text feedback on a paper.\n"
+                "  Open-ended question about the user's paper/research data:\n"
+                "    /paper ask <question> — one-shot Q&A grounded in research_profile / topics / recommendations / saves / interactions.\n"
+                "    /paper discuss [<paper_id>] [<question>] — open a sticky Q&A session (30 min).\n"
+                "  Chinese cue words that route to /paper ask: 查询/查看/看看/告诉我 + '科研画像'/'research profile'/'我的方向'/'关注的主题'/'为什么推荐'/'保存的论文' etc."
+            ),
+            "s": (
+                "Timed reminders (schedules).\n"
+                "  Structured subcommands:\n"
+                "    /s status — active reminders overview.\n"
+                "    /s list [active|paused|done] — list reminders.\n"
+                "    /s add <free text> — create a reminder. Prefer passing the whole\n"
+                "      user phrase VERBATIM after 'add' (no --when quoting) so the\n"
+                "      downstream LLM extractor can pull title + time + attendees +\n"
+                "      url + checklist in one shot and ask any follow-up itself. Only\n"
+                "      use the flag form (--when / --url / --where / --attendees /\n"
+                "      --tags / --remind-before / --checklist) if the user's phrasing\n"
+                "      is genuinely structured. Example: user says '明天下午3点跟 Bob\n"
+                "      开设计评审' -> emit /s add 明天下午3点跟 Bob 开设计评审.\n"
+                "    /s done <id> — mark done.\n"
+                "    /s rm <id> — delete.\n"
+                "    /s pause <id> / /s resume <id>.\n"
+                "    /s check <id> <item> — tick a checklist item done.\n"
+                "    /s uncheck <id> <item> — untick a checklist item.\n"
+                "    /s item add <id> \"text\" / /s item rm <id> <ref> — edit checklist.\n"
+                "    /s cancel — abort the current /s draft session (if any).\n"
+                "  Open-ended question about the user's schedule data:\n"
+                "    /s ask <question> — one-shot Q&A grounded in current + recent tasks.\n"
+                "    /s discuss [<task_id>] [<question>] — sticky Q&A about a task.\n"
+                "  Chinese cue words that route to /s ask: 我的日程/我最近的提醒/查看我的任务/最近还有什么要做.\n"
+                "  Chinese cue words that route to /s add: 提醒我/加个提醒/加个日程/明天X点.../记一下要做..."
+            ),
+            "th": (
+                "Thought incubation / ideas.\n"
+                "  Structured subcommands:\n"
+                "    /th status — active thoughts overview.\n"
+                "    /th list [active|dormant|archived] — list thoughts.\n"
+                "    /th show <id> — show a thought.\n"
+                "    /th done <id> — archive.\n"
+                "    /th rm <id> — delete.\n"
+                "    /th pause <id> / /th resume <id>.\n"
+                "  Open-ended discussion about the user's thoughts:\n"
+                "    /th ask <question> — one-shot Q&A grounded in the user's thoughts.\n"
+                "    /th discuss [<thought_id>] [<question>] — sticky discussion, deep-dive on an idea.\n"
+                "  Chinese cue words that route to /th ask or /th discuss: 我的想法/我的灵感/最近的思考/帮我聊聊这个想法/展开这个 idea."
+            ),
+            "status": "Gateway/session status. Use /status.",
+            "help": "Help. Use /help.",
+            "whoami": "Show caller access tier and allowed commands. Use /whoami.",
+            "end": "End the current sticky domain discussion (opened by /paper|s|th discuss or /paper|s|th ask). Use /end. Prefer /end for phrases like '结束', '算了', '不聊了', 'stop', 'exit'.",
+        }
+        lines = []
+        for cmd in allowed_commands:
+            if cmd in specs:
+                lines.append(f"/{cmd}: {specs[cmd]}")
+        # Global routing guidance: if in doubt, prefer /paper ask, /s ask, /th ask
+        # for open-ended questions rather than deny — the ask handler is
+        # sandboxed and safe.
+        lines.append(
+            "\nRouting guidance:\n"
+            "- If the user asks an open-ended question about their research data (profile/topics/recommendations/saves), route to /paper ask.\n"
+            "- If about their schedule/tasks/reminders, route to /s ask.\n"
+            "- If about their thoughts/ideas/incubation, route to /th ask.\n"
+            "- If the user wants to STOP an ongoing discussion (结束/算了/退出/不聊了/stop/exit), route to /end.\n"
+            "- Only return deny for messages that are unrelated to paper/schedule/thought data (small talk, weather, general knowledge, coding help, model-config changes, etc.)."
+        )
+        return "\n".join(lines)
+
+    def _validated_routed_command(self, route: object, policy: object, source: SessionSource) -> Optional[str]:
+        if not isinstance(route, dict):
+            return None
+        if str(route.get("decision") or "").lower() != "allow":
+            return None
+        command_text = str(route.get("command") or "").strip()
+        if not command_text.startswith("/") or "\n" in command_text or "\r" in command_text:
+            return None
+        command_name = command_text.split(maxsplit=1)[0][1:].lower()
+        if not command_name or "/" in command_name:
+            return None
+        try:
+            from hermes_cli.commands import resolve_command, is_gateway_known_command
+            cmd_def = resolve_command(command_name)
+            canonical = cmd_def.name if cmd_def else command_name
+            if not is_gateway_known_command(canonical):
+                return None
+        except Exception:
+            canonical = command_name
+        if not policy.can_run(source.user_id, canonical):
+            logger.info("NL router produced disallowed command /%s; denying", canonical)
+            return None
+        return command_text
+
+    async def _handle_end_command(self, event: MessageEvent) -> str:
+        """Handle top-level /end — close the active domain discussion."""
+        try:
+            from gateway.domain_discussion import clear_active_discussion
+        except ImportError:
+            return "❌ discussion module unavailable"
+        cleared = clear_active_discussion()
+        return "✅ 已结束当前讨论。" if cleared else "（当前没有进行中的讨论。）"
 
 
 

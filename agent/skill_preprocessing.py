@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # Matches ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} tokens in SKILL.md.
 # Tokens that don't resolve (e.g. ${HERMES_SESSION_ID} with no session) are
 # left as-is so the user can debug them.
-_SKILL_TEMPLATE_RE = re.compile(r"\$\{(HERMES_SKILL_DIR|HERMES_SESSION_ID)\}")
+_SKILL_TEMPLATE_RE = re.compile(r"\$\{(HERMES_SKILL_DIR|HERMES_SESSION_ID|HERMES_HOME)\}")
 
 # Matches inline shell snippets like:  !`date +%Y-%m-%d`
 # Non-greedy, single-line only -- no newlines inside the backticks.
@@ -57,6 +57,17 @@ def substitute_template_vars(
             return skill_dir_str
         if token == "HERMES_SESSION_ID" and session_id:
             return str(session_id)
+        if token == "HERMES_HOME":
+            # Resolve via hermes_constants so profile scoping works — this
+            # is the key fix that stops paper-skill data reads/writes from
+            # leaking into the OWNER default profile when the skill was
+            # invoked under `hermes -p <profile>`.
+            try:
+                from hermes_constants import get_hermes_home
+                return str(get_hermes_home())
+            except Exception:
+                import os
+                return os.environ.get("HERMES_HOME") or match.group(0)
         return match.group(0)
 
     return _SKILL_TEMPLATE_RE.sub(_replace, content)

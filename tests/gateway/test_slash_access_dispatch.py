@@ -117,7 +117,22 @@ def _make_runner(*, platform_extra: dict | None = None,
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
+async def test_whoami_unrestricted_when_no_admin_list():
+    runner = _make_runner(platform_extra={})  # no admin list
+    result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="999")))
+    assert "Tier: unrestricted" in result
+    assert "no admin list configured" in result
+
+
+@pytest.mark.anyio
+async def test_whoami_admin_user():
+    runner = _make_runner(platform_extra={"allow_admin_from": ["111"]})
+    result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="111")))
+    assert "**admin**" in result
+
+
+@pytest.mark.anyio
 async def test_whoami_non_admin_lists_runnable_commands():
     runner = _make_runner(
         platform_extra={
@@ -138,7 +153,23 @@ async def test_whoami_non_admin_lists_runnable_commands():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
+async def test_non_admin_denied_for_unlisted_command():
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": ["status"],
+        }
+    )
+    # /stop is NOT in user_allowed_commands and not in the always-allowed floor.
+    result = await runner._handle_message(_make_event("/stop", _make_source(user_id="999")))
+    assert result is not None
+    assert "⛔" in result
+    assert "/stop is admin-only here" in result
+    assert "/status" in result  # denial preview shows what they CAN run
+
+
+@pytest.mark.anyio
 async def test_non_admin_with_empty_user_commands_gets_floor_only():
     runner = _make_runner(
         platform_extra={
@@ -160,9 +191,48 @@ async def test_non_admin_with_empty_user_commands_gets_floor_only():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.anyio
+async def test_admin_runs_unlisted_command():
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],  # users can run nothing
+        }
+    )
+    # Admin runs /whoami (proxy for "any command works"); the gate must NOT
+    # return the ⛔ denial. The /whoami handler is deterministic and doesn't
+    # need a real agent, so we can assert against its content.
+    result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="111")))
+    assert "⛔" not in result
+    assert "**admin**" in result
+
+
+@pytest.mark.anyio
+async def test_user_runs_listed_command():
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": ["whoami"],  # explicit
+        }
+    )
+    result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="999")))
+    assert "⛔" not in result
+    assert "Tier: user" in result
+
+
 # ---------------------------------------------------------------------------
 # Backward compatibility — no admin list set means no gating at all
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_backward_compat_no_admin_list_means_no_gate():
+    runner = _make_runner(platform_extra={})  # nothing configured
+    # Random non-listed user runs /whoami; should return unrestricted profile,
+    # never a denial.
+    result = await runner._handle_message(_make_event("/whoami", _make_source(user_id="anyone")))
+    assert "⛔" not in result
+    assert "Tier: unrestricted" in result
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +240,24 @@ async def test_non_admin_with_empty_user_commands_gets_floor_only():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
+async def test_dm_admin_is_not_group_admin():
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "group_allow_admin_from": ["222"],
+            "group_user_allowed_commands": [],
+        }
+    )
+    # User 111 is DM admin. In group context they're a non-admin with no
+    # listed commands → /stop denied.
+    result = await runner._handle_message(
+        _make_event("/stop", _make_source(user_id="111", chat_type="group"))
+    )
+    assert "⛔" in result
+
+
+@pytest.mark.anyio
 async def test_group_only_gating_leaves_dm_unrestricted():
     runner = _make_runner(
         platform_extra={
@@ -187,7 +274,48 @@ async def test_group_only_gating_leaves_dm_unrestricted():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
+async def test_plugin_registered_command_is_gated(monkeypatch):
+    """The gate must recognize plugin-registered slash commands, not just
+    built-in COMMAND_REGISTRY entries. We verify by stubbing
+    is_gateway_known_command and resolve_command so a fictitious /myplugin
+    command is treated as a known plugin command.
+    """
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+
+    from hermes_cli import commands as cmd_mod
+
+    real_resolve = cmd_mod.resolve_command
+    real_is_known = cmd_mod.is_gateway_known_command
+
+    def fake_resolve(name):
+        if name == "myplugin":
+            # Return a CommandDef-like duck so canonical resolution succeeds
+            return SimpleNamespace(name="myplugin")
+        return real_resolve(name)
+
+    def fake_is_known(name):
+        if name == "myplugin":
+            return True
+        return real_is_known(name)
+
+    monkeypatch.setattr(cmd_mod, "resolve_command", fake_resolve)
+    monkeypatch.setattr(cmd_mod, "is_gateway_known_command", fake_is_known)
+
+    # Non-admin tries to run the plugin command → must be denied by the gate.
+    result = await runner._handle_message(
+        _make_event("/myplugin foo bar", _make_source(user_id="999"))
+    )
+    assert "⛔" in result
+    assert "/myplugin is admin-only here" in result
+
+
+@pytest.mark.anyio
 async def test_non_admin_denied_for_unlisted_quick_command_exec():
     """A non-admin must not reach the quick_commands exec sink for a command
     that isn't in user_allowed_commands. Regression for #44727 — quick
@@ -213,7 +341,28 @@ async def test_non_admin_denied_for_unlisted_quick_command_exec():
     assert "quick-command-bypass-confirmed" not in result
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
+async def test_listed_quick_command_runs_for_non_admin():
+    """When the operator lists the quick command in user_allowed_commands, a
+    non-admin can run it — the gate must allow, not blanket-deny."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": ["limits"],
+        }
+    )
+    runner.config.quick_commands = {
+        "limits": {"type": "exec", "command": "printf quick-command-allowed"}
+    }
+
+    result = await runner._handle_message(
+        _make_event("/limits", _make_source(user_id="999"))
+    )
+
+    assert result == "quick-command-allowed"
+
+
+@pytest.mark.anyio
 async def test_admin_runs_quick_command_when_gating_enabled():
     """An admin runs the quick command even under an enabled gate with an
     empty user_allowed_commands list."""
@@ -245,7 +394,28 @@ async def test_admin_runs_quick_command_when_gating_enabled():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
+async def test_running_agent_fastpath_blocks_non_admin_command():
+    """When an agent is running, /restart from a non-admin must be denied."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    src = _make_source(user_id="999")
+    # Mark the session as having an in-flight agent so the fast-path runs.
+    sk = build_session_key(src)
+    runner._running_agents[sk] = MagicMock()
+    runner._running_agents_ts[sk] = 0  # not stale (epoch + small delta on this machine)
+
+    result = await runner._handle_message(_make_event("/restart", src))
+    assert result is not None
+    assert "⛔" in result
+    assert "/restart is admin-only here" in result
+
+
+@pytest.mark.anyio
 async def test_running_agent_fastpath_allows_admin_command():
     """Admins must still be able to run privileged commands like /restart
     through the running-agent fast-path. We check that we don't get the
@@ -269,16 +439,84 @@ async def test_running_agent_fastpath_allows_admin_command():
     assert "⛔" not in (result or "")
 
 
+@pytest.mark.anyio
+async def test_running_agent_fastpath_status_always_works():
+    """/status is intentionally pre-gate on the fast-path so users can
+    always see session state, even non-admins."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    src = _make_source(user_id="999")  # non-admin
+    sk = build_session_key(src)
+    runner._running_agents[sk] = MagicMock()
+    runner._running_agents_ts[sk] = 0
+    runner._handle_status_command = AsyncMock(return_value="status-handled")
+
+    result = await runner._handle_message(_make_event("/status", src))
+    assert result == "status-handled"
+    assert "⛔" not in (result or "")
+
+
 # ---------------------------------------------------------------------------
 # Alias resolution — /h aliases to /help; the gate must canonicalize before
 # checking access. /hist (history alias) is a real one to exercise.
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.anyio
+async def test_gate_uses_canonical_name_not_alias():
+    """If /hist resolves to canonical 'history' and history is in
+    user_allowed_commands, the alias must be allowed too."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": ["history"],
+        }
+    )
+    # Find a real alias in the registry to use.
+    from hermes_cli.commands import COMMAND_REGISTRY
+    history_def = next(c for c in COMMAND_REGISTRY if c.name == "history")
+    # If /history has aliases, use one. Otherwise just use /history.
+    alias = history_def.aliases[0] if history_def.aliases else "history"
+    # Mock the history handler so we don't need real session state.
+    runner._handle_history_command = AsyncMock(return_value="history-handled")
+    result = await runner._handle_message(_make_event(f"/{alias}", _make_source(user_id="999")))
+    assert "⛔" not in (result or "")
+
+
 # ---------------------------------------------------------------------------
 # Unknown / unregistered command — gate must NOT intercept (let the existing
 # unknown-command path handle it normally).
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_gate_does_not_intercept_unknown_command():
+    """Random non-command text like /xyzzy is not in the registry. The gate
+    must not produce a denial message — the existing unknown-command path
+    will handle it (or the agent will see it as plain text)."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    # /xyzzy is not in COMMAND_REGISTRY and not a plugin command.
+    # The gate should pass through (no ⛔) since canonical resolution
+    # returns the raw command and is_gateway_known_command returns False.
+    # We can only verify the gate didn't fire — downstream behavior may
+    # vary (returns None, agent processes it, etc.). What matters: no denial.
+    runner._handle_unknown_command = AsyncMock(return_value=None)
+    # Stub out the rest of the cold path to short-circuit
+    runner.session_store.get_or_create_session.side_effect = RuntimeError("would have proceeded past gate")
+    try:
+        await runner._handle_message(_make_event("/xyzzy", _make_source(user_id="999")))
+    except RuntimeError as e:
+        # Reaching session creation means we got past the gate without a denial.
+        assert "would have proceeded past gate" in str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -288,12 +526,29 @@ async def test_running_agent_fastpath_allows_admin_command():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.anyio
+async def test_dm_admin_blocked_in_group_with_separate_admin_list():
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],          # DM admin
+            "group_allow_admin_from": ["222"],    # group admin
+            "group_user_allowed_commands": ["status"],
+        }
+    )
+    # User 111 is DM admin. In a group, they're a non-admin and can only
+    # run group_user_allowed_commands. /restart is not in that list → denied.
+    grp_src = _make_source(user_id="111", chat_type="group", chat_id="g1")
+    result = await runner._handle_message(_make_event("/restart", grp_src))
+    assert "⛔" in result
+    assert "/restart is admin-only here" in result
+
+
 # ---------------------------------------------------------------------------
 # Multi-platform isolation — gating on Discord doesn't leak to Telegram.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_gating_isolated_per_platform():
     """When Discord is gated and Telegram isn't, the same user_id on
     Telegram must be unrestricted."""
@@ -366,3 +621,482 @@ async def test_gating_isolated_per_platform():
     tg_src = _make_source(platform=Platform.TELEGRAM, user_id="999", chat_id="t1")
     result = await runner._handle_message(_make_event("/whoami", tg_src))
     assert "Tier: unrestricted" in result
+
+
+# ---------------------------------------------------------------------------
+# Commands-only free-chat gating — used by Weixin push/reminder bots.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_commands_only_mode_blocks_non_admin_plain_text_before_agent_loop():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+
+    result = await runner._handle_message(_make_event("hello", _make_source(platform=Platform.WEIXIN, user_id="user")))
+
+    assert result is not None
+    assert "功能限定模式" in result
+    assert "/paper" in result
+    # The agent/session path should not be entered for blocked plain text.
+    runner.session_store.get_or_create_session.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_commands_only_mode_allows_listed_command():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+    # Avoid depending on Research Copilot data; stub the handler.
+    runner._handle_paper_command = AsyncMock(return_value="paper-ok")
+
+    result = await runner._handle_message(_make_event("/paper topics", _make_source(platform=Platform.WEIXIN, user_id="user")))
+
+    assert result == "paper-ok"
+
+
+@pytest.mark.anyio
+async def test_commands_only_mode_keeps_unlisted_command_denied():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+
+    result = await runner._handle_message(_make_event("/model gpt-5", _make_source(platform=Platform.WEIXIN, user_id="user")))
+
+    assert result is not None
+    assert "⛔" in result
+    assert "/model is admin-only here" in result
+
+
+@pytest.mark.anyio
+async def test_commands_only_mode_does_not_intercept_unknown_slash_command():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+    runner.session_store.get_or_create_session.side_effect = RuntimeError("would have proceeded past gate")
+
+    try:
+        await runner._handle_message(_make_event("/notarealcommand", _make_source(platform=Platform.WEIXIN, user_id="user")))
+    except RuntimeError as e:
+        assert "would have proceeded past gate" in str(e)
+
+
+@pytest.mark.anyio
+async def test_commands_only_mode_blocks_plain_text_even_when_agent_running():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+    src = _make_source(platform=Platform.WEIXIN, user_id="user")
+    sk = build_session_key(src)
+    runner._running_agents[sk] = MagicMock()
+    runner._running_agents_ts[sk] = 0
+
+    result = await runner._handle_message(_make_event("hello while busy", src))
+
+    assert result is not None
+    assert "功能限定模式" in result
+
+
+@pytest.mark.anyio
+async def test_commands_only_mode_allows_admin_plain_text_to_agent_path():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "allow_admin_from": ["admin"],
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+    runner.session_store.get_or_create_session.side_effect = RuntimeError("admin reached agent path")
+
+    try:
+        await runner._handle_message(_make_event("hello", _make_source(platform=Platform.WEIXIN, user_id="admin")))
+    except RuntimeError as e:
+        assert "admin reached agent path" in str(e)
+
+
+# ---------------------------------------------------------------------------
+# LLM/router natural-language command mapping in commands-only mode.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_llm_router_maps_plain_text_to_allowed_schedule_command():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+        },
+    )
+    runner._llm_route_free_text_to_command = MagicMock(
+        return_value={"decision": "allow", "command": '/s add "开会" --when "明天 9 点"'}
+    )
+    runner._handle_s_command = AsyncMock(return_value="reminder-ok")
+
+    result = await runner._handle_message(
+        _make_event("提醒我明天 9 点开会", _make_source(platform=Platform.WEIXIN, user_id="user"))
+    )
+
+    assert result == "reminder-ok"
+    event_arg = runner._handle_s_command.call_args.args[0]
+    assert event_arg.get_command() == "s"
+    assert event_arg.get_command_args() == 'add "开会" --when "明天 9 点"'
+
+
+@pytest.mark.anyio
+async def test_llm_router_denies_forbidden_command_output():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+        },
+    )
+    runner._llm_route_free_text_to_command = MagicMock(
+        return_value={"decision": "allow", "command": "/model gpt-5"}
+    )
+
+    result = await runner._handle_message(
+        _make_event("帮我换模型", _make_source(platform=Platform.WEIXIN, user_id="user"))
+    )
+
+    assert result is not None
+    assert "功能限定模式" in result
+    runner.session_store.get_or_create_session.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_llm_router_denies_free_form_output():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+        },
+    )
+    runner._llm_route_free_text_to_command = MagicMock(
+        return_value={"decision": "allow", "command": "这里是自由回答"}
+    )
+
+    result = await runner._handle_message(
+        _make_event("随便聊聊", _make_source(platform=Platform.WEIXIN, user_id="user"))
+    )
+
+    assert result is not None
+    assert "功能限定模式" in result
+    runner.session_store.get_or_create_session.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_llm_router_deny_decision_discards_input():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+        },
+    )
+    runner._llm_route_free_text_to_command = MagicMock(
+        return_value={"decision": "deny", "reason": "not an allowed function"}
+    )
+
+    result = await runner._handle_message(
+        _make_event("写一首诗", _make_source(platform=Platform.WEIXIN, user_id="user"))
+    )
+
+    assert result is not None
+    assert "功能限定模式" in result
+    runner.session_store.get_or_create_session.assert_not_called()
+    runner.session_store.append_to_transcript.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_router_off_preserves_plain_text_denial():
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "off",
+        },
+    )
+    runner._llm_route_free_text_to_command = MagicMock(return_value={"decision": "allow", "command": "/status"})
+
+    result = await runner._handle_message(
+        _make_event("运行状态", _make_source(platform=Platform.WEIXIN, user_id="user"))
+    )
+
+    assert result is not None
+    assert "功能限定模式" in result
+    runner._llm_route_free_text_to_command.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase B: sticky active-discussion routes follow-up plain text
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_active_discussion_routes_plain_text_to_domain_ask(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+    from gateway.domain_discussion import open_active_discussion
+    open_active_discussion("th", ttl_minutes=30)
+
+    runner._handle_th_command = AsyncMock(return_value="ask-ok")
+
+    result = await runner._handle_message(_make_event(
+        "帮我想想我的 evidence chain 想法",
+        _make_source(platform=Platform.WEIXIN, user_id="user"),
+    ))
+
+    assert result == "ask-ok"
+    event_arg = runner._handle_th_command.call_args.args[0]
+    assert event_arg.get_command() == "th"
+    assert event_arg.get_command_args().startswith("ask ")
+
+
+@pytest.mark.anyio
+async def test_active_discussion_end_intent_routes_to_end(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+        },
+    )
+    from gateway.domain_discussion import open_active_discussion
+    open_active_discussion("th", ttl_minutes=30)
+
+    runner._handle_end_command = AsyncMock(return_value="ended-ok")
+
+    result = await runner._handle_message(_make_event(
+        "算了",
+        _make_source(platform=Platform.WEIXIN, user_id="user"),
+    ))
+
+    assert result == "ended-ok"
+
+
+@pytest.mark.anyio
+async def test_no_active_discussion_falls_back_to_llm_router(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+        },
+    )
+    runner._llm_route_free_text_to_command = MagicMock(
+        return_value={"decision": "allow", "command": "/status"}
+    )
+    runner._handle_status_command = AsyncMock(return_value="status-ok")
+
+    result = await runner._handle_message(_make_event(
+        "运行状态",
+        _make_source(platform=Platform.WEIXIN, user_id="user"),
+    ))
+
+    assert result == "status-ok"
+
+
+@pytest.mark.anyio
+async def test_expired_discussion_does_not_route(tmp_path, monkeypatch):
+    """An expired sticky discussion should be ignored (and cleared)."""
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "active_discussion.json").write_text(
+        json.dumps({
+            "domain": "th",
+            "subject_id": None,
+            "opened_at": (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+            "kind": "discuss",
+        }),
+        encoding="utf-8",
+    )
+
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "off",
+        },
+    )
+
+    result = await runner._handle_message(_make_event(
+        "hello",
+        _make_source(platform=Platform.WEIXIN, user_id="user"),
+    ))
+
+    # With router off and no valid active discussion, plain text is denied.
+    assert result is not None
+    assert "功能限定模式" in result
+
+
+# ---------------------------------------------------------------------------
+# NL router model/provider pinning via platform extra
+# ---------------------------------------------------------------------------
+
+
+def test_llm_router_uses_pinned_model_and_provider(monkeypatch):
+    """Router must respect nl_command_router_model / _provider platform extras."""
+    from gateway.run import GatewayRunner
+    from types import SimpleNamespace
+
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+            "nl_command_router_model": "gpt-5.4-mini",
+            "nl_command_router_provider": "openai-codex",
+        },
+    )
+
+    captured = {}
+
+    def fake_agent(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            run_conversation=lambda *a, **kw: {
+                "final_response": '{"decision":"allow","command":"/paper now"}'
+            }
+        )
+
+    monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+    # Ensure hermes_cli.config.load_config returns a benign default so the
+    # code that reads model_cfg doesn't override.
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {"default": "some-other-default", "provider": "some-other-provider"}},
+    )
+
+    source = _make_source(platform=Platform.WEIXIN, user_id="user")
+    route = runner._llm_route_free_text_to_command(
+        "推荐一篇论文",
+        ["paper", "s", "th", "status", "help", "whoami", "end"],
+        source,
+    )
+
+    assert route == {"decision": "allow", "command": "/paper now"}
+    assert captured["model"] == "gpt-5.4-mini"
+    assert captured["provider"] == "openai-codex"
+
+
+def test_llm_router_falls_back_to_profile_default_when_no_pin(monkeypatch):
+    from gateway.run import GatewayRunner
+    from types import SimpleNamespace
+
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+            # no *_model / *_provider extras
+        },
+    )
+
+    captured = {}
+
+    def fake_agent(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            run_conversation=lambda *a, **kw: {
+                "final_response": '{"decision":"allow","command":"/status"}'
+            }
+        )
+
+    monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {"default": "profile-default-model", "provider": "profile-provider"}},
+    )
+
+    source = _make_source(platform=Platform.WEIXIN, user_id="user")
+    runner._llm_route_free_text_to_command(
+        "运行状态",
+        ["paper", "s", "th", "status", "help", "whoami", "end"],
+        source,
+    )
+    assert captured["model"] == "profile-default-model"
+    assert captured["provider"] == "profile-provider"
+
+
+def test_llm_router_returns_deny_on_call_failure(monkeypatch):
+    from gateway.run import GatewayRunner
+    from types import SimpleNamespace
+
+    runner = _make_runner(
+        platform=Platform.WEIXIN,
+        platform_extra={
+            "user_allowed_commands": ["paper", "s", "th", "status"],
+            "user_free_chat": False,
+            "nl_command_router": "llm",
+        },
+    )
+
+    def raising_agent(**kwargs):
+        def _raise(*a, **kw):
+            raise TimeoutError("simulated 90s timeout")
+        return SimpleNamespace(run_conversation=_raise)
+
+    monkeypatch.setattr("run_agent.AIAgent", raising_agent)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {"default": "gpt-5.6-luna", "provider": "openai-codex"}},
+    )
+
+    source = _make_source(platform=Platform.WEIXIN, user_id="user")
+    route = runner._llm_route_free_text_to_command(
+        "推送论文",
+        ["paper", "s", "th", "status", "help", "whoami", "end"],
+        source,
+    )
+    assert route["decision"] == "deny"
+    assert "router call failed" in route["reason"]

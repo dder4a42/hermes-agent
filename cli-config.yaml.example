@@ -237,6 +237,20 @@ model:
 #         stale_timeout_seconds: 1800  # Longer non-stream stale timeout for slow large-context turns
 
 # =============================================================================
+# Thought incubation / low-interruption follow-up
+# =============================================================================
+# thoughts:
+#   incubation:
+#     enabled: true
+#     # The worker may check frequently, but sends only when a thought's
+#     # next_review_at is due and all interruption limits allow it.
+#     active_hours:
+#       start: "09:00"
+#       end: "21:30"
+#     max_nudges_per_day: 2
+#     unanswered_backoff: ["3d", "7d", "30d"]
+
+# =============================================================================
 # Unified Timeouts (operation deadlines)
 # =============================================================================
 # One place to override Hermes's internal operation deadlines (seconds).
@@ -1113,7 +1127,7 @@ agent:
   #   "claude-opus-4.6": "high"           # bare model name also works
   #   "deepseek/deepseek-v4-pro": "xhigh" # dots and dashes are interchangeable
   reasoning_overrides: {}
-  
+
   # Custom personalities (use with /personality command).
   # Built-ins (helpful, concise, technical, creative, teacher, kawaii, catgirl,
   # pirate, shakespeare, surfer, noir, uwu, philosopher, hype) are always

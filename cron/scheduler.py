@@ -3930,6 +3930,19 @@ _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
 _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS = _RUN_CLAIM_HEARTBEAT_SECONDS * 3
 
+# Repository-owned cron entry points.  Keep this an explicit allowlist: a
+# ``module:`` job bypasses the profile scripts sandbox, so accepting arbitrary
+# import paths would turn a hand-edited jobs.json into a general module runner.
+_BUNDLED_CRON_MODULES = frozenset({
+    "research_copilot.scripts.library_collect",
+    "research_copilot.scripts.library_daily_report",
+    "research_copilot.scripts.library_enrich",
+    "research_copilot.scripts.library_health",
+    "research_copilot.scripts.library_promote",
+    "research_copilot.scripts.library_recommend",
+    "research_copilot.scripts.library_scout",
+})
+
 
 def _get_script_timeout() -> int:
     """Resolve cron pre-run script timeout from module/env/config with a safe default."""
@@ -4282,15 +4295,17 @@ def _run_job_script(
 
     Supported interpreters (chosen by file extension):
 
+    * registered ``module:package.entrypoint`` — run with ``python -m``
     * ``.sh`` / ``.bash`` — run with ``/bin/bash``
     * anything else — run with the current Python interpreter
       (``sys.executable``), preserving the original behaviour for
       Python-based pre-check and data-collection scripts.
 
-    Shell support lets ``no_agent=True`` jobs ship classic bash watchdogs
+    Bundled module entry points keep repository-owned implementation code out
+    of profile homes. Shell support lets ``no_agent=True`` jobs ship classic bash watchdogs
     (the `memory-watchdog.sh` pattern) without wrapping them in Python.
 
-    Subprocess environment is passed through ``_sanitize_subprocess_env`` so
+    Subprocess environment is built through ``build_subprocess_env`` so
     provider credentials and other Hermes-managed secrets are not inherited
     (SECURITY.md §2.3), matching terminal and MCP child processes.
 
@@ -4309,50 +4324,65 @@ def _run_job_script(
         (success, output) — on failure *output* contains the error message so the
         LLM can report the problem to the user.
     """
+    # Reject malformed paths before either module or filesystem dispatch.  This
+    # keeps the fire-time behavior aligned with the lifecycle ingestion guard.
+    if "\x00" in str(script_path):
+        return False, f"Blocked: script path contains a NUL byte: {script_path!r}"
+
+    module_name = None
+    if script_path.startswith("module:"):
+        module_name = script_path.removeprefix("module:").strip()
+        if module_name not in _BUNDLED_CRON_MODULES:
+            return False, f"Blocked: unregistered bundled cron module: {module_name!r}"
+
     scripts_dir = _get_hermes_home() / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir_resolved = scripts_dir.resolve()
 
-    # Same ingestion contract as cron.lifecycle_guard._expand_candidate_path:
-    # a NUL-bearing value can never name a real script, and on Windows the
-    # Path operations raise ValueError *after* expanduser (expanduser never
-    # expands "~user" there, so the try below never fires) — reject eagerly
-    # so both platforms fail cleanly instead of crashing the scheduler.
-    # str() first so the guard itself can never raise TypeError on a
-    # non-str script_path (e.g. a Path passed by a future caller) — the
-    # guard must be crash-proof even though every current call site
-    # passes a plain str (#86832 review).
-    if "\x00" in str(script_path):
-        return False, f"Blocked: script path contains a NUL byte: {script_path!r}"
+    # Also allow scripts under the hermes-agent repo canonical roots so a
+    # profile can symlink into repo-owned scripts (e.g. research_copilot
+    # scripts, cron surfacers) without giving up the anti-traversal guard.
+    # Both roots are first-party trusted code that ships with hermes-agent.
+    _repo_root = Path(__file__).resolve().parent.parent
+    _allowed_roots = [
+        scripts_dir_resolved,
+        (_repo_root / "scripts").resolve(),
+        (_repo_root / "research_copilot" / "scripts").resolve(),
+    ]
 
-    try:
-        raw = Path(script_path).expanduser()
-    except (ValueError, RuntimeError, OSError):
-        # Same ingestion contract as cron.lifecycle_guard: a NUL-bearing
-        # value (ValueError) or an unexpandable ``~`` (RuntimeError with no
-        # resolvable HOME) can never name a real script. The creation-time
-        # guard tolerates such values as "nothing to scan", so they can
-        # reach fire time — fail the run with a report instead of crashing
-        # the scheduler with an unhandled exception.
-        return False, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
-    if raw.is_absolute():
-        path = raw.resolve()
+    if module_name is not None:
+        path = None
     else:
-        path = (scripts_dir / raw).resolve()
+        try:
+            raw = Path(script_path).expanduser()
+        except (ValueError, RuntimeError, OSError):
+            return False, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
+        if raw.is_absolute():
+            path = raw.resolve()
+        else:
+            path = (scripts_dir / raw).resolve()
 
     # Guard against path traversal, absolute path injection, and symlink
-    # escape — scripts MUST reside within HERMES_HOME/scripts/.
-    try:
-        path.relative_to(scripts_dir_resolved)
-    except ValueError:
+    # escape — scripts MUST resolve into HERMES_HOME/scripts/ OR a
+    # repo-owned canonical scripts directory.
+    def _inside_any(target: Path, roots: list) -> bool:
+        for root in roots:
+            try:
+                target.relative_to(root)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    if path is not None and not _inside_any(path, _allowed_roots):
         return False, (
-            f"Blocked: script path resolves outside the scripts directory "
-            f"({scripts_dir_resolved}): {script_path!r}"
+            f"Blocked: script path resolves outside the allowed scripts directories "
+            f"({[str(r) for r in _allowed_roots]}): {script_path!r}"
         )
 
-    if not path.exists():
+    if path is not None and not path.exists():
         return False, f"Script not found: {path}"
-    if not path.is_file():
+    if path is not None and not path.is_file():
         return False, f"Script path is not a file: {path}"
 
     script_timeout = _get_script_timeout()
@@ -4361,8 +4391,12 @@ def _run_job_script(
     # everything else.  We deliberately do NOT honour the file's own
     # shebang: the scripts dir is trusted, but keeping the interpreter
     # choice explicit here keeps the allowed surface small and auditable.
-    suffix = path.suffix.lower()
-    if suffix in {".sh", ".bash"}:
+    suffix = path.suffix.lower() if path is not None else ""
+    if module_name is not None:
+        argv = [sys.executable, "-m", module_name]
+        env_overlay: dict[str, str] = {}
+        default_cwd = str(_repo_root)
+    elif suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
         # all work.  On native Windows without Git for Windows installed
         # shutil.which returns None — fall back to a clear error rather
@@ -4379,6 +4413,7 @@ def _run_job_script(
         )
         argv = [_bash, str(path)]
         env_overlay: dict[str, str] = {}
+        default_cwd = str(path.parent)
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
         if env_overlay:
@@ -4388,6 +4423,7 @@ def _run_job_script(
             argv = _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path))
         else:
             argv = [python_exe, str(path)]
+        default_cwd = str(path.parent)
 
     try:
         from tools.environments.local import build_subprocess_env
@@ -4406,7 +4442,7 @@ def _run_job_script(
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
-        _script_cwd = workdir or str(path.parent)
+        _script_cwd = workdir or default_cwd
         proc = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,
@@ -4437,7 +4473,8 @@ def _run_job_script(
                 # layer's tree-kill (#85147, d6a5cb9725).
                 _terminate_cron_script_tree(proc)
                 _drain_script_pipes(proc)
-                return False, f"Script timed out after {script_timeout}s: {path}"
+                target = module_name or str(path)
+                return False, f"Script timed out after {script_timeout}s: {target}"
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
                 break
