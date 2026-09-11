@@ -1,12 +1,14 @@
 ---
 name: long-horizon-task
-description: "Plan and execute complex long-running work with a durable DAG task board, subagent delegation, and claim-evidence reports."
+description: "Plan and verify multi-step work on a durable task board."
 version: 0.1.0
 author: Hermes Agent
+license: MIT
+platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [planning, delegation, long-horizon, task-graph, verification]
-    toolsets: [longtask, delegation]
+    requires_toolsets: [longtask, delegation]
 ---
 
 # Long-Horizon Task
@@ -14,6 +16,26 @@ metadata:
 Use this skill when the user's request is complex enough to require multiple
 phases, multiple independent investigations, subagent delegation, or state that
 must survive context compression.
+
+## Prerequisites
+
+This skill needs the `longtask` (board) and `delegation` (`delegate_task`)
+toolsets. Both must be in the session's schema — `requires_toolsets` hides this
+skill from the index otherwise, so if you can read this, the `longtask_*` tools
+are available and the first step below is executable.
+
+`longtask` is NOT part of the core toolset, because its six schemas would
+otherwise ride on every API call for users who never plan this way. Enable it
+per platform in `config.yaml`:
+
+```yaml
+platform_toolsets:
+  cli: [hermes-cli, longtask]
+```
+
+`delegation` is on by default wherever the core toolset is enabled. Verify with
+`longtask_read` / `longtask_next` before assuming a board exists — never invent
+board state from memory.
 
 ## Operating Contract
 
