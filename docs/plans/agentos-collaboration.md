@@ -195,3 +195,22 @@ compression work in parallel.
 - `.hermes/tasks/<session>/reports/*.json` holds the audited inventory of
   persistence paths (N1) and the tail-budget assessment (N2), both with
   file:line evidence, produced by the pre-port flow.
+
+## 6. Incident log
+
+**2026-09-12 — compression abandoned as "no progress" (fixed in f11240ca28).**
+A 710-message / ~817k-token session triggered compression; the archive summarised
+every ~20-message chunk with its own blocking LLM call (30s timeout each, plus
+the auxiliary client's retry), and the host's inactivity watchdog fired at 120s
+(`compression.context_timeout_seconds`) — ten `session_archive_summary` calls
+between 03:49:52 and 03:51:51, then "continuing without compression". The context
+stayed at ~638k tokens and the next request died on the provider's token limit
+(HTTP 429).
+
+Lesson for this port: **anything a plugin runs inside `on_pre_compress` sits on
+the compression critical path and is bounded by that watchdog.** Chunks (the
+recoverable evidence) must be written unconditionally; only enrichment — LLM
+summaries, stage recaps — may be rationed. The stopgap rations them
+(`max_llm_summaries_per_pass`, `llm_summary_budget_seconds`); P7 removes the
+enrichment from the pass entirely.
+
