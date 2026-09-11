@@ -310,6 +310,100 @@ Step 5: strict checkpoint defaults.
   `memory.provider: session_archive` is active.
 - Keep strict mode fail-closed if the archive checkpoint cannot be written.
 
+## Session Wiring
+
+Long-horizon task mode is reachable only when the board tools and the
+delegation tool are both in the session's schema AND the model is told they
+exist. Either half alone leaves the feature inert.
+
+### Enabling the board toolset
+
+`longtask` is deliberately not in `_HERMES_CORE_TOOLS` (six extra schemas on
+every API call for users who never plan this way) and is not in
+`CONFIGURABLE_TOOLSETS`, so it never shows up in `hermes tools` and is never
+auto-enabled. Enable it per platform by naming it explicitly — non-configurable
+toolsets listed in `platform_toolsets` are passed through:
+
+```yaml
+platform_toolsets:
+  cli: [hermes-cli, longtask]
+```
+
+Keep the platform composite in the list; `[longtask]` alone drops every core
+tool. Verified: the CLI path resolves 55 tools with `longtask` (6 board tools +
+`delegate_task` + all core tools) versus 49 without.
+
+The `coding` posture toolset also carries the board tools, but only under the
+opt-in `agent.coding_context: focus`; the default `auto` is prompt-only and
+touches no toolset.
+
+### Skill activation
+
+`skills/long-horizon-task/SKILL.md` declares
+`metadata.hermes.requires_toolsets: [longtask, delegation]`. Only
+`requires_toolsets` / `requires_tools` / `fallback_for_toolsets` /
+`fallback_for_tools` are read (`agent/skill_utils.py::extract_skill_conditions`
+→ `agent/prompt_builder.py::_skill_should_show`). A bare `toolsets:` key is
+inert. Enabling a skill is also not the same as loading it: the prompt index
+carries only `- <name>: <description>`, so the body reaches context only on
+`skill_view`.
+
+### Prompt guidance
+
+Two stable-prompt blocks carry the positive trigger, injected in
+`agent/system_prompt.py` off the session's own tool names:
+
+- `DELEGATION_GUIDANCE` — when `delegate_task` is in the schema. The tool
+  description alone is DO-NOT-heavy, which is why the model defaulted to doing
+  the work inline.
+- `LONGTASK_GUIDANCE` / `longtask_guidance_text()` — when any `longtask_*` tool
+  is in the schema; degrades to a solo variant (no `delegate_task` reference)
+  when the `delegation` toolset is off.
+
+`tools/delegate_tool.py::_build_top_level_description()` now leads with
+`USE THIS for …` before its DO-NOT list. Both gates key on the session's tool
+names, so the rendered text stays byte-stable for the life of a conversation
+(prompt-cache safe). Verified end-to-end: a main session gets both blocks; a
+delegate child (`delegate_task` stripped) gets neither.
+
+## Remaining Follow-Ups
+
+1. **Other platforms are not enabled.** Only `cli` lists `longtask` in
+   `platform_toolsets`, so gateway platforms resolve no board tools and the
+   skill is hidden there by `requires_toolsets`. Decide per platform whether
+   long-horizon mode belongs on a chat surface at all.
+
+2. **`platform_toolsets` is not in `DEFAULT_CONFIG`.** `hermes config set
+   platform_toolsets.cli '["hermes-cli","longtask"]'` writes the key correctly
+   but prints "not a recognized config key — Hermes may not read it", which is
+   false: `hermes_cli/tools_config.py::_get_platform_tools` reads exactly that
+   key. Add it to `DEFAULT_CONFIG` or to the key validator's known list so the
+   supported enablement path does not look broken.
+
+3. **`longtask` is invisible in `hermes tools`.** Absent from
+   `CONFIGURABLE_TOOLSETS`, users cannot discover or toggle it from the TUI and
+   must hand-edit config. Either make it configurable (the subset test then
+   requires the board tools in `_HERMES_CORE_TOOLS`) or keep the footprint at
+   zero with a `check_fn`-gated toolset that ships no schemas until the feature
+   is on, and document the explicit-list path either way.
+
+4. **Structured report format is still advisory.** The claim-evidence schema
+   lives in the skill and in the delegation guidance, but nothing validates a
+   child's summary against it unless the caller passes `output_schema`. Wiring
+   the report schema into the longtask delegation path is the next real gain.
+
+5. **`skills/research/paper` violates the authoring standards** (pre-existing,
+   unrelated to this branch): missing `platforms`, and a 72-char description
+   against the 60-char hardline enforced by
+   `tests/skills/test_authoring_standards.py`. `GRANDFATHER` is intentionally
+   empty — fix the skill, do not exempt it.
+
+6. **Local full-suite noise.** `scripts/run_tests.sh` on this host reports
+   failures that are environmental rather than regressions: git 2.25.1 has no
+   `git init -b` (14 tests in `tests/agent/test_coding_context.py`) and
+   `pytest-asyncio` is not installed (the LSP async tests). Do not read those
+   as branch breakage.
+
 ## SJTU Routing Notes
 
 Current practical routing for this project:
