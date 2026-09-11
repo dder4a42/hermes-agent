@@ -1,4 +1,5 @@
 import json
+import threading
 
 import pytest
 
@@ -100,3 +101,114 @@ def test_compute_ready_nodes_is_pure_for_loaded_board(tmp_path):
     board = create_board(tmp_path, "s", "obj", _nodes())
     ready = compute_ready_nodes(board)
     assert [node["node_id"] for node in ready] == ["N1"]
+
+
+class TestReportStatusVocabulary:
+    """Children report success|partial|failed|timeout; the board tracks
+    lifecycle statuses. Handing one straight to the other used to raise
+    "Invalid status: success" on the documented happy path."""
+
+    def test_success_maps_to_done(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+        update_node(tmp_path, "s", "N1", status="running")
+
+        result = attach_report(tmp_path, "s", "N1", {"status": "success"})
+
+        assert result["node"]["status"] == "done"
+        assert result["node"]["report_status"] == "done"
+
+    def test_partial_maps_to_a_non_terminal_status(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+        update_node(tmp_path, "s", "N1", status="running")
+
+        result = attach_report(tmp_path, "s", "N1", {"status": "partial"})
+
+        assert result["node"]["status"] == "blocked"
+
+    def test_unknown_status_names_both_vocabularies(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+        update_node(tmp_path, "s", "N1", status="running")
+
+        with pytest.raises(LongtaskBoardError) as excinfo:
+            attach_report(tmp_path, "s", "N1", {"status": "gibberish"})
+
+        message = str(excinfo.value)
+        assert "board" in message.lower() and "report" in message.lower()
+
+
+class TestConcurrentWrites:
+    def test_parallel_updates_all_land(self, tmp_path):
+        """The runtime runs a turn's independent tool calls on worker threads.
+        Before the board lock, load -> mutate -> save silently dropped updates
+        (measured: 6 concurrent updates left 2 applied and zero errors)."""
+        create_board(
+            tmp_path, "s", "obj", [{"node_id": f"N{i}", "goal": "g"} for i in range(1, 7)]
+        )
+
+        def worker(index):
+            update_node(tmp_path, "s", f"N{index}", status="running")
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(1, 7)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        board = load_board(tmp_path, "s")
+        running = [n["node_id"] for n in board["nodes"] if n["status"] == "running"]
+        assert running == [f"N{i}" for i in range(1, 7)]
+
+
+class TestVerificationGate:
+    """Optional host-side enforcement of the skill's "no downstream work before
+    a verification result" rule. Off unless
+    longtask.require_verification_before_unlock is set."""
+
+    def _enable_gate(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"longtask": {"require_verification_before_unlock": True}},
+        )
+
+    def test_off_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly", lambda: {"longtask": {}}
+        )
+        create_board(tmp_path, "s", "obj", _nodes())
+
+        assert update_node(tmp_path, "s", "N1", status="done")["node"]["status"] == "done"
+
+    def test_blocks_done_without_a_verdict(self, tmp_path, monkeypatch):
+        self._enable_gate(monkeypatch)
+        create_board(tmp_path, "s", "obj", _nodes())
+        update_node(tmp_path, "s", "N1", status="running")
+
+        with pytest.raises(LongtaskBoardError, match="verification"):
+            update_node(tmp_path, "s", "N1", status="done")
+
+    def test_refused_attach_still_persists_the_report(self, tmp_path, monkeypatch):
+        """A child's self-report is a claim, not a verdict: keep the evidence,
+        refuse only the terminal transition."""
+        self._enable_gate(monkeypatch)
+        create_board(tmp_path, "s", "obj", _nodes())
+        update_node(tmp_path, "s", "N1", status="running")
+        report = {"status": "success", "claims": [{"claim": "c", "evidence": []}]}
+
+        with pytest.raises(LongtaskBoardError, match="verification"):
+            attach_report(tmp_path, "s", "N1", report)
+
+        node = load_board(tmp_path, "s")["nodes"][0]
+        assert node["node_id"] == "N1"
+        assert node["report_path"], "the report must survive the refusal"
+        assert node["status"] == "running"
+        assert node["report_status"] == "done"
+
+    def test_verify_then_done_is_allowed(self, tmp_path, monkeypatch):
+        self._enable_gate(monkeypatch)
+        create_board(tmp_path, "s", "obj", _nodes())
+        update_node(tmp_path, "s", "N1", status="running")
+        update_node(tmp_path, "s", "N1", verification={"verdict": "accepted"})
+
+        assert update_node(tmp_path, "s", "N1", status="done")["node"]["status"] == "done"
+        ready = next_ready_nodes(tmp_path, "s")
+        assert [n["node_id"] for n in ready["ready"]] == ["N2"]

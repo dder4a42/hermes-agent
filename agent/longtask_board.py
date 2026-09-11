@@ -7,13 +7,15 @@ status, reports, and verification summaries.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 from utils import atomic_json_write
 
@@ -53,6 +55,137 @@ ALLOWED_TRANSITIONS = {
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _REPORT_PREVIEW_CHARS = 1200
+
+
+# ---------------------------------------------------------------------------
+# Report status vocabulary
+# ---------------------------------------------------------------------------
+# Children are asked for the SKILL.md report vocabulary
+# (success|partial|failed|timeout); the board tracks lifecycle
+# (pending|ready|running|blocked|done|failed|timeout|cancelled). These are two
+# different vocabularies on purpose, and the attach path used to hand the
+# report's own status straight to _normalize_status — so a parent following the
+# documented protocol died on the first attach ("Invalid status: success").
+# Translate instead of rejecting; unknown values still fail loudly.
+REPORT_STATUS_ALIASES = {
+    "success": "done",
+    "succeeded": "done",
+    "ok": "done",
+    "complete": "done",
+    "completed": "done",
+    # "partial" is not done and not failed: map to the non-terminal status that
+    # can be re-queued (blocked -> pending/ready/running are legal transitions),
+    # so a follow-up run can pick the node back up without a manual reset.
+    "partial": "blocked",
+    "needs_followup": "blocked",
+    "needs-followup": "blocked",
+    "incomplete": "blocked",
+    "error": "failed",
+    "failure": "failed",
+    "timed_out": "timeout",
+    "canceled": "cancelled",
+}
+
+# Terminal statuses a node may only reach once its report has been verified —
+# gated by ``longtask.require_verification_before_unlock`` (default off; see
+# _require_verification).
+_VERIFIED_TERMINAL_STATUSES = {"done"}
+
+
+def normalize_report_status(value: Any) -> str:
+    """Map a report/child status onto a board status.
+
+    Accepts board statuses verbatim and translates the report aliases above.
+    Raises ``LongtaskBoardError`` for anything else, naming both vocabularies so
+    the model can self-correct in one turn.
+    """
+    status = str(value or "").strip().lower()
+    if status in VALID_STATUSES:
+        return status
+    mapped = REPORT_STATUS_ALIASES.get(status)
+    if mapped:
+        return mapped
+    raise LongtaskBoardError(
+        f"Invalid status: {status}. Board statuses: {sorted(VALID_STATUSES)}; "
+        f"report statuses: {sorted(REPORT_STATUS_ALIASES)}"
+    )
+
+
+def _require_verification() -> bool:
+    """Read ``longtask.require_verification_before_unlock`` (default False).
+
+    Off by default so existing boards keep their contract; when on, a node
+    cannot reach a success-terminal status before ``longtask_verify_node`` has
+    written a verdict. That is the invariant the skill states in prose ("do not
+    unlock downstream work until the upstream report has a verification
+    result") — this is the host-side enforcement of it.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        longtask_cfg = cfg.get("longtask") or {}
+        if not isinstance(longtask_cfg, dict):
+            return False
+        return bool(longtask_cfg.get("require_verification_before_unlock", False))
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Board locking
+# ---------------------------------------------------------------------------
+# Every mutator is load -> mutate -> save with no lock, and BOTH layers of
+# concurrency are real: the runtime runs a turn's independent tool calls on
+# worker threads (measured: 6 concurrent update_node(status="running") calls
+# left 2 applied and 0 errors — silent lost updates), and two Hermes processes
+# can share a workspace board. The RLock covers the in-process case; the POSIX
+# flock covers the cross-process one. On Windows fcntl is absent and only the
+# in-process lock applies.
+try:  # pragma: no cover - platform dependent
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+_PATH_LOCKS: Dict[str, "threading.RLock"] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _thread_lock(path: Path) -> "threading.RLock":
+    key = str(path)
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[key] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def board_lock(root: str | Path, session_id: str) -> Iterator[None]:
+    """Serialize one board's read-modify-write cycle."""
+    path = board_path(root, session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _thread_lock(path):
+        handle = None
+        try:
+            handle = open(f"{path}.lock", "a+")
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            if handle is not None:
+                handle.close()
+                handle = None
+        try:
+            yield
+        finally:
+            if handle is not None:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    handle.close()
+
 
 
 class LongtaskBoardError(ValueError):
@@ -119,6 +252,20 @@ def create_board(
     *,
     overwrite: bool = False,
 ) -> Dict[str, Any]:
+    with board_lock(root, session_id):
+        return _create_board_locked(
+            root, session_id, objective, nodes, overwrite=overwrite
+        )
+
+
+def _create_board_locked(
+    root: str | Path,
+    session_id: str,
+    objective: str,
+    nodes: Iterable[Dict[str, Any]],
+    *,
+    overwrite: bool = False,
+) -> Dict[str, Any]:
     path = board_path(root, session_id)
     if path.exists() and not overwrite:
         raise LongtaskBoardError(
@@ -144,6 +291,18 @@ def read_board(
 
 
 def next_ready_nodes(
+    root: str | Path,
+    session_id: str,
+    *,
+    limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    # Also a writer: it records global_state.next_ready, so it needs the same
+    # lock as the mutators or it can clobber a concurrent update.
+    with board_lock(root, session_id):
+        return _next_ready_nodes_locked(root, session_id, limit=limit)
+
+
+def _next_ready_nodes_locked(
     root: str | Path,
     session_id: str,
     *,
@@ -180,6 +339,32 @@ def update_node(
     verification: Optional[Dict[str, Any]] = None,
     notes: Optional[str] = None,
 ) -> Dict[str, Any]:
+    with board_lock(root, session_id):
+        return _update_node_locked(
+            root,
+            session_id,
+            node_id,
+            status=status,
+            assigned_to=assigned_to,
+            claims=claims,
+            evidence=evidence,
+            verification=verification,
+            notes=notes,
+        )
+
+
+def _update_node_locked(
+    root: str | Path,
+    session_id: str,
+    node_id: str,
+    *,
+    status: Optional[str] = None,
+    assigned_to: Optional[str] = None,
+    claims: Optional[List[Dict[str, Any]]] = None,
+    evidence: Optional[List[Dict[str, Any]]] = None,
+    verification: Optional[Dict[str, Any]] = None,
+    notes: Optional[str] = None,
+) -> Dict[str, Any]:
     board = load_board(root, session_id)
     node = _node_by_id(board, node_id)
     if status is not None:
@@ -192,6 +377,16 @@ def update_node(
         if new_status in {"ready", "running", "done"} and not _dependencies_done(board, node):
             raise LongtaskBoardError(
                 f"Node {node_id} cannot become {new_status}; dependencies are not done"
+            )
+        if (
+            new_status in _VERIFIED_TERMINAL_STATUSES
+            and _require_verification()
+            and not node.get("verification")
+        ):
+            raise LongtaskBoardError(
+                f"Node {node_id} cannot become {new_status} before it has a "
+                "verification result; call longtask_verify_node first "
+                "(enable/disable with longtask.require_verification_before_unlock)"
             )
         node["status"] = new_status
     if assigned_to is not None:
@@ -218,6 +413,20 @@ def attach_report(
     *,
     status: Optional[str] = None,
 ) -> Dict[str, Any]:
+    with board_lock(root, session_id):
+        return _attach_report_locked(
+            root, session_id, node_id, report, status=status
+        )
+
+
+def _attach_report_locked(
+    root: str | Path,
+    session_id: str,
+    node_id: str,
+    report: Dict[str, Any],
+    *,
+    status: Optional[str] = None,
+) -> Dict[str, Any]:
     board = load_board(root, session_id)
     node = _node_by_id(board, node_id)
     report_data = _normalize_dict(report, "report")
@@ -236,7 +445,26 @@ def attach_report(
         node["evidence"] = _normalize_list_of_dicts(report_data["evidence"], "evidence")
     requested_status = status or report_data.get("status")
     if requested_status:
-        new_status = _normalize_status(str(requested_status))
+        # The child reports with the SKILL.md vocabulary; translate it onto the
+        # board's lifecycle instead of rejecting it.
+        new_status = normalize_report_status(requested_status)
+        node["report_status"] = new_status
+        if (
+            new_status in _VERIFIED_TERMINAL_STATUSES
+            and _require_verification()
+            and not node.get("verification")
+        ):
+            # The report itself is persisted (re-attaching is idempotent), but
+            # the terminal transition is refused: a child's self-report is a
+            # claim, not a verdict.
+            node["updated_at"] = _now()
+            _refresh_ready_nodes(board)
+            save_board(root, session_id, board)
+            raise LongtaskBoardError(
+                f"Node {node_id}: report recorded, but {new_status!r} needs a "
+                "verification result first. Call longtask_verify_node, then "
+                "longtask_update_node(status='done')."
+            )
         if new_status not in ALLOWED_TRANSITIONS.get(node["status"], set()):
             raise LongtaskBoardError(
                 f"Invalid node transition {node_id}: {node['status']} -> {new_status}"
@@ -309,6 +537,7 @@ def _normalize_nodes(nodes: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "claims": _normalize_list_of_dicts(raw.get("claims") or [], "claims"),
             "evidence": _normalize_list_of_dicts(raw.get("evidence") or [], "evidence"),
             "report_path": raw.get("report_path"),
+            "report_status": raw.get("report_status"),
             "verification": raw.get("verification"),
             "created_at": str(raw.get("created_at") or _now()),
             "updated_at": str(raw.get("updated_at") or _now()),
@@ -426,6 +655,7 @@ def _public_node(node: Dict[str, Any]) -> Dict[str, Any]:
         "evidence",
         "report_path",
         "report_preview",
+        "report_status",
         "verification",
         "notes",
     )
