@@ -1,0 +1,7 @@
+name: session_archive
+version: 0.1.0
+description: "Local session archive for compression checkpoints and retrievable raw context."
+hooks:
+  - on_pre_compress
+  - on_session_switch
+  - on_delegation

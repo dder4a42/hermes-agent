@@ -1,0 +1,3 @@
+name: long_horizon
+version: 0.1.0
+description: "Checkpoint-first compression engine for long-horizon tasks with retrievable archived context."

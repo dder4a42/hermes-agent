@@ -195,7 +195,7 @@ Add an external memory provider that checkpoints context before compression.
 This prevents compression from becoming a permanent information-destroying
 operation.
 
-Proposed plugin:
+Implemented first pass:
 
 - `plugins/memory/session_archive/`
 
@@ -208,24 +208,26 @@ Use existing hooks:
 
 Expose tools:
 
-- `session_archive_search(query, role?, tool_name?, time_range?)`
+- `session_archive_search(query, limit?)`
 - `session_archive_expand(chunk_id)`
 - `session_archive_get_claims(task_id?)`
 
 Storage model:
 
-- chunk original messages before compression;
+- chunk original messages before compression under
+  `<HERMES_HOME>/session_archive/<session_id>/chunks/`;
 - preserve raw tool outputs outside the prompt;
-- attach message IDs, role, tool name, task node, timestamps, and hashes;
-- generate rolling digests over chunks;
-- return a compact checkpoint summary to compression as `memory_context`.
+- attach message offsets, timestamps, previews, and chunk hashes;
+- return a compact checkpoint manifest to compression as `memory_context`;
+- declare checkpoint API v2 support so `compression.checkpoint_required: true`
+  fails closed instead of discarding history without a durable archive.
 
 ## Phase 5: Long-Horizon Context Engine
 
 Add a context-engine plugin that uses the session archive and task board as the
 authoritative long-horizon state.
 
-Proposed plugin:
+Implemented first pass:
 
 - `plugins/context_engine/long_horizon/`
 
@@ -246,46 +248,52 @@ Compression output should avoid preserving:
 
 ## Next Compression Plan
 
-The next compression work should be implemented after Phase 1 and Phase 2 prove
-the task board loop works.
+Enable the implemented first pass with:
 
-Step 1: pre-compress archive provider.
+```yaml
+memory:
+  provider: session_archive
 
-- Implement `plugins/memory/session_archive/` with `on_pre_compress()`.
-- Persist raw pre-compression messages and normalized evidence chunks.
-- Return a short manifest to the existing compressor through `memory_context`.
-- Add tests that compression still succeeds when the provider archives data,
-  and that archived chunks can be searched and expanded after compaction.
+context:
+  engine: long_horizon
 
-Step 2: retrieval tools.
+compression:
+  checkpoint_required: true
+```
 
-- Add `session_archive_search()` and `session_archive_expand()`.
-- Gate them through the memory-provider tool path, not core tools.
+Step 1: host integration test.
+
+- Add an end-to-end compression test with a temp `HERMES_HOME`,
+  `memory.provider: session_archive`, and `context.engine: long_horizon`.
+- Assert the host invokes `on_pre_compress()`, writes archive chunks, and commits
+  a compacted session containing the archive manifest.
+
+Step 2: richer retrieval filters.
+
+- Extend `session_archive_search()` with role, tool name, task ID, node ID, and
+  time filters.
 - Keep returned snippets bounded and include stable chunk IDs.
 - Add tests for role/tool filters and expansion by chunk ID.
 
-Step 3: compression manifest.
+Step 3: rolling summaries.
 
-- Teach the long-horizon skill and later context engine to prefer board state
-  and archive references over raw historical tool output.
+- Add rolling summaries over archived chunks so the prompt gets semantic
+  continuity without raw historical tool output.
 - Keep claim-evidence summaries in prompt, but store full evidence in the
   archive.
 
-Step 4: context-engine override.
+Step 4: task-board manifest.
 
-- Implement `plugins/context_engine/long_horizon/`.
-- Replace the default head/tail-heavy output with a compact handoff:
-  active turn, task graph state, accepted claims, unresolved claims, and archive
-  pointers.
+- Teach the context engine to read the current task board and include active
+  objective, accepted claims, unresolved claims, and archive pointers.
 - Verify that long sessions can compact even when recent user turns and tool
   outputs would otherwise exceed the protected tail budget.
 
-Step 5: strict checkpoint mode.
+Step 5: strict checkpoint defaults.
 
-- Evaluate enabling `compression_checkpoint_required` when
-  `session_archive` is active.
-- In strict mode, compression must fail closed if the archive checkpoint cannot
-  be written, preventing irreversible loss of pre-compression context.
+- Evaluate auto-enabling `compression.checkpoint_required` when
+  `memory.provider: session_archive` is active.
+- Keep strict mode fail-closed if the archive checkpoint cannot be written.
 
 ## SJTU Routing Notes
 
