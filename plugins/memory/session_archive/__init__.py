@@ -16,6 +16,7 @@ from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION
 from agent.redact import redact_sensitive_text
+from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -119,7 +120,7 @@ class SessionArchiveProvider(MemoryProvider):
         return True
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
-        hermes_home = Path(str(kwargs.get("hermes_home") or Path.home() / ".hermes"))
+        hermes_home = Path(str(kwargs.get("hermes_home") or get_hermes_home()))
         self._root = hermes_home / "session_archive"
         self._session_id = _safe_id(session_id)
         self._config = self._load_config()
@@ -343,22 +344,54 @@ class SessionArchiveProvider(MemoryProvider):
             f"{self._session_id}\0{start}\0{end}\0{joined}".encode("utf-8", "replace")
         ).hexdigest()[:16]
         chunk_id = f"chk-{start}-{end}-{digest}"
+        chunk_path = self._chunks_dir() / f"{chunk_id}.json"
+        cached = self._read_json(chunk_path)
+        if isinstance(cached, dict) and cached.get("summary"):
+            # Identical range + identical bytes ⇒ identical chunk_id, and the
+            # chunk (with its summary) is already on disk. Compression re-archives
+            # the whole transcript on every pass, so summarizing again burned one
+            # LLM call per chunk per pass on inputs that had not changed —
+            # measured: a byte-identical second pass still fired the summarizer.
+            return self._chunk_entry(
+                chunk_id,
+                start,
+                end,
+                str(cached["summary"]),
+                cached.get("messages") or messages,
+                cached.get("created_at"),
+            )
         summary = self._summarize_chunk(joined, messages=messages)
+        created_at = time.time()
         payload = {
             "chunk_id": chunk_id,
             "session_id": self._session_id,
             "source": source,
-            "created_at": time.time(),
+            "created_at": created_at,
             "message_start": start,
             "message_end": end,
             "summary": summary,
             "messages": messages,
         }
-        atomic_json_write(self._chunks_dir() / f"{chunk_id}.json", payload, indent=2, mode=0o600)
+        atomic_json_write(chunk_path, payload, indent=2, mode=0o600)
+        return self._chunk_entry(chunk_id, start, end, summary, messages, created_at)
+
+    def _chunk_entry(
+        self,
+        chunk_id: str,
+        start: int,
+        end: int,
+        summary: str,
+        messages: List[Dict[str, Any]],
+        created_at: Any,
+    ) -> Dict[str, Any]:
+        """Build the index entry for a chunk (no LLM work)."""
+        joined = "\n\n".join(
+            _message_text(m) for m in messages if isinstance(m, dict)
+        )
         preview = redact_sensitive_text(joined[:700].replace("\n", " "), force=True)
         return {
             "chunk_id": chunk_id,
-            "created_at": payload["created_at"],
+            "created_at": created_at or time.time(),
             "message_start": start,
             "message_end": end,
             "summary": summary,
@@ -428,6 +461,15 @@ class SessionArchiveProvider(MemoryProvider):
         index = self._read_index()
         if len(index) < self.secondary_index_chunk_threshold:
             return
+        # Reuse a group's recap when its inputs are unchanged. The groups are
+        # recomputed from the whole index on EVERY compression pass, so without
+        # this the stage-level recaps cost one LLM call per group per pass for
+        # as long as the session lives.
+        previous = {
+            str(item.get("group_id")): item
+            for item in self._read_secondary_index()
+            if isinstance(item, dict) and item.get("group_id")
+        }
         groups = []
         for group_index, start in enumerate(
             range(0, len(index), self.secondary_index_group_size),
@@ -440,13 +482,23 @@ class SessionArchiveProvider(MemoryProvider):
                 f"- {item.get('chunk_id')}: {item.get('summary') or item.get('preview') or ''}"
                 for item in items
             )
+            group_id = f"recap-{group_index}"
+            fingerprint = hashlib.sha256(
+                summaries.encode("utf-8", "replace")
+            ).hexdigest()[:16]
+            prior = previous.get(group_id) or {}
+            if prior.get("fingerprint") == fingerprint and prior.get("summary"):
+                summary = str(prior["summary"])
+            else:
+                summary = self._summarize_secondary_group(summaries)
             groups.append(
                 {
-                    "group_id": f"recap-{group_index}",
+                    "group_id": group_id,
                     "chunk_ids": [item.get("chunk_id") for item in items],
                     "message_start": items[0].get("message_start"),
                     "message_end": items[-1].get("message_end"),
-                    "summary": self._summarize_secondary_group(summaries),
+                    "summary": summary,
+                    "fingerprint": fingerprint,
                     "updated_at": time.time(),
                 }
             )
@@ -494,6 +546,14 @@ class SessionArchiveProvider(MemoryProvider):
             by_id[chunk["chunk_id"]] = chunk
         merged = sorted(by_id.values(), key=lambda item: (item.get("created_at") or 0, item.get("chunk_id") or ""))
         atomic_json_write(self._index_path(), merged, indent=2, mode=0o600)
+
+    def _read_json(self, path: Path) -> Any:
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
 
     def _read_index(self) -> List[Dict[str, Any]]:
         path = self._index_path()
@@ -549,7 +609,7 @@ class SessionArchiveProvider(MemoryProvider):
             return {}
 
     def _session_dir(self) -> Path:
-        root = self._root or Path.home() / ".hermes" / "session_archive"
+        root = self._root or get_hermes_home() / "session_archive"
         return root / self._session_id
 
     def _chunks_dir(self) -> Path:

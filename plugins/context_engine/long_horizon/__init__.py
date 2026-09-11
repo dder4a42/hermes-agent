@@ -8,6 +8,7 @@ the live prompt is rebuilt around a compact manifest and recent tail.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -224,15 +225,46 @@ class LongHorizonContextEngine(ContextEngine):
             from agent.longtask_board import load_board
         except Exception:
             return {}
-        roots = [Path.cwd() / ".hermes" / "tasks"]
-        if self._hermes_home:
-            roots.append(Path(self._hermes_home) / "tasks")
-        for root in roots:
+        for root in self._task_board_roots():
             try:
                 return load_board(root, self._session_id)
             except Exception:
                 continue
         return {}
+
+    def _task_board_roots(self) -> List[Path]:
+        """Candidate board roots, in writer-compatible order.
+
+        ``tools/longtask_tool.py::_root`` writes the board under the PARENT
+        AGENT's workspace — ``terminal_cwd`` / agent cwd / subdirectory hints,
+        falling back to the process cwd. Probing only ``Path.cwd()`` therefore
+        silently missed the board whenever the two differ: verified on a
+        gateway-shaped session (board present under ``terminal.cwd``, process cwd
+        elsewhere) where the handoff rendered no board state at all — the one
+        thing this engine exists to carry. The engine has no agent object, so
+        mirror the writer's env-visible head (``TERMINAL_CWD``, which the gateway
+        bridges from ``terminal.cwd``) and keep ``HERMES_HOME/tasks`` last.
+        """
+        candidates: List[str] = []
+        env_cwd = os.environ.get("TERMINAL_CWD")
+        if env_cwd:
+            candidates.append(env_cwd)
+        try:
+            candidates.append(os.getcwd())
+        except OSError:
+            pass
+        roots: List[Path] = []
+        seen = set()
+        for value in candidates:
+            root = Path(value).expanduser() / ".hermes" / "tasks"
+            if str(root) not in seen:
+                seen.add(str(root))
+                roots.append(root)
+        if self._hermes_home:
+            root = Path(self._hermes_home) / "tasks"
+            if str(root) not in seen:
+                roots.append(root)
+        return roots
 
     def _node_status(self, node: Any) -> str:
         return str(node.get("status") or "unknown") if isinstance(node, dict) else "unknown"

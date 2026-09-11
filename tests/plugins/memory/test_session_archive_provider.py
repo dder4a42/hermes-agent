@@ -104,3 +104,80 @@ def test_secondary_index_is_created_after_threshold(tmp_path):
     assert secondary
     assert secondary[0]["group_id"] == "recap-1"
     assert len(secondary[0]["chunk_ids"]) == 2
+
+
+def _summary_stub(calls, text="RECAP"):
+    """A call_llm stand-in that counts invocations."""
+    def fake_call_llm(**_kwargs):
+        calls["n"] += 1
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=text, reasoning=None)
+                )
+            ]
+        )
+    return fake_call_llm
+
+
+def test_unchanged_chunks_are_not_resummarized(tmp_path, monkeypatch):
+    """Compression re-archives the whole transcript on every pass, and the
+    chunk id is a hash of the chunk's content. Re-summarizing an identical chunk
+    cost one LLM call per chunk per pass (measured: a byte-identical second pass
+    still fired the summarizer)."""
+    provider = SessionArchiveProvider()
+    provider.initialize("idempotent-session", hermes_home=str(tmp_path))
+    provider._config = {"llm_summary": {"enabled": True, "max_tokens": 200}}
+    calls = {"n": 0}
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", _summary_stub(calls))
+
+    # Two messages past max_chars_per_chunk => two chunks.
+    messages = [
+        {"role": "user", "content": "a" * 40_000},
+        {"role": "user", "content": "b" * 40_000},
+    ]
+
+    first = provider.on_pre_compress(messages)
+    calls_after_first = calls["n"]
+    second = provider.on_pre_compress(messages)
+
+    assert calls_after_first >= 1, "the first pass must summarize"
+    assert calls["n"] == calls_after_first, "identical input must not re-summarize"
+    assert "chk-" in first and "chk-" in second
+    assert provider.search("a" * 20)["results"]
+
+
+def test_secondary_recaps_reuse_unchanged_groups(tmp_path, monkeypatch):
+    provider = SessionArchiveProvider()
+    provider.initialize("recap-session", hermes_home=str(tmp_path))
+    provider._config = {"llm_summary": {"enabled": True, "max_tokens": 200}}
+    provider.max_messages_per_chunk = 1
+    calls = {"n": 0}
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", _summary_stub(calls))
+
+    provider.on_pre_compress(
+        [{"role": "user", "content": f"stage {i}"} for i in range(2)]
+    )
+
+    # Manual pass so the recount starts from a known state.
+    provider.secondary_index_chunk_threshold = 2
+    provider.secondary_index_group_size = 1
+    calls["n"] = 0
+    provider._maybe_write_secondary_index()
+    first_pass = calls["n"]
+    provider._maybe_write_secondary_index()
+    second_pass = calls["n"] - first_pass
+
+    assert first_pass == 2, "one recap per group on a cold index"
+    assert second_pass == 0, "unchanged inputs must not recompute recap groups"
+    groups = provider._read_secondary_index()
+    assert all(group.get("fingerprint") for group in groups)
+
+    # Only the affected group is recomputed when a member changes.
+    index = provider._read_index()
+    provider._index_path().write_text(
+        json.dumps([{**index[0], "summary": "CHANGED"}, index[1]]), encoding="utf-8"
+    )
+    calls["n"] = 0
+    provider._maybe_write_secondary_index()
+    assert calls["n"] == 1, "granular invalidation: only the changed group"

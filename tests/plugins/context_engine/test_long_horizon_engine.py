@@ -88,3 +88,39 @@ def test_compress_includes_task_board_handoff(tmp_path, monkeypatch):
     assert "recent_terminal:" in joined
     assert "verification=accepted" in joined
     assert "Archive provider stores chunks" in joined
+
+
+def test_board_handoff_follows_terminal_cwd(tmp_path, monkeypatch):
+    """The board is written under the PARENT AGENT's workspace (terminal.cwd,
+    bridged to TERMINAL_CWD — see tools/longtask_tool.py::_root), while
+    compression runs in the process cwd. Probing only Path.cwd() silently
+    dropped the board from the handoff on any surface where the two differ
+    (verified on a gateway-shaped session) — the one thing this engine exists
+    to carry across compression."""
+    from agent.longtask_board import create_board
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    process_cwd = tmp_path / "elsewhere"
+    process_cwd.mkdir()
+    session_id = "sid-gateway"
+    create_board(
+        workspace / ".hermes" / "tasks",
+        session_id,
+        "Gateway objective",
+        [{"node_id": "N1", "goal": "Drain the queue"}],
+    )
+
+    monkeypatch.chdir(process_cwd)
+    monkeypatch.setenv("TERMINAL_CWD", str(workspace))
+
+    engine = LongHorizonContextEngine()
+    engine.update_model(model="test", context_length=1000)
+    engine.on_session_start(session_id, platform="weixin", model="test")
+
+    compacted = engine.compress(_messages(), current_tokens=900, memory_context="")
+    joined = "\n".join(str(m.get("content") or "") for m in compacted)
+
+    assert "Task board state:" in joined
+    assert "Gateway objective" in joined
+    assert "Drain the queue" in joined
