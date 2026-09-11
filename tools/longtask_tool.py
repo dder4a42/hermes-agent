@@ -205,7 +205,8 @@ def longtask_update_node_handler(args: Dict[str, Any], **kw) -> str:
             _root(parent, args.get("root")),
             sid,
             str(args.get("node_id") or ""),
-            status=args.get("status"),
+            resolution=args.get("resolution"),
+            blocked_reason=args.get("blocked_reason"),
             assigned_to=args.get("assigned_to"),
             claims=args.get("claims"),
             evidence=args.get("evidence"),
@@ -229,7 +230,7 @@ def longtask_attach_report_handler(args: Dict[str, Any], **kw) -> str:
             sid,
             str(args.get("node_id") or ""),
             report,
-            status=args.get("status"),
+            report_status=args.get("report_status"),
         )
         return _ok({"status": "ok", "session_id": sid, **data})
     except Exception as exc:
@@ -354,8 +355,9 @@ registry.register(
     schema={
         "name": "longtask_next",
         "description": (
-            "Return nodes whose dependencies are done and are ready to execute. "
-            "Use this before delegating work to subagents."
+            "Return the ready frontier: items whose dependencies are resolved "
+            "and that are open, plus the items still waiting and what they wait "
+            "on. Use this before delegating work to subagents."
         ),
         "parameters": {
             "type": "object",
@@ -375,25 +377,28 @@ registry.register(
     schema={
         "name": "longtask_update_node",
         "description": (
-            "Update a task-board node. Status transitions and dependencies are "
-            "validated by Hermes."
+            "Update a task-board item's resolution (open | in_progress | "
+            "resolved | cancelled), its blocker, or its claims/evidence. "
+            "`resolved` asserts the result was returned AND sufficiently "
+            "checked; with longtask.require_verification_before_unlock it "
+            "requires an accepted verdict first. Execution status is "
+            "runtime-owned and cannot be set here."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "node_id": {"type": "string"},
-                "status": {
+                "resolution": {
                     "type": "string",
-                    "enum": [
-                        "pending",
-                        "ready",
-                        "running",
-                        "blocked",
-                        "done",
-                        "failed",
-                        "timeout",
-                        "cancelled",
-                    ],
+                    "enum": ["open", "in_progress", "resolved", "cancelled"],
+                },
+                "blocked_reason": {
+                    "type": "string",
+                    "description": (
+                        "Set when the item is waiting on something outside your "
+                        "control (a human decision, a missing credential). Keeps "
+                        "the item open but out of the ready frontier."
+                    ),
                 },
                 "assigned_to": {"type": "string"},
                 "claims": {"type": "array", "items": {"type": "object"}},
@@ -414,17 +419,24 @@ registry.register(
     schema={
         "name": "longtask_attach_report",
         "description": (
-            "Attach a structured subagent report to a node. Full report is "
-            "persisted to disk and a bounded preview is kept on the board."
+            "Attach a structured subagent report to a board item. The full "
+            "report is persisted to disk and a bounded preview stays on the "
+            "board. Attaching records the report and marks the execution as "
+            "reported — it does NOT resolve the item: resolve it explicitly "
+            "after longtask_verify_node."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "node_id": {"type": "string"},
                 "report": {"type": "object"},
-                "status": {
+                "report_status": {
                     "type": "string",
-                    "enum": ["done", "failed", "timeout", "blocked"],
+                    "description": (
+                        "Optional advisory label from the child "
+                        "(success|partial|failed|timeout). Recorded for the "
+                        "reader; it never advances the item's resolution."
+                    ),
                 },
                 **_COMMON_OPTIONAL,
             },

@@ -46,27 +46,35 @@ the source of truth.
 The division of labour is enforced by the host, not by convention:
 
 - Subagents never receive the `longtask_*` board tools. They execute one bounded
-  node and return a claim-evidence report; the main agent attaches and verifies
+  item and return a claim-evidence report; the main agent attaches and verifies
   it. Do not try to make a child update the board.
-- Attach the child's report with `longtask_attach_report`, verify it with
-  `longtask_verify_node`, and only then move the node to `done` with
-  `longtask_update_node`. A node's dependents unlock when it is `done`, so a
-  terminal status without a verification result unlocks downstream work on an
-  unverified claim.
+- Two state axes, two owners. `execution` (none | queued | running | reported |
+  failed | timeout | cancelled) is the runtime's record of a dispatched run and
+  is not yours to set. `resolution` (open | in_progress | resolved | cancelled)
+  is your judgement, moved with `longtask_update_node`.
+- **Attaching a report does not resolve the item.** `longtask_attach_report`
+  records the child's report and marks the execution reported; the item stays
+  open. A child's `status: success` is a claim, not a verdict.
+- `resolved` means the result is back AND sufficiently checked. With
+  `longtask.require_verification_before_unlock` enabled, an accepted verdict from
+  `longtask_verify_node` is required first. Dependents unlock on `resolved`, so
+  resolving on a missing or rejected verdict carries downstream work forward on
+  an unverified claim.
 
 For complex work:
 
 1. Create or read a longtask board.
-2. Represent the work as a DAG of small nodes with explicit dependencies.
-3. Use `longtask_next` to select ready nodes in dependency order.
-4. Delegate ready nodes with `delegate_task` — pass the report schema below as
+2. Represent the work as a DAG of small items with explicit dependencies.
+3. Use `longtask_next` to select ready items in dependency order.
+4. Delegate ready items with `delegate_task` — pass the report schema below as
    `output_schema` so the child returns structured JSON.
 5. Require each subagent to return a claim-evidence report.
 6. Attach reports to the board with `longtask_attach_report`.
 7. Verify reports with `longtask_verify_node`.
-8. Update node status with `longtask_update_node`.
-9. Continue until all terminal nodes are done, failed, timeout, cancelled, or
-   explicitly blocked on user input.
+8. Move the item to `resolved` with `longtask_update_node` once the verdict
+   supports it.
+9. Continue until every item is resolved or cancelled, or explicitly blocked on
+   user input.
 
 ## Complexity Heuristic
 
@@ -122,11 +130,15 @@ Ask subagents to finish with JSON-compatible content in this shape:
 Timeouts and failures still need a report. The report should say what was
 attempted, what evidence was collected, and what remains uncertain.
 
+The `status` field is the child's own label. It is recorded as advisory
+(`report_status`) and never resolves the item — resolution is your explicit call
+after verification.
+
 ## Main-Agent Discipline
 
 - Keep the user's current objective and constraints in the board.
 - Prefer board state over memory of the conversation when they conflict.
-- Do not mark a node done without concrete evidence or an explicit user
+- Do not resolve an item without concrete evidence or an explicit user
   decision.
 - Do not unlock downstream work until the upstream report has a verification
   result.

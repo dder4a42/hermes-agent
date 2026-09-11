@@ -1,8 +1,9 @@
 """Durable task board for long-horizon orchestration.
 
 The board is intentionally small, JSON-backed, and inspectable. It gives the
-main agent a stable DAG state outside the model context: nodes, dependencies,
-status, reports, and verification summaries.
+main agent a stable DAG state outside the model context: items, dependencies,
+two separate state axes (runtime-owned ``execution`` and agent-owned
+``resolution``), attached reports, and verification summaries.
 """
 
 from __future__ import annotations
@@ -20,95 +21,151 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 from utils import atomic_json_write
 
 
-VALID_STATUSES = {
-    "pending",
-    "ready",
+# ---------------------------------------------------------------------------
+# Two axes: execution (runtime-owned) and resolution (agent-owned)
+# ---------------------------------------------------------------------------
+# Split deliberately, per AgentOS: "The coordinator owns these semantic fields,
+# while the runtime owns the status of each dispatched execution. This separation
+# prevents a Task Board update from overwriting the state of a live asynchronous
+# job" (arXiv 2608.23283 §3.3.2). A single conflated `status` could not express
+# the difference between "a child said success" and "the result is back AND
+# sufficiently checked, so the item is closed" — and it let a report arriving
+# from a child advance the plan by itself.
+#
+#   execution  — facts about a dispatched run. Written by the HOST only
+#                (never exposed on the tool schema).
+#   resolution — the coordinator's semantic judgement. Written by the AGENT.
+#                `resolved` means "the requested result has been returned and
+#                sufficiently checked", not "a process exited" (§3.3.2).
+VALID_EXECUTION = {
+    "none",
+    "queued",
     "running",
-    "blocked",
-    "done",
+    "reported",
     "failed",
     "timeout",
     "cancelled",
 }
 
-TERMINAL_STATUSES = {"done", "failed", "timeout", "cancelled"}
+VALID_RESOLUTION = {"open", "in_progress", "resolved", "cancelled"}
 
-ALLOWED_TRANSITIONS = {
-    "pending": {
-        "pending",
-        "ready",
-        "running",
-        "blocked",
-        "done",
-        "failed",
-        "timeout",
-        "cancelled",
-    },
-    "ready": {"ready", "running", "blocked", "cancelled"},
-    "running": {"running", "done", "failed", "timeout", "blocked", "cancelled"},
-    "blocked": {"blocked", "pending", "ready", "running", "cancelled"},
-    "done": {"done"},
-    "failed": {"failed", "pending", "ready", "cancelled"},
-    "timeout": {"timeout", "pending", "ready", "cancelled"},
+ALLOWED_RESOLUTION_TRANSITIONS = {
+    "open": {"open", "in_progress", "resolved", "cancelled"},
+    "in_progress": {"in_progress", "open", "resolved", "cancelled"},
+    # Reopening is deliberate: a superseded premise must be able to invalidate
+    # its descendants, and that starts by reopening the item it rested on.
+    "resolved": {"resolved", "open"},
     "cancelled": {"cancelled"},
 }
+
+# Legacy single-axis statuses. Migrated on load and accepted on write, so boards
+# written before the split (and models still saying "done") keep working.
+_LEGACY_STATUS_MIGRATION = {
+    "pending": ("none", "open"),
+    "ready": ("none", "open"),
+    "running": ("running", "in_progress"),
+    "blocked": ("none", "open"),
+    "done": ("reported", "resolved"),
+    "failed": ("failed", "open"),
+    "timeout": ("timeout", "open"),
+    "cancelled": ("cancelled", "cancelled"),
+}
+LEGACY_STATUSES = frozenset(_LEGACY_STATUS_MIGRATION)
+
+# A child's own words about its result. ADVISORY ONLY: it is recorded for the
+# reader and never advances `resolution` — that is what a verdict plus an
+# explicit `resolved` are for. Synonyms are normalised so the same outcome in
+# different words compares equal; anything unrecognised is kept verbatim rather
+# than rejected, because a report label is data, not a state transition.
+REPORT_STATUS_ALIASES = {
+    "success": "success",
+    "succeeded": "success",
+    "ok": "success",
+    "complete": "success",
+    "completed": "success",
+    "done": "success",
+    "partial": "partial",
+    "needs_followup": "partial",
+    "needs-followup": "partial",
+    "incomplete": "partial",
+    "error": "failed",
+    "failure": "failed",
+    "failed": "failed",
+    "timed_out": "timeout",
+    "timeout": "timeout",
+    "canceled": "cancelled",
+    "cancelled": "cancelled",
+}
+VALID_REPORT_STATUSES = frozenset(
+    {"success", "partial", "failed", "timeout", "cancelled", "unknown"}
+)
+
+
+def normalize_execution(value: Any) -> str:
+    execution = str(value or "none").strip().lower()
+    if execution not in VALID_EXECUTION:
+        raise LongtaskBoardError(
+            f"Invalid execution: {execution}. Expected one of {sorted(VALID_EXECUTION)}"
+        )
+    return execution
+
+
+def normalize_resolution(value: Any) -> str:
+    resolution = str(value or "open").strip().lower()
+    if resolution in VALID_RESOLUTION:
+        return resolution
+    legacy = _LEGACY_STATUS_MIGRATION.get(resolution)
+    if legacy:
+        return legacy[1]
+    raise LongtaskBoardError(
+        f"Invalid resolution: {resolution}. Expected one of {sorted(VALID_RESOLUTION)}"
+    )
+
+
+def normalize_report_status(value: Any) -> str:
+    """Normalise a child's self-reported status. Advisory; never a board state."""
+    status = str(value or "").strip().lower()
+    if not status:
+        return "unknown"
+    if status in VALID_REPORT_STATUSES:
+        return status
+    mapped = REPORT_STATUS_ALIASES.get(status)
+    if mapped:
+        return mapped
+    return status[:40]
+
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _REPORT_PREVIEW_CHARS = 1200
 
 
-# ---------------------------------------------------------------------------
-# Report status vocabulary
-# ---------------------------------------------------------------------------
-# Children are asked for the SKILL.md report vocabulary
-# (success|partial|failed|timeout); the board tracks lifecycle
-# (pending|ready|running|blocked|done|failed|timeout|cancelled). These are two
-# different vocabularies on purpose, and the attach path used to hand the
-# report's own status straight to _normalize_status — so a parent following the
-# documented protocol died on the first attach ("Invalid status: success").
-# Translate instead of rejecting; unknown values still fail loudly.
-REPORT_STATUS_ALIASES = {
-    "success": "done",
-    "succeeded": "done",
-    "ok": "done",
-    "complete": "done",
-    "completed": "done",
-    # "partial" is not done and not failed: map to the non-terminal status that
-    # can be re-queued (blocked -> pending/ready/running are legal transitions),
-    # so a follow-up run can pick the node back up without a manual reset.
-    "partial": "blocked",
-    "needs_followup": "blocked",
-    "needs-followup": "blocked",
-    "incomplete": "blocked",
-    "error": "failed",
-    "failure": "failed",
-    "timed_out": "timeout",
-    "canceled": "cancelled",
-}
+def _resolution_blocked_by_gate(node: Dict[str, Any], new_resolution: str) -> Optional[str]:
+    """Reason a resolution transition is refused, or ``None`` when allowed.
 
-# Terminal statuses a node may only reach once its report has been verified —
-# gated by ``longtask.require_verification_before_unlock`` (default off; see
-# _require_verification).
-_VERIFIED_TERMINAL_STATUSES = {"done"}
-
-
-def normalize_report_status(value: Any) -> str:
-    """Map a report/child status onto a board status.
-
-    Accepts board statuses verbatim and translates the report aliases above.
-    Raises ``LongtaskBoardError`` for anything else, naming both vocabularies so
-    the model can self-correct in one turn.
+    Only ``resolved`` is gated, and only when
+    ``longtask.require_verification_before_unlock`` is on: `resolved` claims the
+    result was returned AND sufficiently checked, so a recorded verdict is the
+    evidence for that claim — a missing or non-accepted verdict is a refusal,
+    not a warning.
     """
-    status = str(value or "").strip().lower()
-    if status in VALID_STATUSES:
-        return status
-    mapped = REPORT_STATUS_ALIASES.get(status)
-    if mapped:
-        return mapped
-    raise LongtaskBoardError(
-        f"Invalid status: {status}. Board statuses: {sorted(VALID_STATUSES)}; "
-        f"report statuses: {sorted(REPORT_STATUS_ALIASES)}"
-    )
+    if new_resolution != "resolved":
+        return None
+    if not _require_verification():
+        return None
+    verification = node.get("verification")
+    if not isinstance(verification, dict):
+        return (
+            "no verification result yet; run longtask_verify_node first "
+            "(longtask.require_verification_before_unlock)"
+        )
+    verdict = str(verification.get("verdict") or "").strip().lower()
+    if verdict != "accepted":
+        return (
+            f"verification verdict is {verdict or 'missing'!r}, not 'accepted' — "
+            "resolve the contested claims first"
+        )
+    return None
+
 
 
 def _require_verification() -> bool:
@@ -318,13 +375,32 @@ def _next_ready_nodes_locked(
         "task_id": board["task_id"],
         "objective": board["objective"],
         "ready": ready,
-        "blocked": [
-            _public_node(n)
-            for n in board["nodes"]
-            if n["status"] in {"pending", "blocked"}
-            and not _dependencies_done(board, n)
-        ],
+        "blocked": _blocked_nodes(board, ready),
     }
+
+
+def _blocked_nodes(
+    board: Dict[str, Any], ready: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Open items that are not ready, each with the reason it is waiting.
+
+    The reason matters more than the label: a model that sees only "blocked" will
+    guess, whereas "blocked_by: [N2]" tells it exactly which upstream item to
+    resolve (or which external decision to chase).
+    """
+    ready_ids = {node["node_id"] for node in ready}
+    blocked = []
+    for node in board["nodes"]:
+        if node["resolution"] != "open" or node["node_id"] in ready_ids:
+            continue
+        entry = _public_node(node)
+        waiting = _unresolved_dependencies(board, node)
+        if waiting:
+            entry["blocked_by"] = waiting
+        elif node.get("blocked_reason"):
+            entry["blocked_by"] = [node["blocked_reason"]]
+        blocked.append(entry)
+    return blocked
 
 
 def update_node(
@@ -332,7 +408,9 @@ def update_node(
     session_id: str,
     node_id: str,
     *,
-    status: Optional[str] = None,
+    resolution: Optional[str] = None,
+    execution: Optional[str] = None,
+    blocked_reason: Optional[str] = None,
     assigned_to: Optional[str] = None,
     claims: Optional[List[Dict[str, Any]]] = None,
     evidence: Optional[List[Dict[str, Any]]] = None,
@@ -344,7 +422,9 @@ def update_node(
             root,
             session_id,
             node_id,
-            status=status,
+            resolution=resolution,
+            execution=execution,
+            blocked_reason=blocked_reason,
             assigned_to=assigned_to,
             claims=claims,
             evidence=evidence,
@@ -358,7 +438,9 @@ def _update_node_locked(
     session_id: str,
     node_id: str,
     *,
-    status: Optional[str] = None,
+    resolution: Optional[str] = None,
+    execution: Optional[str] = None,
+    blocked_reason: Optional[str] = None,
     assigned_to: Optional[str] = None,
     claims: Optional[List[Dict[str, Any]]] = None,
     evidence: Optional[List[Dict[str, Any]]] = None,
@@ -367,28 +449,31 @@ def _update_node_locked(
 ) -> Dict[str, Any]:
     board = load_board(root, session_id)
     node = _node_by_id(board, node_id)
-    if status is not None:
-        new_status = _normalize_status(status)
-        old_status = node["status"]
-        if new_status not in ALLOWED_TRANSITIONS.get(old_status, set()):
+    if resolution is not None:
+        new_resolution = normalize_resolution(resolution)
+        old_resolution = node["resolution"]
+        if new_resolution not in ALLOWED_RESOLUTION_TRANSITIONS.get(old_resolution, set()):
             raise LongtaskBoardError(
-                f"Invalid node transition {node_id}: {old_status} -> {new_status}"
+                f"Invalid resolution transition {node_id}: "
+                f"{old_resolution} -> {new_resolution}"
             )
-        if new_status in {"ready", "running", "done"} and not _dependencies_done(board, node):
+        if new_resolution == "resolved" and not _dependencies_resolved(board, node):
             raise LongtaskBoardError(
-                f"Node {node_id} cannot become {new_status}; dependencies are not done"
+                f"Node {node_id} cannot be resolved; dependencies are not resolved"
             )
-        if (
-            new_status in _VERIFIED_TERMINAL_STATUSES
-            and _require_verification()
-            and not node.get("verification")
-        ):
+        gate_reason = _resolution_blocked_by_gate(node, new_resolution)
+        if gate_reason:
             raise LongtaskBoardError(
-                f"Node {node_id} cannot become {new_status} before it has a "
-                "verification result; call longtask_verify_node first "
-                "(enable/disable with longtask.require_verification_before_unlock)"
+                f"Node {node_id} cannot be resolved: {gate_reason}"
             )
-        node["status"] = new_status
+        node["resolution"] = new_resolution
+    if execution is not None:
+        # Runtime-owned axis. Exposed on the Python API for the host (and for
+        # tests), deliberately NOT on the tool schema: a model must not declare
+        # the status of a dispatched execution.
+        node["execution"] = normalize_execution(execution)
+    if blocked_reason is not None:
+        node["blocked_reason"] = str(blocked_reason).strip() or None
     if assigned_to is not None:
         node["assigned_to"] = str(assigned_to).strip() or None
     if claims is not None:
@@ -411,11 +496,11 @@ def attach_report(
     node_id: str,
     report: Dict[str, Any],
     *,
-    status: Optional[str] = None,
+    report_status: Optional[str] = None,
 ) -> Dict[str, Any]:
     with board_lock(root, session_id):
         return _attach_report_locked(
-            root, session_id, node_id, report, status=status
+            root, session_id, node_id, report, report_status=report_status
         )
 
 
@@ -425,7 +510,7 @@ def _attach_report_locked(
     node_id: str,
     report: Dict[str, Any],
     *,
-    status: Optional[str] = None,
+    report_status: Optional[str] = None,
 ) -> Dict[str, Any]:
     board = load_board(root, session_id)
     node = _node_by_id(board, node_id)
@@ -443,33 +528,15 @@ def _attach_report_locked(
         node["claims"] = _normalize_list_of_dicts(report_data["claims"], "claims")
     if isinstance(report_data.get("evidence"), list):
         node["evidence"] = _normalize_list_of_dicts(report_data["evidence"], "evidence")
-    requested_status = status or report_data.get("status")
-    if requested_status:
-        # The child reports with the SKILL.md vocabulary; translate it onto the
-        # board's lifecycle instead of rejecting it.
-        new_status = normalize_report_status(requested_status)
-        node["report_status"] = new_status
-        if (
-            new_status in _VERIFIED_TERMINAL_STATUSES
-            and _require_verification()
-            and not node.get("verification")
-        ):
-            # The report itself is persisted (re-attaching is idempotent), but
-            # the terminal transition is refused: a child's self-report is a
-            # claim, not a verdict.
-            node["updated_at"] = _now()
-            _refresh_ready_nodes(board)
-            save_board(root, session_id, board)
-            raise LongtaskBoardError(
-                f"Node {node_id}: report recorded, but {new_status!r} needs a "
-                "verification result first. Call longtask_verify_node, then "
-                "longtask_update_node(status='done')."
-            )
-        if new_status not in ALLOWED_TRANSITIONS.get(node["status"], set()):
-            raise LongtaskBoardError(
-                f"Invalid node transition {node_id}: {node['status']} -> {new_status}"
-            )
-        node["status"] = new_status
+    # The child's own label is recorded for the reader and NEVER advances
+    # `resolution`. AgentOS: "A subagent execution may be reported while its item
+    # remains open because the report is incomplete, contradicted, or awaiting
+    # verification" (§3.3.2). Resolving is a separate, explicit act with its own
+    # evidence (a verdict).
+    node["report_status"] = normalize_report_status(
+        report_status if report_status is not None else report_data.get("status")
+    )
+    node["execution"] = "reported"
     node["updated_at"] = _now()
     _refresh_ready_nodes(board)
     save_board(root, session_id, board)
@@ -482,14 +549,11 @@ def _attach_report_locked(
 
 def compute_ready_nodes(board: Dict[str, Any]) -> List[Dict[str, Any]]:
     normalized = _normalize_board(board)
-    ready = []
-    for node in _topological_nodes(normalized):
-        if node["status"] in {"done", "running", "cancelled"}:
-            continue
-        if _dependencies_done(normalized, node):
-            if node["status"] in {"pending", "ready", "failed", "timeout"}:
-                ready.append(_public_node({**node, "status": "ready"}))
-    return ready
+    return [
+        _public_node({**node, "ready": True})
+        for node in _topological_nodes(normalized)
+        if _is_ready(normalized, node)
+    ]
 
 
 def _normalize_board(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -528,11 +592,15 @@ def _normalize_nodes(nodes: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             raise LongtaskBoardError(f"Duplicate node_id: {node_id}")
         seen.add(node_id)
         deps = [safe_id(str(dep)) for dep in raw.get("dependencies", raw.get("deps", [])) or []]
+        execution, resolution = _resolve_axes(raw)
+        blocked_reason = raw.get("blocked_reason")
         node = {
             "node_id": node_id,
             "goal": str(raw.get("goal") or "").strip(),
             "dependencies": deps,
-            "status": _normalize_status(raw.get("status") or "pending"),
+            "execution": execution,
+            "resolution": resolution,
+            "blocked_reason": (str(blocked_reason).strip() or None) if blocked_reason else None,
             "assigned_to": raw.get("assigned_to"),
             "claims": _normalize_list_of_dicts(raw.get("claims") or [], "claims"),
             "evidence": _normalize_list_of_dicts(raw.get("evidence") or [], "evidence"),
@@ -559,11 +627,36 @@ def _normalize_nodes(nodes: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _normalize_status(value: Any) -> str:
-    status = str(value or "pending").strip().lower()
-    if status not in VALID_STATUSES:
-        raise LongtaskBoardError(f"Invalid status: {status}")
-    return status
+def _resolve_axes(raw: Dict[str, Any]) -> tuple[str, str]:
+    """Return ``(execution, resolution)`` for a raw node.
+
+    Boards written before the split carry a single ``status``; migrate it so an
+    on-disk board keeps loading instead of needing a rewrite. Both new keys win
+    when present, so a partially migrated node is read as written.
+    """
+    has_execution = raw.get("execution") is not None
+    has_resolution = raw.get("resolution") is not None
+    if has_execution or has_resolution:
+        execution = (
+            normalize_execution(raw.get("execution")) if has_execution else "none"
+        )
+        resolution = (
+            normalize_resolution(raw.get("resolution")) if has_resolution else "open"
+        )
+        return execution, resolution
+    legacy = str(raw.get("status") or "pending").strip().lower()
+    migrated = _LEGACY_STATUS_MIGRATION.get(legacy)
+    if migrated is None:
+        raise LongtaskBoardError(
+            f"Invalid status: {legacy}. Expected a legacy status "
+            f"{sorted(LEGACY_STATUSES)} or execution/resolution"
+        )
+    execution, resolution = migrated
+    # A legacy `done` only becomes `reported` if a report actually exists;
+    # otherwise the item was closed without one.
+    if execution == "reported" and not raw.get("report_path"):
+        execution = "none"
+    return execution, resolution
 
 
 def _normalize_list_of_dicts(value: Any, name: str) -> List[Dict[str, Any]]:
@@ -591,25 +684,39 @@ def _node_by_id(board: Dict[str, Any], node_id: str) -> Dict[str, Any]:
     raise LongtaskBoardError(f"Unknown node_id: {node_id}")
 
 
-def _dependencies_done(board: Dict[str, Any], node: Dict[str, Any]) -> bool:
+def _unresolved_dependencies(board: Dict[str, Any], node: Dict[str, Any]) -> List[str]:
     nodes = {n["node_id"]: n for n in board["nodes"]}
-    return all(nodes[dep]["status"] == "done" for dep in node.get("dependencies", []))
+    return [
+        dep for dep in node.get("dependencies", []) if nodes[dep]["resolution"] != "resolved"
+    ]
+
+
+def _dependencies_resolved(board: Dict[str, Any], node: Dict[str, Any]) -> bool:
+    return not _unresolved_dependencies(board, node)
+
+
+def _is_ready(board: Dict[str, Any], node: Dict[str, Any]) -> bool:
+    """True when an item may be dispatched now.
+
+    Readiness is DERIVED, never stored: an item is ready while it is ``open``, is
+    not parked on an external decision, and every dependency is ``resolved``.
+    This replaces the old ``status == "ready"`` fiction, where a stored state had
+    to be kept in sync with the DAG by hand.
+    """
+    if node["resolution"] != "open":
+        return False
+    if node.get("blocked_reason"):
+        return False
+    return _dependencies_resolved(board, node)
 
 
 def _refresh_ready_nodes(board: Dict[str, Any]) -> None:
     board.setdefault("global_state", {})
-    ready_ids = [node["node_id"] for node in compute_ready_nodes_no_normalize(board)]
-    board["global_state"]["next_ready"] = ready_ids
-
-
-def compute_ready_nodes_no_normalize(board: Dict[str, Any]) -> List[Dict[str, Any]]:
-    ready = []
-    for node in _topological_nodes_no_validate(board):
-        if node["status"] in {"done", "running", "cancelled", "blocked"}:
-            continue
-        if _dependencies_done(board, node):
-            ready.append(_public_node({**node, "status": "ready"}))
-    return ready
+    board["global_state"]["next_ready"] = [
+        node["node_id"]
+        for node in _topological_nodes_no_validate(board)
+        if _is_ready(board, node)
+    ]
 
 
 def _topological_nodes(board: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -649,7 +756,10 @@ def _public_node(node: Dict[str, Any]) -> Dict[str, Any]:
         "node_id",
         "goal",
         "dependencies",
-        "status",
+        "execution",
+        "resolution",
+        "blocked_reason",
+        "ready",
         "assigned_to",
         "claims",
         "evidence",

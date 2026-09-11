@@ -159,7 +159,8 @@ class LongHorizonContextEngine(ContextEngine):
         board = self._load_task_board()
         if not board:
             return ""
-        nodes = board.get("nodes") if isinstance(board.get("nodes"), list) else []
+        raw_nodes = board.get("nodes")
+        nodes: List[Dict[str, Any]] = raw_nodes if isinstance(raw_nodes, list) else []
         global_state = (
             board.get("global_state")
             if isinstance(board.get("global_state"), dict)
@@ -169,33 +170,40 @@ class LongHorizonContextEngine(ContextEngine):
         for node in nodes:
             if not isinstance(node, dict):
                 continue
-            status = str(node.get("status") or "unknown")
-            counts[status] = counts.get(status, 0) + 1
+            key = self._node_resolution(node)
+            counts[key] = counts.get(key, 0) + 1
 
         ready = self._node_lines(
-            [n for n in nodes if self._node_status(n) in {"ready", "pending"}],
+            [n for n in nodes if self._node_is_ready(n, nodes)],
             limit=6,
-            require_ready=True,
-            all_nodes=nodes,
         )
-        running = self._node_lines(
-            [n for n in nodes if self._node_status(n) == "running"],
+        active = self._node_lines(
+            [n for n in nodes if self._node_resolution(n) == "in_progress"],
             limit=4,
         )
-        blocked = self._node_lines(
-            [n for n in nodes if self._node_status(n) == "blocked"],
+        parked = self._node_lines(
+            [n for n in nodes if isinstance(n, dict) and n.get("blocked_reason")],
             limit=4,
         )
-        terminal = self._node_lines(
-            [n for n in nodes if self._node_status(n) in {"done", "failed", "timeout"}],
+        resolved = self._node_lines(
+            [n for n in nodes if self._node_resolution(n) == "resolved"],
             limit=6,
             include_verification=True,
+        )
+        failed_exec = self._node_lines(
+            [
+                n
+                for n in nodes
+                if self._node_execution(n) in {"failed", "timeout"}
+                and self._node_resolution(n) == "open"
+            ],
+            limit=4,
         )
 
         lines = [
             f"task_id: {board.get('task_id') or 'unknown'}",
             f"objective: {str(board.get('objective') or '').strip()[:700]}",
-            "status_counts: "
+            "resolution_counts: "
             + ", ".join(f"{key}={counts[key]}" for key in sorted(counts)),
         ]
         for key in ("decisions", "constraints", "open_questions"):
@@ -207,15 +215,18 @@ class LongHorizonContextEngine(ContextEngine):
         if ready:
             lines.append("ready_frontier:")
             lines.extend(ready)
-        if running:
-            lines.append("running:")
-            lines.extend(running)
-        if blocked:
-            lines.append("blocked:")
-            lines.extend(blocked)
-        if terminal:
-            lines.append("recent_terminal:")
-            lines.extend(terminal)
+        if active:
+            lines.append("in_progress:")
+            lines.extend(active)
+        if parked:
+            lines.append("waiting_on_decision:")
+            lines.extend(parked)
+        if resolved:
+            lines.append("resolved:")
+            lines.extend(resolved)
+        if failed_exec:
+            lines.append("failed_executions (still open, retryable):")
+            lines.extend(failed_exec)
         return "\n".join(lines)[:6000]
 
     def _load_task_board(self) -> Dict[str, Any]:
@@ -266,26 +277,27 @@ class LongHorizonContextEngine(ContextEngine):
                 roots.append(root)
         return roots
 
-    def _node_status(self, node: Any) -> str:
-        return str(node.get("status") or "unknown") if isinstance(node, dict) else "unknown"
+    def _node_resolution(self, node: Any) -> str:
+        return str(node.get("resolution") or "open") if isinstance(node, dict) else "open"
+
+    def _node_execution(self, node: Any) -> str:
+        return str(node.get("execution") or "none") if isinstance(node, dict) else "none"
 
     def _node_lines(
         self,
         nodes: List[Dict[str, Any]],
         *,
         limit: int,
-        require_ready: bool = False,
-        all_nodes: List[Dict[str, Any]] | None = None,
         include_verification: bool = False,
     ) -> List[str]:
         out = []
         for node in nodes:
-            if require_ready and not self._dependencies_done(node, all_nodes or []):
-                continue
             goal = str(node.get("goal") or "").strip().replace("\n", " ")[:280]
             deps = ",".join(str(dep) for dep in node.get("dependencies") or [])
             line = (
-                f"- {node.get('node_id')} status={node.get('status')} "
+                f"- {node.get('node_id')} "
+                f"resolution={self._node_resolution(node)} "
+                f"execution={self._node_execution(node)} "
                 f"deps=[{deps}] goal={goal}"
             )
             if include_verification and isinstance(node.get("verification"), dict):
@@ -305,20 +317,28 @@ class LongHorizonContextEngine(ContextEngine):
                 break
         return out
 
-    def _dependencies_done(
-        self,
-        node: Dict[str, Any],
-        all_nodes: List[Dict[str, Any]],
-    ) -> bool:
-        deps = set(str(dep) for dep in node.get("dependencies") or [])
+    def _node_is_ready(self, node: Any, all_nodes: List[Dict[str, Any]]) -> bool:
+        """Mirror the board's readiness derivation on the rendered snapshot.
+
+        Readiness is derived from ``resolution`` (plus the blocker flag), exactly
+        as ``agent.longtask_board._is_ready`` does — the handoff must never claim
+        a different frontier than the board itself would report.
+        """
+        if not isinstance(node, dict):
+            return False
+        if self._node_resolution(node) != "open":
+            return False
+        if node.get("blocked_reason"):
+            return False
+        deps = [str(dep) for dep in node.get("dependencies") or []]
         if not deps:
             return True
-        status_by_id = {
-            str(item.get("node_id")): str(item.get("status") or "")
+        resolution_by_id = {
+            str(item.get("node_id")): self._node_resolution(item)
             for item in all_nodes
             if isinstance(item, dict)
         }
-        return all(status_by_id.get(dep) == "done" for dep in deps)
+        return all(resolution_by_id.get(dep) == "resolved" for dep in deps)
 
     def _bounded_list(self, values: Any, *, limit: int) -> List[str]:
         if not isinstance(values, list):

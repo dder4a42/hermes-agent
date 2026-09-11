@@ -512,27 +512,34 @@ LONGTASK_GUIDANCE_HEAD = (
     "When a request spans many steps, has dependencies between them, or may "
     "outlive this context window, keep the plan in the board instead of in "
     "your head:\n"
-    "1. `longtask_create` the board — global objective plus small nodes with "
+    "1. `longtask_create` the board — global objective plus small items with "
     "explicit dependencies — before executing, or `longtask_read` to resume an "
-    "existing one.\n"
-    "2. `longtask_next` to get the ready nodes in dependency order.\n"
+    "existing one. `longtask_update_node` moves an item's RESOLUTION "
+    "(open | in_progress | resolved | cancelled); execution status belongs to "
+    "the runtime, not to you.\n"
+    "2. `longtask_next` for the ready frontier — the items whose dependencies "
+    "are resolved.\n"
 )
 _LONGTASK_STEP_DELEGATE = (
-    "3. Delegate each ready node with `delegate_task`, passing the claim-evidence "
+    "3. Delegate a ready item with `delegate_task`, passing the claim-evidence "
     "report shape via `output_schema` so the child returns structured JSON "
     "rather than prose you have to re-type. Children do NOT hold the board "
-    "tools — the board is yours; you attach and verify their reports.\n"
+    "tools — the board is yours.\n"
 )
 # Fallback for a longtask-only session (delegation toolset disabled): naming
 # delegate_task there would be a dangling reference.
 _LONGTASK_STEP_SOLO = (
-    "3. Work each ready node yourself and record its claim-evidence report.\n"
+    "3. Work each ready item yourself and record its claim-evidence report.\n"
 )
 LONGTASK_GUIDANCE_TAIL = (
-    "4. `longtask_attach_report` the report, then `longtask_verify_node`.\n"
-    "5. `longtask_update_node` only with concrete evidence or an explicit user "
-    "decision — a node's dependents unlock once it is `done`, so never mark a "
-    "node done before its report has a verification result.\n"
+    "4. `longtask_attach_report` the report, then `longtask_verify_node`. "
+    "Attaching only records the report and marks the execution reported — it "
+    "never resolves the item, because a child saying \"success\" is a claim, "
+    "not a verdict.\n"
+    "5. `longtask_update_node` to `resolved` only when the result is back AND "
+    "checked (with the verification gate on, an accepted verdict is required). "
+    "Dependents unlock on `resolved`, so resolving on a missing or rejected "
+    "verdict carries them forward on an unverified claim.\n"
     "Board state beats your memory of the conversation when they conflict; "
     "after compression the board is where you recover. For a simple one-shot "
     "request, answer directly — do not build a board for a single step."

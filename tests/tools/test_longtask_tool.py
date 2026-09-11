@@ -24,6 +24,8 @@ def _loads(result):
 
 
 def test_longtask_tool_minimal_flow(tmp_path):
+    """End-to-end through the tool surface: a report lands, but only an explicit
+    `resolved` — after the verdict — unlocks the dependent item."""
     common = {"root": str(tmp_path), "session_id": "s"}
 
     created = _loads(
@@ -45,9 +47,11 @@ def test_longtask_tool_minimal_flow(tmp_path):
     assert [node["node_id"] for node in first["ready"]] == ["N1"]
 
     updated = _loads(
-        longtask_update_node_handler({**common, "node_id": "N1", "status": "running"})
+        longtask_update_node_handler(
+            {**common, "node_id": "N1", "resolution": "in_progress"}
+        )
     )
-    assert updated["node"]["status"] == "running"
+    assert updated["node"]["resolution"] == "in_progress"
 
     attached = _loads(
         longtask_attach_report_handler(
@@ -55,16 +59,29 @@ def test_longtask_tool_minimal_flow(tmp_path):
                 **common,
                 "node_id": "N1",
                 "report": {
-                    "status": "done",
+                    "status": "success",
                     "claims": [{"claim": "Researched", "evidence": []}],
                 },
             }
         )
     )
-    assert attached["node"]["status"] == "done"
+    assert attached["node"]["execution"] == "reported"
+    assert attached["node"]["resolution"] == "in_progress"
 
     verify = _loads(longtask_verify_node_handler({**common, "node_id": "N1"}))
     assert verify["verification"]["verdict"] == "rejected"
+
+    # A rejected claim does not unlock downstream work: the item is still open.
+    after_rejection = _loads(longtask_next_handler(common))
+    assert after_rejection["ready"] == []
+    assert {n["node_id"]: n for n in after_rejection["blocked"]}["N2"]["blocked_by"] == [
+        "N1"
+    ]
+
+    resolved = _loads(
+        longtask_update_node_handler({**common, "node_id": "N1", "resolution": "resolved"})
+    )
+    assert resolved["node"]["resolution"] == "resolved"
 
     second = _loads(longtask_next_handler(common))
     assert [node["node_id"] for node in second["ready"]] == ["N2"]

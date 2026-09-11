@@ -62,7 +62,7 @@ def test_compress_includes_task_board_handoff(tmp_path, monkeypatch):
         root,
         session_id,
         "N1",
-        status="done",
+        resolution="resolved",
         claims=[{"claim": "Archive provider stores chunks"}],
         verification={
             "verdict": "accepted",
@@ -83,9 +83,10 @@ def test_compress_includes_task_board_handoff(tmp_path, monkeypatch):
     joined = "\n".join(str(m.get("content") or "") for m in compacted)
     assert "Task board state:" in joined
     assert "objective: Ship long-horizon compression" in joined
+    assert "resolution_counts:" in joined
     assert "ready_frontier:" in joined
     assert "N2" in joined
-    assert "recent_terminal:" in joined
+    assert "resolved:" in joined
     assert "verification=accepted" in joined
     assert "Archive provider stores chunks" in joined
 
