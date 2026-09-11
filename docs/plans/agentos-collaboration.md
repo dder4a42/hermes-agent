@@ -245,4 +245,30 @@ unconditionally; enrichment may be rationed only as an abort valve. And an
 unrecognized `provider` in auxiliary config must fail loudly rather than silently
 inheriting the main runtime with a substituted model (P8).
 
+**Incremental archiving (P9, shipped 2026-09-12).** Chunking is content-driven and
+the "needs summarizing?" decision is per *message*, not per chunk position:
+
+- `_message_hash` (role + text) addresses each message; `seen.json` caches the
+  per-chunk hash lists, so a pass only hashes chunks it has not hashed before
+  (measured on the live archive: 22 chunks → 134 hashes, 0.02s cold / 0.005s warm;
+  a removed chunk file drops its hashes, so the set self-heals).
+- Only runs of *unseen* messages are chunked (`_unseen_runs`). A compression
+  handoff replacing the transcript head no longer re-partitions the archive —
+  measured before: a 5-message head shift re-summarized 4/4 chunks; after: one
+  summary, for the 5 genuinely new messages.
+- Chunk boundaries close at a user turn once the soft limits are reached (hard
+  limits 1.5× messages / 1.25× chars bound the wait). That is a property of the
+  message sequence, so the same messages keep landing in the same chunk.
+- **Recaps are the baseline and the trigger for their own upgrade.** A chunk that
+  could not afford an LLM summary this pass is marked `summary_kind: recap`; the
+  next pass upgrades recap chunks newest-first (`_upgrade_recap_chunks`) inside
+  the same budget, so the summary list converges over successive compressions
+  instead of being recomputed.
+- The checkpoint manifest survives a no-op pass (it falls back to the newest index
+  entries) and now reports `archived_chunks` (total) plus `new_chunks_this_pass`.
+
+Tests: `tests/plugins/memory/test_session_archive_provider.py` (16 pass) —
+head-shift incrementality, recap upgrade on a later pass, turn-aligned boundaries.
+
+
 

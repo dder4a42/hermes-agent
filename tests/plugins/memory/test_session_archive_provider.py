@@ -362,3 +362,106 @@ def test_concurrency_one_serializes_without_losing_summaries(tmp_path, monkeypat
     assert calls["n"] == 6, "one summary per eligible chunk"
     assert len(index) == 6
     assert all(item["summary"] == "RECAP" for item in index)
+
+
+def test_head_shift_only_summarizes_genuinely_new_messages(tmp_path, monkeypatch):
+    """Incremental, not re-indexed.
+
+    Compression re-hands the whole transcript on every pass, and a successful
+    pass replaces the transcript's head with a handoff — which moves every
+    following message to a new index. Deciding "needs summarizing?" by chunk
+    position made that a full replay: measured, a 5-message head shift
+    re-summarized 100% of a 4-chunk archive. The decision is per *message*
+    (content hash), so a shift costs only what is genuinely new.
+    """
+    provider = SessionArchiveProvider()
+    provider.initialize("incremental-session", hermes_home=str(tmp_path))
+    provider._config = {"llm_summary": {"enabled": True, "max_tokens": 200}}
+    provider.max_messages_per_chunk = 5
+    calls = {"n": 0}
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", _summary_stub(calls))
+
+    def msgs(lo, hi):
+        return [{"role": "user", "content": f"message {i}"} for i in range(lo, hi)]
+
+    provider.on_pre_compress(msgs(0, 20))
+    assert calls["n"] == 4, "20 messages / 5 per chunk"
+
+    calls["n"] = 0
+    provider.on_pre_compress(msgs(0, 20))
+    assert calls["n"] == 0, "an unchanged transcript is already archived"
+
+    calls["n"] = 0
+    provider.on_pre_compress(msgs(5, 25))
+    assert calls["n"] == 1, "only the 5 unseen messages cost a summary"
+
+    calls["n"] = 0
+    provider.on_pre_compress(msgs(5, 25))
+    assert calls["n"] == 0, "and they stay archived"
+
+
+def test_recap_only_chunks_are_upgraded_on_a_later_pass(tmp_path, monkeypatch):
+    """The recap is the baseline; the LLM summary upgrades it incrementally.
+
+    A pass that runs out of budget still writes every chunk, marked
+    ``summary_kind: recap``. The next pass picks those up newest-first instead of
+    recomputing anything, so the archive converges on full LLM summaries over
+    successive compressions.
+    """
+    provider = SessionArchiveProvider()
+    provider.initialize("upgrade-session", hermes_home=str(tmp_path))
+    provider._config = {"llm_summary": {"enabled": True, "max_tokens": 200}}
+    provider.max_messages_per_chunk = 1
+    provider.max_llm_summaries_per_pass = 1
+    calls = {"n": 0}
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", _summary_stub(calls))
+
+    messages = [{"role": "user", "content": f"msg {i}"} for i in range(4)]
+    provider.on_pre_compress(messages)
+
+    def recap_count():
+        return sum(
+            1
+            for item in provider._read_index()
+            if str(item.get("summary_kind") or "llm") == "recap"
+        )
+
+    assert calls["n"] == 1, "the pass spends its single allowance on a chunk"
+    assert recap_count() == 3
+
+    calls["n"] = 0
+    provider.on_pre_compress(messages)
+    assert calls["n"] == 1, "no new material, so the pass upgrades a recap instead"
+    assert recap_count() == 2
+
+
+def test_chunk_boundaries_prefer_user_turns(tmp_path):
+    """Boundaries are content-driven: a chunk closes at a turn start.
+
+    The old split cut the instant a size limit was hit, which lands mid-turn and
+    (because the limits were evaluated from index 0) re-partitions everything the
+    moment the transcript's head changes. A turn-aligned boundary depends only on
+    the message sequence, with hard limits bounding how far the split waits.
+    """
+    provider = SessionArchiveProvider()
+    provider.initialize("boundary-session", hermes_home=str(tmp_path))
+    provider._config = {"llm_summary": {"enabled": False}}
+    provider.max_messages_per_chunk = 3
+
+    transcript = (
+        [{"role": "user", "content": "start"}]
+        + [{"role": "tool", "content": f"out {i}"} for i in range(3)]
+        + [{"role": "user", "content": "next"}]
+        + [{"role": "assistant", "content": "ok"}]
+    )
+    groups = provider._message_chunks(transcript)
+    assert groups[0][:2] == (0, 3), "the tight turn kept its tool results"
+    assert groups[1][0] == 4, "the next chunk starts at the user turn"
+
+    long_turn = (
+        [{"role": "user", "content": "start"}]
+        + [{"role": "tool", "content": f"out {i}"} for i in range(8)]
+        + [{"role": "user", "content": "next"}]
+    )
+    groups = provider._message_chunks(long_turn)
+    assert groups[0][1] < 8, "a hard limit still bounds the wait for a turn"

@@ -92,6 +92,29 @@ def _message_text(message: Dict[str, Any]) -> str:
     return "\n".join(part for part in parts if part)
 
 
+_RECAP_PREFIX = "Deterministic recap ("
+
+
+def _starts_new_turn(message: Dict[str, Any]) -> bool:
+    """Whether ``message`` opens a user turn — the preferred chunk boundary."""
+    return isinstance(message, dict) and str(message.get("role") or "") == "user"
+
+
+def _message_hash(message: Dict[str, Any]) -> str:
+    """Content address for one transcript message.
+
+    The archive decides what still needs summarizing by *message*, not by chunk
+    id. Chunk boundaries legitimately move when a compression handoff replaces
+    the transcript's head, and a position-keyed decision then re-summarizes
+    material that is already on disk.
+    """
+    if not isinstance(message, dict):
+        payload = repr(message)
+    else:
+        payload = f"{message.get('role') or ''}\0{_message_text(message)}"
+    return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:16]
+
+
 def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     try:
         parsed = int(value)
@@ -234,22 +257,28 @@ class SessionArchiveProvider(MemoryProvider):
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         chunks = self._write_checkpoint(messages, source="pre_compress")
-        if not chunks:
+        index = self._read_index()
+        if not chunks and not index:
             return ""
+        # A pass over already-archived material writes nothing new, but the next
+        # turn still needs the archive pointer — fall back to the newest entries
+        # so the checkpoint marker never disappears from the context.
+        listed = chunks or index[-12:]
         lines = [
             "[SESSION ARCHIVE CHECKPOINT]",
             f"provider: {self.name}",
             f"session_id: {self._session_id}",
-            f"archived_chunks: {len(chunks)}",
+            f"archived_chunks: {len(index)}",
+            f"new_chunks_this_pass: {len(chunks)}",
             "Use session_archive_search(query) and session_archive_expand(chunk_id) to recover raw pre-compression context.",
         ]
-        for chunk in chunks[:12]:
-            summary = chunk.get("summary") or chunk["preview"]
+        for chunk in listed[:12]:
+            summary = chunk.get("summary") or chunk.get("preview") or ""
             lines.append(
-                f"- {chunk['chunk_id']} messages={chunk['message_start']}-{chunk['message_end']} summary={summary}"
+                f"- {chunk.get('chunk_id')} messages={chunk.get('message_start')}-{chunk.get('message_end')} summary={summary}"
             )
-        if len(chunks) > 12:
-            lines.append(f"- ... {len(chunks) - 12} more chunks archived")
+        if len(listed) > 12:
+            lines.append(f"- ... {len(listed) - 12} more chunks archived")
         secondary = self._read_secondary_index()
         if secondary:
             lines.append(
@@ -356,21 +385,38 @@ class SessionArchiveProvider(MemoryProvider):
     def _message_chunks(
         self, messages: List[Dict[str, Any]]
     ) -> List[tuple[int, int, List[Dict[str, Any]]]]:
-        """Split a transcript into ``(start, end, messages)`` groups. No IO, no LLM."""
+        """Split a transcript into ``(start, end, messages)`` groups. No IO, no LLM.
+
+        Boundaries are content-driven, never index-driven: the split depends only
+        on the message sequence, and once the soft limits are reached a chunk is
+        only closed where a *user turn* starts (or where a hard limit forces it).
+        So the same messages keep landing in the same chunk when the transcript's
+        head is replaced by a compression handoff, and a chunk stops ending
+        mid-turn when the next user message is close by. Hard limits (1.5x
+        messages, 1.25x chars) bound how far a split will wait for a turn.
+        """
+        soft_messages = max(1, int(self.max_messages_per_chunk))
+        hard_messages = int(soft_messages * 1.5) + 1
+        soft_chars = max(1, int(self.max_chars_per_chunk))
+        hard_chars = int(soft_chars * 1.25) + 1
+
         groups: List[tuple[int, int, List[Dict[str, Any]]]] = []
         current: List[Dict[str, Any]] = []
         current_chars = 0
         start = 0
         for idx, message in enumerate(messages):
             text_len = len(_message_text(message))
-            if current and (
-                len(current) >= self.max_messages_per_chunk
-                or current_chars + text_len > self.max_chars_per_chunk
-            ):
-                groups.append((start, idx - 1, current))
-                current = []
-                current_chars = 0
-                start = idx
+            if current:
+                over_soft = len(current) >= soft_messages or current_chars >= soft_chars
+                over_hard = (
+                    len(current) >= hard_messages
+                    or current_chars + text_len > hard_chars
+                )
+                if over_hard or (over_soft and _starts_new_turn(message)):
+                    groups.append((start, idx - 1, current))
+                    current = []
+                    current_chars = 0
+                    start = idx
             current.append(dict(message))
             current_chars += text_len
         if current:
@@ -397,20 +443,148 @@ class SessionArchiveProvider(MemoryProvider):
         deadline = getattr(self, "_llm_summary_deadline", None)
         return deadline is not None and time.monotonic() >= deadline
 
+    def _seen_cache_path(self) -> Path:
+        return self._session_dir() / "seen.json"
+
+    def _archived_message_hashes(self) -> set:
+        """Message hashes the archive already holds, derived from its chunks.
+
+        ``seen.json`` caches the per-chunk hash lists so a pass only reads chunks
+        it has not hashed before; a chunk that moved or vanished falls back to a
+        fresh read, which keeps the answer honest if the archive is pruned.
+        """
+        cache = self._read_json(self._seen_cache_path())
+        if not isinstance(cache, dict):
+            cache = {}
+        archived: set = set()
+        refreshed: Dict[str, List[str]] = {}
+        changed = False
+        for entry in self._read_index():
+            chunk_id = str(entry.get("chunk_id") or "")
+            if not chunk_id:
+                continue
+            path = self._chunks_dir() / f"{_safe_id(chunk_id)}.json"
+            cached = cache.get(chunk_id)
+            if isinstance(cached, list) and path.exists():
+                hashes = [str(item) for item in cached]
+            else:
+                payload = self._read_json(path)
+                messages = payload.get("messages") if isinstance(payload, dict) else None
+                hashes = (
+                    [_message_hash(m) for m in messages if isinstance(m, dict)]
+                    if isinstance(messages, list)
+                    else []
+                )
+                changed = True
+            refreshed[chunk_id] = hashes
+            archived.update(hashes)
+        if len(refreshed) != len(cache):
+            changed = True
+        if changed:
+            try:
+                atomic_json_write(self._seen_cache_path(), refreshed, indent=2, mode=0o600)
+            except Exception:
+                logger.debug("session_archive: could not persist seen.json", exc_info=True)
+        return archived
+
+    def _unseen_runs(
+        self, messages: List[Dict[str, Any]], archived: set
+    ) -> List[tuple[int, int, List[Dict[str, Any]]]]:
+        """Contiguous runs of messages the archive has not stored yet."""
+        runs: List[tuple[int, int, List[Dict[str, Any]]]] = []
+        current: List[Dict[str, Any]] = []
+        start = 0
+        for idx, message in enumerate(messages):
+            if _message_hash(message) in archived:
+                if current:
+                    runs.append((start, idx - 1, current))
+                    current = []
+                start = idx + 1
+                continue
+            if not current:
+                start = idx
+            current.append(dict(message))
+        if current:
+            runs.append((start, len(messages) - 1, current))
+        return runs
+
+    def _upgrade_recap_chunks(self) -> int:
+        """Re-summarize chunks that only carry a deterministic recap.
+
+        The recap is the cheap baseline that always lands on disk; the LLM
+        summary is what upgrades it. Whatever the pass budget did not cover stays
+        marked ``summary_kind: recap`` in the index, so a later pass picks up
+        where this one stopped — the summary list fills in incrementally instead
+        of being recomputed, and the recap stage (below) then aggregates the
+        upgraded text.
+        """
+        if not self._summary_config().get("enabled"):
+            return 0
+        pending = [
+            entry
+            for entry in self._read_index()
+            if str(entry.get("summary_kind") or "llm") == "recap" and entry.get("chunk_id")
+        ]
+        if not pending:
+            return 0
+        upgraded: List[Dict[str, Any]] = []
+        for entry in reversed(pending):  # newest first — recency is what retrieval hits
+            if self._llm_summary_budget_exhausted():
+                break
+            chunk_id = str(entry["chunk_id"])
+            path = self._chunks_dir() / f"{_safe_id(chunk_id)}.json"
+            payload = self._read_json(path)
+            if not isinstance(payload, dict):
+                continue
+            messages = [
+                m for m in (payload.get("messages") or []) if isinstance(m, dict)
+            ]
+            if not messages:
+                continue
+            text = "\n\n".join(_message_text(m) for m in messages)
+            summary = self._summarize_chunk(text, messages=messages)
+            if summary.startswith(_RECAP_PREFIX):
+                continue  # still no LLM result: leave it for a later pass
+            payload["summary"] = summary
+            payload["summary_kind"] = "llm"
+            atomic_json_write(path, payload, indent=2, mode=0o600)
+            upgraded.append(
+                self._chunk_entry(
+                    chunk_id,
+                    entry.get("message_start"),
+                    entry.get("message_end"),
+                    summary,
+                    messages,
+                    entry.get("created_at"),
+                    "llm",
+                )
+            )
+        if upgraded:
+            self._merge_index(upgraded)
+        return len(upgraded)
+
     def _write_checkpoint(self, messages: List[Dict[str, Any]], *, source: str) -> List[Dict[str, Any]]:
-        groups = self._message_chunks(messages)
+        # Only material the archive has never seen is chunked. Every compression
+        # re-hands the whole transcript, so without this a pass re-summarized the
+        # same messages on each attempt, and a handoff replacing the head pushed
+        # the *entire* transcript through the summarizer again (measured: a
+        # 5-message head shift re-summarized 100% of a 4-chunk archive).
+        archived = self._archived_message_hashes()
+        groups: List[tuple[int, int, List[Dict[str, Any]]]] = []
+        for run_start, _run_end, run in self._unseen_runs(messages, archived):
+            groups.extend(
+                (start + run_start, end + run_start, group)
+                for start, end, group in self._message_chunks(run)
+            )
 
         # Decide which chunks may spend an LLM call BEFORE writing anything:
-        # only fresh ones (a cached chunk re-emits for free — see _prepare_chunk),
-        # and only the newest few. Everything else is written with a deterministic
-        # recap, so the pass stays bounded no matter how long the transcript is.
+        # every group here holds unseen messages, but only the newest few get an
+        # LLM summary in this pass. Everything else is written with a
+        # deterministic recap, so the pass stays bounded no matter how long the
+        # transcript is — and the leftover recaps are upgraded by later passes.
         allow_llm: set = set()
         if self._summary_config().get("enabled") and self.max_llm_summaries_per_pass > 0:
-            fresh = [
-                self._chunk_id_for(start, end, group)
-                for start, end, group in groups
-                if not (self._chunks_dir() / f"{self._chunk_id_for(start, end, group)}.json").exists()
-            ]
+            fresh = [self._chunk_id_for(start, end, group) for start, end, group in groups]
             allow_llm = set(list(reversed(fresh))[: self.max_llm_summaries_per_pass])
 
         self._llm_summary_calls = 0
@@ -431,6 +605,9 @@ class SessionArchiveProvider(MemoryProvider):
             self._write_prepared_chunk(item, summary)
             for item, summary in zip(prepared, summaries)
         ]
+        # Recaps written above are the trigger for their own upgrade: whatever the
+        # budget did not cover is picked up by the next pass.
+        self._upgrade_recap_chunks()
         self._merge_index(chunks)
         self._maybe_write_secondary_index()
         return chunks
@@ -476,6 +653,7 @@ class SessionArchiveProvider(MemoryProvider):
                     str(cached["summary"]),
                     cached.get("messages") or messages,
                     cached.get("created_at"),
+                    str(cached.get("summary_kind") or "llm"),
                 ),
             }
         return {
@@ -544,6 +722,7 @@ class SessionArchiveProvider(MemoryProvider):
             # Past the pass budget (or summaries disabled/failed): keep the chunk
             # and its deterministic recap, skip the model call.
             summary = self._fallback_summary(item["messages"], item["joined"])
+        summary_kind = "recap" if summary.startswith(_RECAP_PREFIX) else "llm"
         created_at = time.time()
         payload = {
             "chunk_id": item["chunk_id"],
@@ -553,6 +732,7 @@ class SessionArchiveProvider(MemoryProvider):
             "message_start": item["start"],
             "message_end": item["end"],
             "summary": summary,
+            "summary_kind": summary_kind,
             "messages": item["messages"],
         }
         atomic_json_write(item["chunk_path"], payload, indent=2, mode=0o600)
@@ -563,6 +743,7 @@ class SessionArchiveProvider(MemoryProvider):
             summary,
             item["messages"],
             created_at,
+            summary_kind,
         )
 
     def _store_chunk(
@@ -593,6 +774,7 @@ class SessionArchiveProvider(MemoryProvider):
         summary: str,
         messages: List[Dict[str, Any]],
         created_at: Any,
+        summary_kind: str = "llm",
     ) -> Dict[str, Any]:
         """Build the index entry for a chunk (no LLM work)."""
         joined = "\n\n".join(
@@ -605,6 +787,7 @@ class SessionArchiveProvider(MemoryProvider):
             "message_start": start,
             "message_end": end,
             "summary": summary,
+            "summary_kind": summary_kind,
             "preview": preview,
             "search_text": f"{summary}\n{joined[:20_000]}",
         }
@@ -669,7 +852,7 @@ class SessionArchiveProvider(MemoryProvider):
             force=True,
             redact_url_credentials=True,
         )
-        return f"Deterministic recap ({role_text}): {preview}"
+        return f"{_RECAP_PREFIX}{role_text}): {preview}"
 
     def _maybe_write_secondary_index(self) -> None:
         index = self._read_index()
