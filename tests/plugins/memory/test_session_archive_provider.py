@@ -147,6 +147,98 @@ def test_unchanged_chunks_are_not_resummarized(tmp_path, monkeypatch):
     assert provider.search("a" * 20)["results"]
 
 
+def test_summarization_is_bounded_per_pass(tmp_path, monkeypatch):
+    """A pass must spend a bounded number of LLM calls.
+
+    The archive used to summarise every chunk of the transcript inside the
+    compression pass, one blocking call at a time. On a 700-message session that
+    blew the host's inactivity budget (compression.context_timeout_seconds,
+    default 120s), compression was abandoned as "made no progress", and the
+    context stayed over the provider's token limit. Chunks are always written;
+    only the summaries are rationed.
+    """
+    provider = SessionArchiveProvider()
+    provider.initialize("bounded-session", hermes_home=str(tmp_path))
+    provider._config = {"llm_summary": {"enabled": True, "max_tokens": 200}}
+    provider.max_messages_per_chunk = 1
+    provider.max_llm_summaries_per_pass = 4
+    calls = {"n": 0}
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", _summary_stub(calls))
+
+    manifest = provider.on_pre_compress(
+        [{"role": "user", "content": f"msg {i}"} for i in range(40)]
+    )
+
+    assert calls["n"] == 4, "one summary per allowance, no more"
+    chunks = provider._read_index()
+    assert len(chunks) == 40, "every chunk is still archived"
+    assert "chunk" in manifest or "chk-" in manifest
+    assert provider.search("msg 3")["results"]
+
+
+def test_summarization_prefers_the_newest_chunks(tmp_path, monkeypatch):
+    provider = SessionArchiveProvider()
+    provider.initialize("recency-session", hermes_home=str(tmp_path))
+    provider._config = {"llm_summary": {"enabled": True, "max_tokens": 200}}
+    provider.max_messages_per_chunk = 1
+    provider.max_llm_summaries_per_pass = 2
+    calls = {"n": 0}
+
+    def fake_call_llm(**kwargs):
+        calls["n"] += 1
+        text = kwargs["messages"][-1]["content"]
+        label = "OLD" if "msg 0" in text else "NEW"
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=f"{label}-summary", reasoning=None)
+                )
+            ]
+        )
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+
+    provider.on_pre_compress(
+        [{"role": "user", "content": f"msg {i}"} for i in range(6)]
+    )
+
+    summaries = {item["summary"] for item in provider._read_index()}
+    assert calls["n"] == 2
+    assert "NEW-summary" in summaries
+    assert "OLD-summary" not in summaries
+
+
+def test_zero_budget_writes_chunks_without_any_llm_call(tmp_path, monkeypatch):
+    provider = SessionArchiveProvider()
+    provider.initialize("zero-budget", hermes_home=str(tmp_path))
+    provider._config = {"llm_summary": {"enabled": True, "max_tokens": 200}}
+    provider.max_llm_summaries_per_pass = 0
+    calls = {"n": 0}
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", _summary_stub(calls))
+
+    provider.on_pre_compress([{"role": "user", "content": "only one"}])
+
+    assert calls["n"] == 0
+    assert provider.search("only one")["results"]
+
+
+def test_wall_clock_budget_falls_back_to_deterministic_recap(tmp_path, monkeypatch):
+    """The deadline bounds a slow provider even when the count allows more."""
+    provider = SessionArchiveProvider()
+    provider.initialize("deadline-session", hermes_home=str(tmp_path))
+    provider._config = {"llm_summary": {"enabled": True, "max_tokens": 200}}
+    provider.max_messages_per_chunk = 1
+    provider.max_llm_summaries_per_pass = 10
+    provider.llm_summary_budget_seconds = 0.0
+    calls = {"n": 0}
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", _summary_stub(calls))
+
+    provider.on_pre_compress([{"role": "user", "content": f"m{i}"} for i in range(5)])
+
+    assert calls["n"] == 0
+    assert all(item["summary"] for item in provider._read_index())
+
+
 def test_secondary_recaps_reuse_unchanged_groups(tmp_path, monkeypatch):
     provider = SessionArchiveProvider()
     provider.initialize("recap-session", hermes_home=str(tmp_path))

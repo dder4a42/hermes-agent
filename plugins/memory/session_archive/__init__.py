@@ -106,11 +106,24 @@ class SessionArchiveProvider(MemoryProvider):
     max_chars_per_chunk = 30_000
     secondary_index_chunk_threshold = 24
     secondary_index_group_size = 12
+    # LLM summaries are ON THE CRITICAL PATH of a compression pass, which the host
+    # bounds by inactivity (compression.context_timeout_seconds, default 120s):
+    # exceed it and the pass is abandoned — "Context compression made no
+    # progress" — leaving the context over the provider limit. A 700-message
+    # transcript is ~36 chunks; summarising each one sequentially (30s timeout,
+    # plus the client's own retry) blew straight through that budget, so both a
+    # count cap and a wall-clock budget are enforced here. Chunks are always
+    # written; only the progressive-disclosure summaries are rationed, newest
+    # first (recency is what retrieval actually hits).
+    max_llm_summaries_per_pass = 6
+    llm_summary_budget_seconds = 45.0
 
     def __init__(self) -> None:
         self._session_id = ""
         self._root: Path | None = None
         self._config: Dict[str, Any] = {}
+        self._llm_summary_calls = 0
+        self._llm_summary_deadline: Optional[float] = None
 
     @property
     def name(self) -> str:
@@ -147,6 +160,20 @@ class SessionArchiveProvider(MemoryProvider):
             self.secondary_index_group_size,
             2,
             100,
+        )
+        self.max_llm_summaries_per_pass = _bounded_int(
+            self._config.get("max_llm_summaries_per_pass"),
+            self.max_llm_summaries_per_pass,
+            0,
+            64,
+        )
+        self.llm_summary_budget_seconds = float(
+            _bounded_int(
+                self._config.get("llm_summary_budget_seconds"),
+                int(self.llm_summary_budget_seconds),
+                0,
+                600,
+            )
         )
         self._session_dir().mkdir(parents=True, exist_ok=True)
 
@@ -308,8 +335,11 @@ class SessionArchiveProvider(MemoryProvider):
     def backup_paths(self) -> List[str]:
         return []
 
-    def _write_checkpoint(self, messages: List[Dict[str, Any]], *, source: str) -> List[Dict[str, Any]]:
-        chunks = []
+    def _message_chunks(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[tuple[int, int, List[Dict[str, Any]]]]:
+        """Split a transcript into ``(start, end, messages)`` groups. No IO, no LLM."""
+        groups: List[tuple[int, int, List[Dict[str, Any]]]] = []
         current: List[Dict[str, Any]] = []
         current_chars = 0
         start = 0
@@ -319,14 +349,65 @@ class SessionArchiveProvider(MemoryProvider):
                 len(current) >= self.max_messages_per_chunk
                 or current_chars + text_len > self.max_chars_per_chunk
             ):
-                chunks.append(self._store_chunk(current, start, idx - 1, source=source))
+                groups.append((start, idx - 1, current))
                 current = []
                 current_chars = 0
                 start = idx
             current.append(dict(message))
             current_chars += text_len
         if current:
-            chunks.append(self._store_chunk(current, start, len(messages) - 1, source=source))
+            groups.append((start, len(messages) - 1, current))
+        return groups
+
+    def _chunk_id_for(
+        self, start: int, end: int, messages: List[Dict[str, Any]]
+    ) -> str:
+        joined = "\n\n".join(_message_text(m) for m in messages)
+        digest = hashlib.sha256(
+            f"{self._session_id}\0{start}\0{end}\0{joined}".encode("utf-8", "replace")
+        ).hexdigest()[:16]
+        return f"chk-{start}-{end}-{digest}"
+
+    def _llm_summary_budget_exhausted(self) -> bool:
+        """True once this pass has spent its summary allowance.
+
+        Both caps matter: the count bounds a fast provider, the deadline bounds a
+        slow one (including the auxiliary client's own transient retry).
+        """
+        if getattr(self, "_llm_summary_calls", 0) >= self.max_llm_summaries_per_pass:
+            return True
+        deadline = getattr(self, "_llm_summary_deadline", None)
+        return deadline is not None and time.monotonic() >= deadline
+
+    def _write_checkpoint(self, messages: List[Dict[str, Any]], *, source: str) -> List[Dict[str, Any]]:
+        groups = self._message_chunks(messages)
+
+        # Decide which chunks may spend an LLM call BEFORE writing anything:
+        # only fresh ones (a cached chunk re-emits for free — see _store_chunk),
+        # and only the newest few. Everything else is written with a deterministic
+        # recap, so the pass stays bounded no matter how long the transcript is.
+        allow_llm: set = set()
+        if self._summary_config().get("enabled") and self.max_llm_summaries_per_pass > 0:
+            fresh = [
+                self._chunk_id_for(start, end, group)
+                for start, end, group in groups
+                if not (self._chunks_dir() / f"{self._chunk_id_for(start, end, group)}.json").exists()
+            ]
+            allow_llm = set(list(reversed(fresh))[: self.max_llm_summaries_per_pass])
+
+        self._llm_summary_calls = 0
+        self._llm_summary_deadline = time.monotonic() + self.llm_summary_budget_seconds
+
+        chunks = [
+            self._store_chunk(
+                group,
+                start,
+                end,
+                source=source,
+                allow_llm=self._chunk_id_for(start, end, group) in allow_llm,
+            )
+            for start, end, group in groups
+        ]
         self._merge_index(chunks)
         self._maybe_write_secondary_index()
         return chunks
@@ -338,12 +419,10 @@ class SessionArchiveProvider(MemoryProvider):
         end: int,
         *,
         source: str,
+        allow_llm: bool = True,
     ) -> Dict[str, Any]:
         joined = "\n\n".join(_message_text(m) for m in messages)
-        digest = hashlib.sha256(
-            f"{self._session_id}\0{start}\0{end}\0{joined}".encode("utf-8", "replace")
-        ).hexdigest()[:16]
-        chunk_id = f"chk-{start}-{end}-{digest}"
+        chunk_id = self._chunk_id_for(start, end, messages)
         chunk_path = self._chunks_dir() / f"{chunk_id}.json"
         cached = self._read_json(chunk_path)
         if isinstance(cached, dict) and cached.get("summary"):
@@ -360,7 +439,12 @@ class SessionArchiveProvider(MemoryProvider):
                 cached.get("messages") or messages,
                 cached.get("created_at"),
             )
-        summary = self._summarize_chunk(joined, messages=messages)
+        if allow_llm:
+            summary = self._summarize_chunk(joined, messages=messages)
+        else:
+            # Past the pass budget (or summaries disabled): keep the chunk and its
+            # deterministic recap, skip the model call.
+            summary = self._fallback_summary(messages, joined)
         created_at = time.time()
         payload = {
             "chunk_id": chunk_id,
@@ -403,6 +487,8 @@ class SessionArchiveProvider(MemoryProvider):
         cfg = self._summary_config()
         if not cfg.get("enabled"):
             return self._fallback_summary(messages, text)
+        if self._llm_summary_budget_exhausted():
+            return self._fallback_summary(messages, text)
         sample = text[:_bounded_int(cfg.get("max_input_chars"), 12_000, 1000, 80_000)]
         prompt = (
             "Summarize this Hermes transcript chunk for later long-horizon "
@@ -415,6 +501,7 @@ class SessionArchiveProvider(MemoryProvider):
         try:
             from agent.auxiliary_client import call_llm, extract_content_or_reasoning
 
+            self._llm_summary_calls += 1
             response = call_llm(
                 task="session_archive_summary",
                 provider=cfg.get("provider") or None,
@@ -508,9 +595,14 @@ class SessionArchiveProvider(MemoryProvider):
         cfg = self._summary_config()
         if not cfg.get("enabled"):
             return summaries[:3000]
+        # Stage recaps share the pass budget with chunk summaries — they are the
+        # same critical-path LLM calls, just at a coarser grain.
+        if self._llm_summary_budget_exhausted():
+            return summaries[:3000]
         try:
             from agent.auxiliary_client import call_llm, extract_content_or_reasoning
 
+            self._llm_summary_calls += 1
             response = call_llm(
                 task="session_archive_summary",
                 provider=cfg.get("provider") or None,
