@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -27,6 +28,16 @@ def _hermes_home() -> Path:
 
 def _store_path() -> Path:
     return _hermes_home() / "thoughts.json"
+
+
+_RECURRENCE_HINT_RE = re.compile(
+    r"每|every|daily|weekly|monthly|yearly|each|天天|每日", re.IGNORECASE
+)
+
+
+def _raw_signals_recurrence(raw: str) -> bool:
+    """True when a schedule phrase names a repeating cadence."""
+    return bool(_RECURRENCE_HINT_RE.search(raw or ""))
 
 
 def main() -> int:
@@ -72,7 +83,13 @@ def main() -> int:
             t["scheduled_at"] = result.scheduled_at
             t["schedule_cron"] = result.schedule_cron or ""
             if (t.get("recurrence") or "once") == "once":
-                t["recurrence"] = result.recurrence
+                # Only adopt a non-once recurrence when the phrase names a
+                # cadence; LLM parsers hallucinate weekly/daily from
+                # one-time phrases like '明早10点'.
+                t["recurrence"] = (
+                    result.recurrence
+                    if _raw_signals_recurrence(raw) else "once"
+                )
             t.setdefault("parse", {}).update({
                 "error": None,
                 "confidence": result.confidence,

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -149,6 +150,19 @@ def _normalize_remind_before(value):
     return 0
 
 
+# A schedule phrase only counts as recurring when it names a cadence.
+# LLM parsers hallucinate weekly/daily from one-time phrases like
+# '明早10点', silently converting one-shot reminders into recurring ones.
+_RECURRENCE_HINT_RE = re.compile(
+    r"每|every|daily|weekly|monthly|yearly|each|天天|每日", re.IGNORECASE
+)
+
+
+def _raw_signals_recurrence(raw: str) -> bool:
+    """True when the user's schedule phrase names a repeating cadence."""
+    return bool(_RECURRENCE_HINT_RE.search(raw or ""))
+
+
 def add_task(
     title: str,
     schedule_raw: str,
@@ -200,7 +214,12 @@ def add_task(
         scheduled_at = result.scheduled_at
         schedule_cron = result.schedule_cron or ""
         if recurrence == "once":
-            resolved_recurrence = result.recurrence
+            # Only adopt a non-once recurrence from the parser when the
+            # phrase explicitly names a cadence; otherwise keep 'once'
+            # (defense against LLM recurrence hallucination).
+            resolved_recurrence = (
+                result.recurrence if _raw_signals_recurrence(schedule_raw) else "once"
+            )
         parse_confidence = result.confidence
         parse_reasoning = result.reasoning
     else:

@@ -136,6 +136,11 @@ Ambiguity rules:
   - 'in N minutes/hours/days' → now + delta.
   - '每周三下午2点' → recurrence='weekly', schedule_cron='0 14 * * 3',
     scheduled_at = next Wednesday 14:00.
+  - HARD RULE — recurrence: MUST be 'once' unless the user's phrase
+    EXPLICITLY names a repeating cadence (每天/每周/每月/每周三/every day/
+    every week/daily/weekly/monthly/yearly). Single-point phrases
+    ('明早10点', '明天下午3点', 'tomorrow 3pm', '下周三', '今天下午') are ALWAYS
+    'once'. Never infer recurrence from task content, notes, or context.
 
 Respond with ONLY the JSON. No markdown, no prose, no code fences.
 """
