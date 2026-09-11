@@ -70,6 +70,8 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         # Board state belongs to the parent agent's planning loop, not to a
         # bounded executor child.
         "longtask_create",
+        "longtask_add_node",
+        "longtask_cancel_node",
         "longtask_read",
         "longtask_next",
         "longtask_update_node",

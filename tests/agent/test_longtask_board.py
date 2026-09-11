@@ -5,11 +5,14 @@ import pytest
 
 from agent.longtask_board import (
     LongtaskBoardError,
+    add_nodes,
     attach_report,
+    cancel_node,
     compute_ready_nodes,
     create_board,
     load_board,
     next_ready_nodes,
+    render_board_summary,
     update_node,
 )
 
@@ -186,6 +189,146 @@ class TestLegacyBoardMigration:
         board = load_board(tmp_path, "s")
         n1 = next(n for n in board["nodes"] if n["node_id"] == "N1")
         assert n1["execution"] == "none"
+
+
+class TestMutableBoard:
+    """The DAG is not frozen at create time.
+
+    AgentOS §3.3.2: the board stays mutable during execution "so new
+    subquestions can be registered as evidence changes the plan", and plan
+    revisions are tool-mediated edits to it rather than a rebuild.
+    """
+
+    def test_add_node_appends_and_waits_for_existing_dependencies(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+
+        result = add_nodes(
+            tmp_path,
+            "s",
+            [{"node_id": "N4", "goal": "follow-up work", "dependencies": ["N1"]}],
+        )
+
+        assert result["added"] == ["N4"]
+        assert result["next_ready"] == ["N1"]
+
+        update_node(tmp_path, "s", "N1", resolution="resolved")
+        ready = [n["node_id"] for n in next_ready_nodes(tmp_path, "s")["ready"]]
+        assert ready == ["N2", "N4"]
+
+    def test_add_node_rejects_a_duplicate_id(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+
+        with pytest.raises(LongtaskBoardError, match="already exists"):
+            add_nodes(tmp_path, "s", [{"node_id": "N1", "goal": "clash"}])
+
+    def test_add_node_rejects_unknown_dependency(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+
+        with pytest.raises(LongtaskBoardError, match="unknown node"):
+            add_nodes(
+                tmp_path,
+                "s",
+                [{"node_id": "N4", "goal": "g", "dependencies": ["NOPE"]}],
+            )
+
+    def test_add_node_rejects_a_cycle_inside_the_batch(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+
+        with pytest.raises(LongtaskBoardError, match="cycle"):
+            add_nodes(
+                tmp_path,
+                "s",
+                [
+                    {"node_id": "N4", "goal": "a", "dependencies": ["N5"]},
+                    {"node_id": "N5", "goal": "b", "dependencies": ["N4"]},
+                ],
+            )
+
+    def test_cancel_records_the_reason_and_reports_dependents(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+
+        result = cancel_node(tmp_path, "s", "N1", reason="premise was wrong")
+
+        assert result["node"]["resolution"] == "cancelled"
+        assert "premise was wrong" in result["node"]["notes"]
+        assert result["dependents_to_review"] == ["N2"]
+
+    def test_dependent_of_a_cancelled_item_is_flagged_not_released(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+        cancel_node(tmp_path, "s", "N1")
+
+        frontier = next_ready_nodes(tmp_path, "s")
+
+        assert frontier["ready"] == []
+        entry = {n["node_id"]: n for n in frontier["blocked"]}["N2"]
+        assert entry["blocked_by"] == ["N1"]
+        assert entry["blocked_by_cancelled"] == ["N1"]
+
+    def test_rewiring_releases_a_stranded_dependent(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+        cancel_node(tmp_path, "s", "N1")
+
+        update_node(tmp_path, "s", "N2", dependencies=[])
+
+        assert [n["node_id"] for n in next_ready_nodes(tmp_path, "s")["ready"]] == ["N2"]
+
+    def test_update_node_revises_goal_and_dependencies(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+
+        result = update_node(
+            tmp_path,
+            "s",
+            "N3",
+            goal="Verify the revised behavior",
+            dependencies=["N1"],
+        )
+
+        assert result["node"]["goal"] == "Verify the revised behavior"
+        assert result["node"]["dependencies"] == ["N1"]
+
+    def test_rewire_rejects_self_unknown_and_cycles(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+
+        with pytest.raises(LongtaskBoardError, match="cannot depend on itself"):
+            update_node(tmp_path, "s", "N1", dependencies=["N1"])
+        with pytest.raises(LongtaskBoardError, match="unknown node"):
+            update_node(tmp_path, "s", "N3", dependencies=["NOPE"])
+        with pytest.raises(LongtaskBoardError, match="cycle"):
+            update_node(tmp_path, "s", "N1", dependencies=["N3"])
+
+    def test_revising_a_goal_must_not_empty_it(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+
+        with pytest.raises(LongtaskBoardError, match="non-empty"):
+            update_node(tmp_path, "s", "N1", goal="   ")
+
+
+class TestBoardRendering:
+    def test_summary_names_every_section_and_the_blocker(self, tmp_path):
+        create_board(tmp_path, "s", "obj", _nodes())
+        update_node(tmp_path, "s", "N1", resolution="in_progress")
+
+        text = render_board_summary(load_board(tmp_path, "s"))
+
+        assert "board task-" in text
+        assert "resolution: in_progress=1 open=2" in text
+        assert "in progress (1):" in text
+        # N1 in progress ⇒ N2 waits on it and N3 waits on N2: both blocked.
+        assert "blocked (2):" in text
+        assert "blocked_by: N1" in text
+
+    def test_summary_derives_readiness_like_the_board(self, tmp_path):
+        """The render's frontier must match next_ready_nodes, not a stale field."""
+        create_board(tmp_path, "s", "obj", _nodes())
+        update_node(tmp_path, "s", "N1", resolution="resolved")
+
+        board = load_board(tmp_path, "s")
+        text = render_board_summary(board)
+        ready_ids = [n["node_id"] for n in next_ready_nodes(tmp_path, "s")["ready"]]
+
+        assert ready_ids == ["N2"]
+        assert "ready frontier (1):" in text
+        assert text.index("N2") < text.index("resolved (1):")
 
 
 class TestReportStatusIsAdvisory:

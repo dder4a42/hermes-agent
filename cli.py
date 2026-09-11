@@ -12280,6 +12280,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._show_gateway_status()
         elif canonical == "status":
             self._show_session_status()
+        elif canonical == "board":
+            self._show_task_board(cmd_original)
         elif canonical == "context":
             self._show_context_breakdown(cmd_original)
         elif canonical == "egress":
@@ -13673,6 +13675,93 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print("  ❌ Timed out talking to the Codex backend — try again shortly.")
                 return
         print(f"  {result.message}")
+
+    def _show_task_board(self, cmd_original: str = ""):
+        """`/board [node_id]` — render this session's long-horizon task board.
+
+        Read-only: loads the board for this session's workspace and prints it via
+        the shared renderer (agent.longtask_board.render_board_summary). Execution
+        status is the runtime's record of a dispatched run; resolution is the
+        agent's judgement — this shows both and changes neither.
+        """
+        if not self.agent:
+            print("  (._.) No active agent -- send a message first.")
+            return
+
+        arg = (
+            cmd_original.split(maxsplit=1)[1].strip()
+            if " " in (cmd_original or "")
+            else ""
+        )
+
+        from agent.longtask_board import (
+            LongtaskBoardError,
+            load_board,
+            render_board_summary,
+        )
+        from tools.longtask_tool import _root, _session_id
+
+        session_id = _session_id(self.agent)
+        try:
+            board = load_board(_root(self.agent), session_id)
+        except LongtaskBoardError:
+            self._console_print(
+                f"  (._.) No task board for this session ({session_id}).",
+                highlight=False,
+                markup=False,
+            )
+            self._console_print(
+                "        Create one with longtask_create (the longtask toolset "
+                "must be enabled for this platform).",
+                highlight=False,
+                markup=False,
+            )
+            return
+        except Exception as exc:
+            self._console_print(
+                f"  (._.) Could not read the task board: {exc}",
+                highlight=False,
+                markup=False,
+            )
+            return
+
+        if arg:
+            node = next((n for n in board["nodes"] if n["node_id"] == arg), None)
+            if node is None:
+                self._console_print(
+                    f"  (._.) No item {arg!r} on {board['task_id']}.",
+                    highlight=False,
+                    markup=False,
+                )
+                return
+            lines = [
+                f"  {node['node_id']} — {node['goal']}",
+                f"    resolution={node['resolution']}   execution={node['execution']}",
+            ]
+            if node.get("dependencies"):
+                lines.append(f"    deps: {', '.join(node['dependencies'])}")
+            if node.get("blocked_reason"):
+                lines.append(f"    blocked: {node['blocked_reason']}")
+            if node.get("report_path"):
+                lines.append(
+                    f"    report: {node['report_path']} "
+                    f"(child said: {node.get('report_status') or 'unknown'})"
+                )
+            verification = node.get("verification")
+            if isinstance(verification, dict) and verification:
+                summary = str(verification.get("summary_for_parent") or "").strip()
+                lines.append(
+                    f"    verdict: {verification.get('verdict') or 'unknown'}"
+                    + (f" — {summary[:200]}" if summary else "")
+                )
+            if node.get("notes"):
+                lines.append(f"    notes: {str(node['notes'])[:400]}")
+            for line in lines:
+                self._console_print(line, highlight=False, markup=False)
+            return
+
+        for line in render_board_summary(board).splitlines():
+            self._console_print(line, highlight=False, markup=False)
 
     def _show_context_breakdown(self, cmd_original: str = ""):
         """`/context [all]` — visual context-window usage breakdown.

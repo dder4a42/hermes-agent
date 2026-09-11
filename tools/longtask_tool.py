@@ -14,8 +14,10 @@ from typing import Any, Dict, Optional
 
 from agent.longtask_board import (
     LongtaskBoardError,
+    add_nodes,
     attach_report,
     board_dir,
+    cancel_node,
     create_board,
     load_board,
     next_ready_nodes,
@@ -170,6 +172,35 @@ def longtask_create_handler(args: Dict[str, Any], **kw) -> str:
         return _handle_error(exc)
 
 
+def longtask_add_node_handler(args: Dict[str, Any], **kw) -> str:
+    try:
+        parent = kw.get("parent_agent")
+        sid = _session_id(parent, args.get("session_id"), kw.get("session_id"))
+        data = add_nodes(
+            _root(parent, args.get("root")),
+            sid,
+            args.get("nodes") or [],
+        )
+        return _ok({"status": "ok", "session_id": sid, **data})
+    except Exception as exc:
+        return _handle_error(exc)
+
+
+def longtask_cancel_node_handler(args: Dict[str, Any], **kw) -> str:
+    try:
+        parent = kw.get("parent_agent")
+        sid = _session_id(parent, args.get("session_id"), kw.get("session_id"))
+        data = cancel_node(
+            _root(parent, args.get("root")),
+            sid,
+            str(args.get("node_id") or ""),
+            reason=args.get("reason"),
+        )
+        return _ok({"status": "ok", "session_id": sid, **data})
+    except Exception as exc:
+        return _handle_error(exc)
+
+
 def longtask_read_handler(args: Dict[str, Any], **kw) -> str:
     try:
         parent = kw.get("parent_agent")
@@ -204,9 +235,11 @@ def longtask_update_node_handler(args: Dict[str, Any], **kw) -> str:
         data = update_node(
             _root(parent, args.get("root")),
             sid,
-            str(args.get("node_id") or ""),
+            node_id=str(args.get("node_id") or ""),
             resolution=args.get("resolution"),
             blocked_reason=args.get("blocked_reason"),
+            goal=args.get("goal"),
+            dependencies=args.get("dependencies"),
             assigned_to=args.get("assigned_to"),
             claims=args.get("claims"),
             evidence=args.get("evidence"),
@@ -332,6 +365,72 @@ registry.register(
 )
 
 registry.register(
+    name="longtask_add_node",
+    toolset="longtask",
+    schema={
+        "name": "longtask_add_node",
+        "description": (
+            "Append items to an existing board when new work appears mid-run "
+            "(replanning) — do not rebuild the board. Appended items may depend "
+            "on existing ones; duplicate ids, unknown dependencies and cycles "
+            "are rejected."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "nodes": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "node_id": {"type": "string"},
+                            "goal": {"type": "string"},
+                            "dependencies": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                            },
+                        },
+                        "required": ["node_id", "goal"],
+                    },
+                },
+                **_COMMON_OPTIONAL,
+            },
+            "required": ["nodes"],
+        },
+    },
+    handler=_board_handler(longtask_add_node_handler),
+)
+
+registry.register(
+    name="longtask_cancel_node",
+    toolset="longtask",
+    schema={
+        "name": "longtask_cancel_node",
+        "description": (
+            "Cancel a board item that is superseded or no longer worth doing. "
+            "Its dependents are NOT cancelled for you: they come back in "
+            "dependents_to_review and will report the cancelled dependency, so "
+            "rewire them (longtask_update_node with new dependencies) or cancel "
+            "them explicitly. That decision stays visible."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string"},
+                "reason": {
+                    "type": "string",
+                    "description": "Why the item is cancelled; recorded on the item.",
+                },
+                **_COMMON_OPTIONAL,
+            },
+            "required": ["node_id"],
+        },
+    },
+    handler=_board_handler(longtask_cancel_node_handler),
+)
+
+registry.register(
     name="longtask_read",
     toolset="longtask",
     schema={
@@ -398,6 +497,21 @@ registry.register(
                         "Set when the item is waiting on something outside your "
                         "control (a human decision, a missing credential). Keeps "
                         "the item open but out of the ready frontier."
+                    ),
+                },
+                "goal": {
+                    "type": "string",
+                    "description": (
+                        "Revise the item's description when the plan changes. "
+                        "Plan revisions are edits to the board, not a rebuild."
+                    ),
+                },
+                "dependencies": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Replace this item's dependencies (rewiring). Unknown "
+                        "ids and cycles are rejected."
                     ),
                 },
                 "assigned_to": {"type": "string"},

@@ -299,12 +299,14 @@ TOOLSETS = {
 
     "longtask": {
         "description": (
-            "Durable DAG task board for long-horizon work: plan nodes, select "
-            "ready work by dependency order, attach subagent reports, and keep "
-            "state outside the model context."
+            "Durable DAG task board for long-horizon work: plan items, select "
+            "ready work by dependency order, replan mid-run (add/cancel/rewire), "
+            "attach subagent reports, and keep state outside the model context."
         ),
         "tools": [
             "longtask_create",
+            "longtask_add_node",
+            "longtask_cancel_node",
             "longtask_read",
             "longtask_next",
             "longtask_update_node",
@@ -433,7 +435,8 @@ TOOLSETS = {
             "todo", "memory",
             "session_search", "clarify",
             "execute_code", "delegate_task",
-            "longtask_create", "longtask_read", "longtask_next",
+            "longtask_create", "longtask_add_node", "longtask_cancel_node",
+            "longtask_read", "longtask_next",
             "longtask_update_node", "longtask_attach_report",
             "longtask_verify_node",
         ],

@@ -397,10 +397,24 @@ def _blocked_nodes(
         waiting = _unresolved_dependencies(board, node)
         if waiting:
             entry["blocked_by"] = waiting
+            # A cancelled dependency can never become resolved, so name it
+            # separately: the item needs REWIRING or cancelling, not waiting.
+            cancelled = [
+                dep for dep in waiting if _resolution_of(board, dep) == "cancelled"
+            ]
+            if cancelled:
+                entry["blocked_by_cancelled"] = cancelled
         elif node.get("blocked_reason"):
             entry["blocked_by"] = [node["blocked_reason"]]
         blocked.append(entry)
     return blocked
+
+
+def _resolution_of(board: Dict[str, Any], node_id: str) -> str:
+    for node in board["nodes"]:
+        if node["node_id"] == node_id:
+            return str(node.get("resolution") or "open")
+    return "unknown"
 
 
 def update_node(
@@ -411,6 +425,8 @@ def update_node(
     resolution: Optional[str] = None,
     execution: Optional[str] = None,
     blocked_reason: Optional[str] = None,
+    goal: Optional[str] = None,
+    dependencies: Optional[List[str]] = None,
     assigned_to: Optional[str] = None,
     claims: Optional[List[Dict[str, Any]]] = None,
     evidence: Optional[List[Dict[str, Any]]] = None,
@@ -425,6 +441,8 @@ def update_node(
             resolution=resolution,
             execution=execution,
             blocked_reason=blocked_reason,
+            goal=goal,
+            dependencies=dependencies,
             assigned_to=assigned_to,
             claims=claims,
             evidence=evidence,
@@ -441,6 +459,8 @@ def _update_node_locked(
     resolution: Optional[str] = None,
     execution: Optional[str] = None,
     blocked_reason: Optional[str] = None,
+    goal: Optional[str] = None,
+    dependencies: Optional[List[str]] = None,
     assigned_to: Optional[str] = None,
     claims: Optional[List[Dict[str, Any]]] = None,
     evidence: Optional[List[Dict[str, Any]]] = None,
@@ -484,6 +504,27 @@ def _update_node_locked(
         node["verification"] = _normalize_dict(verification, "verification")
     if notes is not None:
         node["notes"] = str(notes)
+    if goal is not None:
+        # Revising an item's description is how a plan revision is expressed;
+        # AgentOS: "plan revisions are expressed as tool-mediated edits to it".
+        text = str(goal).strip()
+        if not text:
+            raise LongtaskBoardError(f"Node {node_id} must keep a non-empty goal")
+        node["goal"] = text
+    if dependencies is not None:
+        new_deps = [safe_id(str(dep)) for dep in dependencies]
+        if node_id in new_deps:
+            raise LongtaskBoardError(f"Node {node_id} cannot depend on itself")
+        known = {other["node_id"] for other in board["nodes"]}
+        missing = [dep for dep in new_deps if dep not in known]
+        if missing:
+            raise LongtaskBoardError(
+                f"Node {node_id} cannot depend on unknown node(s): {', '.join(missing)}"
+            )
+        node["dependencies"] = new_deps
+        # Rewiring is the one edit that can introduce a cycle; validate before
+        # persisting so a bad edit is rejected whole.
+        _validate_acyclic(board)
     node["updated_at"] = _now()
     _refresh_ready_nodes(board)
     save_board(root, session_id, board)
@@ -547,6 +588,101 @@ def _attach_report_locked(
     }
 
 
+def add_nodes(
+    root: str | Path,
+    session_id: str,
+    nodes: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Append items to an existing board.
+
+    The DAG is not frozen at create time: AgentOS keeps the board mutable while
+    the run proceeds "so new subquestions can be registered as evidence changes
+    the plan" (§3.3.2). Validation matches create time — duplicate ids, unknown
+    dependencies and cycles are rejected — so an appended item may depend on
+    existing work without being able to corrupt the graph.
+    """
+    with board_lock(root, session_id):
+        return _add_nodes_locked(root, session_id, nodes)
+
+
+def _add_nodes_locked(
+    root: str | Path,
+    session_id: str,
+    nodes: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    board = load_board(root, session_id)
+    existing = {node["node_id"] for node in board["nodes"]}
+    incoming = _normalize_nodes(nodes, known_ids=existing)
+    if not incoming:
+        raise LongtaskBoardError("add_nodes requires at least one item")
+    clash = sorted({node["node_id"] for node in incoming} & existing)
+    if clash:
+        raise LongtaskBoardError(
+            f"node_id already exists on this board: {', '.join(clash)}"
+        )
+    board["nodes"].extend(incoming)
+    _validate_acyclic(board)
+    _refresh_ready_nodes(board)
+    save_board(root, session_id, board)
+    return {
+        "task_id": board["task_id"],
+        "added": [node["node_id"] for node in incoming],
+        "node_count": len(board["nodes"]),
+        "next_ready": board["global_state"]["next_ready"],
+    }
+
+
+def cancel_node(
+    root: str | Path,
+    session_id: str,
+    node_id: str,
+    *,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Cancel an item, reporting — never silently cascading to — its dependents.
+
+    A cancelled item is terminal on the resolution axis. Its dependents are NOT
+    cancelled for you: they stay open and now report the cancelled dependency in
+    ``blocked_by``, which is the signal to either rewire them (``update_node``
+    with new ``dependencies``) or cancel them too. Cascading silently would hide
+    the decision from the coordinator.
+    """
+    with board_lock(root, session_id):
+        return _cancel_node_locked(root, session_id, node_id, reason=reason)
+
+
+def _cancel_node_locked(
+    root: str | Path,
+    session_id: str,
+    node_id: str,
+    *,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    board = load_board(root, session_id)
+    node = _node_by_id(board, node_id)
+    node["resolution"] = "cancelled"
+    if reason:
+        existing_notes = str(node.get("notes") or "").strip()
+        node["notes"] = (
+            f"{existing_notes}\ncancelled: {reason}".strip() if existing_notes
+            else f"cancelled: {reason}"
+        )
+    dependents = [
+        other["node_id"]
+        for other in board["nodes"]
+        if node_id in (other.get("dependencies") or [])
+        and other["resolution"] in {"open", "in_progress"}
+    ]
+    node["updated_at"] = _now()
+    _refresh_ready_nodes(board)
+    save_board(root, session_id, board)
+    return {
+        "task_id": board["task_id"],
+        "node": _public_node(node),
+        "dependents_to_review": dependents,
+    }
+
+
 def compute_ready_nodes(board: Dict[str, Any]) -> List[Dict[str, Any]]:
     normalized = _normalize_board(board)
     return [
@@ -579,7 +715,16 @@ def _normalize_board(data: Dict[str, Any]) -> Dict[str, Any]:
     return board
 
 
-def _normalize_nodes(nodes: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _normalize_nodes(
+    nodes: Iterable[Dict[str, Any]],
+    known_ids: Optional[Iterable[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Normalise item dicts, validating ids and dependencies.
+
+    ``known_ids`` are ids that already exist elsewhere on the board (used when
+    appending): a dependency may point at them even though they are not part of
+    this batch.
+    """
     if not isinstance(nodes, list):
         nodes = list(nodes or [])
     out = []
@@ -618,8 +763,9 @@ def _normalize_nodes(nodes: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             raise LongtaskBoardError(f"Node {node_id} must have a goal")
         out.append(node)
     node_ids = {n["node_id"] for n in out}
+    legal_ids = node_ids | {safe_id(str(extra)) for extra in (known_ids or ())}
     for node in out:
-        missing = [dep for dep in node["dependencies"] if dep not in node_ids]
+        missing = [dep for dep in node["dependencies"] if dep not in legal_ids]
         if missing:
             raise LongtaskBoardError(
                 f"Node {node['node_id']} depends on unknown node(s): {', '.join(missing)}"
@@ -777,6 +923,90 @@ def _preview(data: Dict[str, Any]) -> str:
     if len(text) <= _REPORT_PREVIEW_CHARS:
         return text
     return text[:_REPORT_PREVIEW_CHARS] + "...[truncated]"
+
+
+def render_board_summary(
+    board: Dict[str, Any],
+    *,
+    max_items: int = 8,
+    include_resolved: bool = True,
+) -> str:
+    """Plain-text rendering of a board.
+
+    One renderer for every consumer: the `/board` slash command today, and the
+    event-driven re-injection planned for P4 — so the CLI, the agent, and the
+    compression handoff can never disagree about what the board says. Readiness
+    is derived with the board's own rule, never read from a stored field.
+    """
+    normalized = _normalize_board(board)
+    nodes = normalized["nodes"]
+    resolution_counts: Dict[str, int] = {}
+    execution_counts: Dict[str, int] = {}
+    for node in nodes:
+        resolution_counts[node["resolution"]] = (
+            resolution_counts.get(node["resolution"], 0) + 1
+        )
+        execution_counts[node["execution"]] = execution_counts.get(node["execution"], 0) + 1
+
+    lines = [
+        f"board {normalized['task_id']} — {normalized['objective']}",
+        "  resolution: "
+        + " ".join(f"{key}={resolution_counts[key]}" for key in sorted(resolution_counts))
+        + "    execution: "
+        + " ".join(f"{key}={execution_counts[key]}" for key in sorted(execution_counts)),
+    ]
+
+    def _item_line(node: Dict[str, Any], extra: str = "") -> str:
+        deps = ",".join(node.get("dependencies") or []) or "-"
+        # No square brackets: this text is printed through Rich (and later
+        # injected into prompts), and [...] would be parsed as markup.
+        line = f"    {node['node_id']:<10} deps={deps}  {node['goal'][:80]}"
+        return f"{line}  {extra}".rstrip()
+
+    def _section(
+        title: str,
+        items: List[Dict[str, Any]],
+        *,
+        extra_for: Optional[Any] = None,
+    ) -> None:
+        if not items:
+            return
+        lines.append(f"  {title} ({len(items)}):")
+        for node in items[:max_items]:
+            lines.append(_item_line(node, extra_for(node) if extra_for else ""))
+        if len(items) > max_items:
+            lines.append(f"    ... {len(items) - max_items} more")
+
+    _section("ready frontier", [n for n in nodes if _is_ready(normalized, n)])
+    _section(
+        "in progress", [n for n in nodes if n["resolution"] == "in_progress"]
+    )
+    _section(
+        "waiting on a decision",
+        [n for n in nodes if n["resolution"] == "open" and n.get("blocked_reason")],
+    )
+    _section(
+        "blocked",
+        [
+            n
+            for n in nodes
+            if n["resolution"] == "open"
+            and not _is_ready(normalized, n)
+            and not n.get("blocked_reason")
+        ],
+        extra_for=lambda n: "blocked_by: "
+        + ", ".join(_unresolved_dependencies(normalized, n)),
+    )
+    if include_resolved:
+        _section(
+            "resolved",
+            [n for n in nodes if n["resolution"] == "resolved"],
+            extra_for=lambda n: (
+                f"verdict={str((n.get('verification') or {}).get('verdict') or 'none')}"
+            ),
+        )
+    _section("cancelled", [n for n in nodes if n["resolution"] == "cancelled"])
+    return "\n".join(lines)
 
 
 def _now() -> str:

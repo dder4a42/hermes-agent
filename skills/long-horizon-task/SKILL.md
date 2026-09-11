@@ -76,6 +76,23 @@ For complex work:
 9. Continue until every item is resolved or cancelled, or explicitly blocked on
    user input.
 
+## Replanning
+
+The board is mutable for the life of the run — a plan that can only be written
+before execution would force the agent to stay faithful to an obsolete
+interpretation. Revise it, never rebuild it:
+
+- `longtask_add_node` registers follow-up work as the evidence changes the plan
+  (appended items may depend on existing ones).
+- `longtask_cancel_node` retires a superseded item. Its dependents are returned
+  in `dependents_to_review` and are NOT cancelled for you — rewire them with
+  `longtask_update_node(dependencies=[...])` or cancel them explicitly.
+- `longtask_update_node` also revises an item's `goal`, which is the
+  tool-mediated form of a plan revision.
+
+An item whose dependency was cancelled can never become ready; it will report
+that dependency in `blocked_by_cancelled` so the decision stays visible.
+
 ## Complexity Heuristic
 
 Use the board when any of these are true:

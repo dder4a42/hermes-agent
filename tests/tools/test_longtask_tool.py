@@ -2,7 +2,9 @@ import json
 
 from tools.longtask_tool import (
     _board_handler,
+    longtask_add_node_handler,
     longtask_attach_report_handler,
+    longtask_cancel_node_handler,
     longtask_create_handler,
     longtask_next_handler,
     longtask_update_node_handler,
@@ -11,6 +13,8 @@ from tools.longtask_tool import (
 
 LONGTASK_TOOL_NAMES = {
     "longtask_create",
+    "longtask_add_node",
+    "longtask_cancel_node",
     "longtask_read",
     "longtask_next",
     "longtask_update_node",
@@ -256,3 +260,81 @@ class TestRuntimeContextResolution:
 
         assert "Task board state:" in handoff["content"]
         assert "Drain the queue" in handoff["content"]
+
+
+class TestMutableBoardToolSurface:
+    """Mid-run replanning through the tools: append, cancel, rewire."""
+
+    def test_add_then_cancel_then_rewire(self, tmp_path):
+        common = {"root": str(tmp_path), "session_id": "s"}
+        _loads(
+            longtask_create_handler(
+                {**common, "objective": "Ship", "nodes": [{"node_id": "N1", "goal": "Research"}]}
+            )
+        )
+
+        added = _loads(
+            longtask_add_node_handler(
+                {
+                    **common,
+                    "nodes": [
+                        {"node_id": "N2", "goal": "Follow-up", "dependencies": ["N1"]}
+                    ],
+                }
+            )
+        )
+        assert added["added"] == ["N2"]
+
+        cancelled = _loads(
+            longtask_cancel_node_handler(
+                {**common, "node_id": "N1", "reason": "superseded"}
+            )
+        )
+        assert cancelled["node"]["resolution"] == "cancelled"
+        assert cancelled["dependents_to_review"] == ["N2"]
+
+        rewired = _loads(
+            longtask_update_node_handler({**common, "node_id": "N2", "dependencies": []})
+        )
+        assert rewired["node"]["dependencies"] == []
+
+        assert [n["node_id"] for n in _loads(longtask_next_handler(common))["ready"]] == [
+            "N2"
+        ]
+
+    def test_revising_a_goal_through_the_tool(self, tmp_path):
+        common = {"root": str(tmp_path), "session_id": "s"}
+        _loads(
+            longtask_create_handler(
+                {**common, "objective": "Ship", "nodes": [{"node_id": "N1", "goal": "Old"}]}
+            )
+        )
+
+        out = _loads(longtask_update_node_handler({**common, "node_id": "N1", "goal": "New"}))
+
+        assert out["node"]["goal"] == "New"
+
+    def test_validation_errors_surface_as_tool_errors(self, tmp_path):
+        common = {"root": str(tmp_path), "session_id": "s"}
+        _loads(
+            longtask_create_handler(
+                {**common, "objective": "Ship", "nodes": [{"node_id": "N1", "goal": "g"}]}
+            )
+        )
+
+        clash = _loads(
+            longtask_add_node_handler({**common, "nodes": [{"node_id": "N1", "goal": "x"}]})
+        )
+
+        assert "error" in clash
+
+
+class TestBoardSlashCommand:
+    def test_registered_with_a_non_colliding_alias(self):
+        from hermes_cli.commands import resolve_command
+
+        cmd = resolve_command("board")
+        assert cmd is not None and cmd.name == "board"
+        assert resolve_command("longtask").name == "board"
+        # /tasks belongs to /agents — this alias must not have shadowed it.
+        assert resolve_command("tasks").name == "agents"

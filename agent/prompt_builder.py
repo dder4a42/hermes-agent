@@ -541,8 +541,12 @@ LONGTASK_GUIDANCE_TAIL = (
     "Dependents unlock on `resolved`, so resolving on a missing or rejected "
     "verdict carries them forward on an unverified claim.\n"
     "Board state beats your memory of the conversation when they conflict; "
-    "after compression the board is where you recover. For a simple one-shot "
-    "request, answer directly — do not build a board for a single step."
+    "after compression the board is where you recover. When evidence changes the "
+    "plan, revise the board instead of rebuilding it: `longtask_add_node` "
+    "registers follow-up work, `longtask_cancel_node` retires a superseded item, "
+    "and `longtask_update_node` rewrites an item's goal or dependencies. "
+    "For a simple one-shot request, answer directly — do not build a board for a "
+    "single step."
 )
 
 
