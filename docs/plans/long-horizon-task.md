@@ -366,12 +366,33 @@ names, so the rendered text stays byte-stable for the life of a conversation
 (prompt-cache safe). Verified end-to-end: a main session gets both blocks; a
 delegate child (`delegate_task` stripped) gets neither.
 
+### Division of labour (enforced by the host)
+
+The main agent plans and owns the board; a subagent executes one bounded node
+and returns a claim-evidence report. Three mechanisms enforce that, instead of
+leaving it to the prose in the skill:
+
+- `DELEGATE_BLOCKED_TOOLS` (`tools/delegate_tool.py`) carries the six board
+  tools, so the `longtask` toolset is derived as fully blocked and stripped from
+  every child's toolset list — and `_blocked_toolsets_for_role` passes it as a
+  deny toolset, which subtracts the names *after* composite expansion. That
+  second layer matters: the `coding` posture toolset carries the board tools
+  inline, so stripping toolset *names* alone would leak them into a child of a
+  coding session.
+- `tools/longtask_tool.py::_board_handler` refuses the board at runtime for any
+  `delegated_child_context()` caller (defence in depth; mirrors kanban's
+  `_reject_delegated_child_mutation`).
+- The board is keyed by the acting agent's `session_id`, and a child gets its own
+  generated id — so even a leaked call addressed a different board. Blocking it
+  removes the failure mode entirely rather than making it "usually fine".
+
 ## Remaining Follow-Ups
 
 1. **Other platforms are not enabled.** Only `cli` lists `longtask` in
-   `platform_toolsets`, so gateway platforms resolve no board tools and the
-   skill is hidden there by `requires_toolsets`. Decide per platform whether
-   long-horizon mode belongs on a chat surface at all.
+   `platform_toolsets`; the toolset is now a first-class configurable entry
+   (`hermes tools` → Long-Horizon Board), so enabling another platform is a
+   checkbox, but nobody has decided yet whether long-horizon mode belongs on a
+   chat surface at all.
 
 2. **`platform_toolsets` is not in `DEFAULT_CONFIG`.** `hermes config set
    platform_toolsets.cli '["hermes-cli","longtask"]'` writes the key correctly
@@ -380,25 +401,32 @@ delegate child (`delegate_task` stripped) gets neither.
    key. Add it to `DEFAULT_CONFIG` or to the key validator's known list so the
    supported enablement path does not look broken.
 
-3. **`longtask` is invisible in `hermes tools`.** Absent from
-   `CONFIGURABLE_TOOLSETS`, users cannot discover or toggle it from the TUI and
-   must hand-edit config. Either make it configurable (the subset test then
-   requires the board tools in `_HERMES_CORE_TOOLS`) or keep the footprint at
-   zero with a `check_fn`-gated toolset that ships no schemas until the feature
-   is on, and document the explicit-list path either way.
+3. **Tail budgeting is not implemented in the long_horizon engine.** The core
+   compressor demotes large completed tool/file outputs inside the protected
+   region (`agent/context_compressor.py`); this engine keeps the last 10 messages
+   verbatim, so a tool-heavy tail may not shrink below the threshold. The host's
+   anti-thrash breaker then stops compression and the context grows to the hard
+   provider limit. A tail budget is the fix.
 
-4. **Structured report format is still advisory.** The claim-evidence schema
-   lives in the skill and in the delegation guidance, but nothing validates a
-   child's summary against it unless the caller passes `output_schema`. Wiring
-   the report schema into the longtask delegation path is the next real gain.
+4. **Two claim stores coexist.** `session_archive` writes
+   `delegation_reports.json` from the `on_delegation` hook
+   (`session_archive_get_claims` reads it), while the board keeps
+   `reports/*.json` via `longtask_attach_report`. They are not cross-referenced
+   and the compression handoff only renders the board. Decide which is
+   authoritative: archive = raw evidence, board = conclusions.
 
-5. **`skills/research/paper` violates the authoring standards** (pre-existing,
+5. **Verification is opt-in.** `longtask.require_verification_before_unlock`
+   (default false) is what makes "no downstream work before a verification
+   result" a host guarantee; with the gate off it is still prose. Consider
+   defaulting it on once the flow has mileage behind it.
+
+6. **`skills/research/paper` violates the authoring standards** (pre-existing,
    unrelated to this branch): missing `platforms`, and a 72-char description
    against the 60-char hardline enforced by
    `tests/skills/test_authoring_standards.py`. `GRANDFATHER` is intentionally
    empty — fix the skill, do not exempt it.
 
-6. **Local full-suite noise.** `scripts/run_tests.sh` on this host reports
+7. **Local full-suite noise.** `scripts/run_tests.sh` on this host reports
    failures that are environmental rather than regressions: git 2.25.1 has no
    `git init -b` (14 tests in `tests/agent/test_coding_context.py`) and
    `pytest-asyncio` is not installed (the LSP async tests). Do not read those
