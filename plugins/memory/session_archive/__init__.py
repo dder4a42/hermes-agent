@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 from pathlib import Path
@@ -16,6 +17,8 @@ from typing import Any, Dict, List
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION
 from agent.redact import redact_sensitive_text
 from utils import atomic_json_write
+
+logger = logging.getLogger(__name__)
 
 
 SEARCH_SCHEMA = {
@@ -100,10 +103,13 @@ class SessionArchiveProvider(MemoryProvider):
     pre_compress_checkpoint_api_version = PRE_COMPRESS_CHECKPOINT_API_VERSION
     max_messages_per_chunk = 20
     max_chars_per_chunk = 30_000
+    secondary_index_chunk_threshold = 24
+    secondary_index_group_size = 12
 
     def __init__(self) -> None:
         self._session_id = ""
         self._root: Path | None = None
+        self._config: Dict[str, Any] = {}
 
     @property
     def name(self) -> str:
@@ -116,6 +122,31 @@ class SessionArchiveProvider(MemoryProvider):
         hermes_home = Path(str(kwargs.get("hermes_home") or Path.home() / ".hermes"))
         self._root = hermes_home / "session_archive"
         self._session_id = _safe_id(session_id)
+        self._config = self._load_config()
+        self.max_messages_per_chunk = _bounded_int(
+            self._config.get("max_messages_per_chunk"),
+            self.max_messages_per_chunk,
+            1,
+            100,
+        )
+        self.max_chars_per_chunk = _bounded_int(
+            self._config.get("max_chars_per_chunk"),
+            self.max_chars_per_chunk,
+            2000,
+            200_000,
+        )
+        self.secondary_index_chunk_threshold = _bounded_int(
+            self._config.get("secondary_index_chunk_threshold"),
+            self.secondary_index_chunk_threshold,
+            2,
+            1000,
+        )
+        self.secondary_index_group_size = _bounded_int(
+            self._config.get("secondary_index_group_size"),
+            self.secondary_index_group_size,
+            2,
+            100,
+        )
         self._session_dir().mkdir(parents=True, exist_ok=True)
 
     def on_session_switch(
@@ -167,11 +198,27 @@ class SessionArchiveProvider(MemoryProvider):
             "Use session_archive_search(query) and session_archive_expand(chunk_id) to recover raw pre-compression context.",
         ]
         for chunk in chunks[:12]:
+            summary = chunk.get("summary") or chunk["preview"]
             lines.append(
-                f"- {chunk['chunk_id']} messages={chunk['message_start']}-{chunk['message_end']} preview={chunk['preview']}"
+                f"- {chunk['chunk_id']} messages={chunk['message_start']}-{chunk['message_end']} summary={summary}"
             )
         if len(chunks) > 12:
             lines.append(f"- ... {len(chunks) - 12} more chunks archived")
+        secondary = self._read_secondary_index()
+        if secondary:
+            lines.append(
+                f"secondary_index: {len(secondary)} recap group(s) available in archive"
+            )
+            for group in secondary[:6]:
+                chunk_ids = [
+                    str(chunk_id)
+                    for chunk_id in (group.get("chunk_ids") or [])
+                    if chunk_id
+                ]
+                lines.append(
+                    f"- {group.get('group_id')} chunks={','.join(chunk_ids)} "
+                    f"summary={str(group.get('summary') or '')[:700]}"
+                )
         return "\n".join(lines)
 
     def on_delegation(
@@ -214,6 +261,7 @@ class SessionArchiveProvider(MemoryProvider):
                 "message_start": item.get("message_start"),
                 "message_end": item.get("message_end"),
                 "created_at": item.get("created_at"),
+                "summary": redact_sensitive_text(str(item.get("summary") or ""), force=True),
                 "preview": redact_sensitive_text(str(item.get("preview") or ""), force=True),
             })
             if len(results) >= limit:
@@ -238,6 +286,7 @@ class SessionArchiveProvider(MemoryProvider):
             "chunk_id": data.get("chunk_id", chunk_id),
             "message_start": data.get("message_start"),
             "message_end": data.get("message_end"),
+            "summary": data.get("summary") or "",
             "truncated": truncated,
             "content": redacted,
         }
@@ -278,6 +327,7 @@ class SessionArchiveProvider(MemoryProvider):
         if current:
             chunks.append(self._store_chunk(current, start, len(messages) - 1, source=source))
         self._merge_index(chunks)
+        self._maybe_write_secondary_index()
         return chunks
 
     def _store_chunk(
@@ -293,6 +343,7 @@ class SessionArchiveProvider(MemoryProvider):
             f"{self._session_id}\0{start}\0{end}\0{joined}".encode("utf-8", "replace")
         ).hexdigest()[:16]
         chunk_id = f"chk-{start}-{end}-{digest}"
+        summary = self._summarize_chunk(joined, messages=messages)
         payload = {
             "chunk_id": chunk_id,
             "session_id": self._session_id,
@@ -300,6 +351,7 @@ class SessionArchiveProvider(MemoryProvider):
             "created_at": time.time(),
             "message_start": start,
             "message_end": end,
+            "summary": summary,
             "messages": messages,
         }
         atomic_json_write(self._chunks_dir() / f"{chunk_id}.json", payload, indent=2, mode=0o600)
@@ -309,9 +361,131 @@ class SessionArchiveProvider(MemoryProvider):
             "created_at": payload["created_at"],
             "message_start": start,
             "message_end": end,
+            "summary": summary,
             "preview": preview,
-            "search_text": joined[:20_000],
+            "search_text": f"{summary}\n{joined[:20_000]}",
         }
+
+    def _summarize_chunk(self, text: str, *, messages: List[Dict[str, Any]]) -> str:
+        cfg = self._summary_config()
+        if not cfg.get("enabled"):
+            return self._fallback_summary(messages, text)
+        sample = text[:_bounded_int(cfg.get("max_input_chars"), 12_000, 1000, 80_000)]
+        prompt = (
+            "Summarize this Hermes transcript chunk for later long-horizon "
+            "context reconstruction. Preserve task phase, concrete decisions, "
+            "claims, evidence references, file paths, commands, failures, and "
+            "open questions. Do not invent facts. Return concise plain text "
+            "with sections: Phase, Claims/Evidence, Decisions, Open Questions.\n\n"
+            f"{sample}"
+        )
+        try:
+            from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+
+            response = call_llm(
+                task="session_archive_summary",
+                provider=cfg.get("provider") or None,
+                model=cfg.get("model") or None,
+                base_url=cfg.get("base_url") or None,
+                api_key=cfg.get("api_key") or None,
+                api_mode=cfg.get("api_mode") or None,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You write compact, evidence-preserving recap "
+                            "notes for an AI agent's archived conversation."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0,
+                max_tokens=_bounded_int(cfg.get("max_tokens"), 500, 100, 2000),
+                timeout=float(cfg.get("timeout") or 30),
+            )
+            summary = (extract_content_or_reasoning(response) or "").strip()
+        except Exception as exc:
+            logger.debug("session_archive chunk summary failed: %s", exc)
+            summary = ""
+        if not summary:
+            return self._fallback_summary(messages, text)
+        return redact_sensitive_text(summary[:4000], force=True, redact_url_credentials=True)
+
+    def _fallback_summary(self, messages: List[Dict[str, Any]], text: str) -> str:
+        roles: Dict[str, int] = {}
+        for message in messages:
+            role = str(message.get("role") or "unknown")
+            roles[role] = roles.get(role, 0) + 1
+        role_text = ", ".join(f"{role}:{count}" for role, count in sorted(roles.items()))
+        preview = redact_sensitive_text(
+            text[:500].replace("\n", " "),
+            force=True,
+            redact_url_credentials=True,
+        )
+        return f"Deterministic recap ({role_text}): {preview}"
+
+    def _maybe_write_secondary_index(self) -> None:
+        index = self._read_index()
+        if len(index) < self.secondary_index_chunk_threshold:
+            return
+        groups = []
+        for group_index, start in enumerate(
+            range(0, len(index), self.secondary_index_group_size),
+            start=1,
+        ):
+            items = index[start:start + self.secondary_index_group_size]
+            if not items:
+                continue
+            summaries = "\n".join(
+                f"- {item.get('chunk_id')}: {item.get('summary') or item.get('preview') or ''}"
+                for item in items
+            )
+            groups.append(
+                {
+                    "group_id": f"recap-{group_index}",
+                    "chunk_ids": [item.get("chunk_id") for item in items],
+                    "message_start": items[0].get("message_start"),
+                    "message_end": items[-1].get("message_end"),
+                    "summary": self._summarize_secondary_group(summaries),
+                    "updated_at": time.time(),
+                }
+            )
+        atomic_json_write(self._secondary_index_path(), groups, indent=2, mode=0o600)
+
+    def _summarize_secondary_group(self, summaries: str) -> str:
+        cfg = self._summary_config()
+        if not cfg.get("enabled"):
+            return summaries[:3000]
+        try:
+            from agent.auxiliary_client import call_llm, extract_content_or_reasoning
+
+            response = call_llm(
+                task="session_archive_summary",
+                provider=cfg.get("provider") or None,
+                model=cfg.get("model") or None,
+                base_url=cfg.get("base_url") or None,
+                api_key=cfg.get("api_key") or None,
+                api_mode=cfg.get("api_mode") or None,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You compress several archived chunk recaps into "
+                            "one higher-level stage recap for progressive disclosure."
+                        ),
+                    },
+                    {"role": "user", "content": summaries[:12_000]},
+                ],
+                temperature=0,
+                max_tokens=_bounded_int(cfg.get("secondary_max_tokens"), 700, 100, 2500),
+                timeout=float(cfg.get("timeout") or 30),
+            )
+            text = (extract_content_or_reasoning(response) or "").strip()
+            if text:
+                return redact_sensitive_text(text[:5000], force=True, redact_url_credentials=True)
+        except Exception as exc:
+            logger.debug("session_archive secondary summary failed: %s", exc)
+        return summaries[:3000]
 
     def _merge_index(self, chunks: List[Dict[str, Any]]) -> None:
         existing = self._read_index()
@@ -341,6 +515,39 @@ class SessionArchiveProvider(MemoryProvider):
             return []
         return data if isinstance(data, list) else []
 
+    def _read_secondary_index(self) -> List[Dict[str, Any]]:
+        path = self._secondary_index_path()
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        return data if isinstance(data, list) else []
+
+    def _summary_config(self) -> Dict[str, Any]:
+        cfg = self._config.get("llm_summary", {})
+        if not isinstance(cfg, dict):
+            cfg = {}
+        merged = dict(cfg)
+        merged["enabled"] = bool(merged.get("enabled", False))
+        return merged
+
+    def _load_config(self) -> Dict[str, Any]:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+            memory_cfg = config.get("memory", {}) if isinstance(config, dict) else {}
+            archive_cfg = (
+                memory_cfg.get("session_archive", {})
+                if isinstance(memory_cfg, dict)
+                else {}
+            )
+            return dict(archive_cfg) if isinstance(archive_cfg, dict) else {}
+        except Exception:
+            return {}
+
     def _session_dir(self) -> Path:
         root = self._root or Path.home() / ".hermes" / "session_archive"
         return root / self._session_id
@@ -355,6 +562,9 @@ class SessionArchiveProvider(MemoryProvider):
 
     def _reports_path(self) -> Path:
         return self._session_dir() / "delegation_reports.json"
+
+    def _secondary_index_path(self) -> Path:
+        return self._session_dir() / "secondary_index.json"
 
 
 def register(ctx) -> None:

@@ -216,11 +216,15 @@ Storage model:
 
 - chunk original messages before compression under
   `<HERMES_HOME>/session_archive/<session_id>/chunks/`;
+- write a chunk-level semantic summary when
+  `memory.session_archive.llm_summary.enabled: true`;
 - preserve raw tool outputs outside the prompt;
 - attach message offsets, timestamps, previews, and chunk hashes;
 - return a compact checkpoint manifest to compression as `memory_context`;
 - declare checkpoint API v2 support so `compression.checkpoint_required: true`
   fails closed instead of discarding history without a durable archive.
+- create a secondary recap index after enough chunks accumulate, so the handoff
+  can reveal stage-level summaries first and raw chunks only on demand.
 
 ## Phase 5: Long-Horizon Context Engine
 
@@ -253,6 +257,9 @@ Enable the implemented first pass with:
 ```yaml
 memory:
   provider: session_archive
+  session_archive:
+    llm_summary:
+      enabled: true
 
 context:
   engine: long_horizon
@@ -268,24 +275,26 @@ Step 1: host integration test.
 - Assert the host invokes `on_pre_compress()`, writes archive chunks, and commits
   a compacted session containing the archive manifest.
 
-Step 2: richer retrieval filters.
+Step 2: structured handoff.
 
-- Extend `session_archive_search()` with role, tool name, task ID, node ID, and
-  time filters.
-- Keep returned snippets bounded and include stable chunk IDs.
-- Add tests for role/tool filters and expansion by chunk ID.
+- Teach the context engine to read the current task board and include active
+  objective, current node frontier, accepted claims, unresolved claims,
+  decisions, and open questions.
+- Prefer stage recap summaries and chunk IDs over raw historical tool output.
 
 Step 3: rolling summaries.
 
-- Add rolling summaries over archived chunks so the prompt gets semantic
-  continuity without raw historical tool output.
+- Add periodic recap outside compression so chunks can align with task phases,
+  not only with token pressure.
+- Keep the chunk summary prompt evidence-preserving and plain-text so it can be
+  used by small SJTU/Qwen-style auxiliary models.
 - Keep claim-evidence summaries in prompt, but store full evidence in the
   archive.
 
-Step 4: task-board manifest.
+Step 4: lightweight retrieval filters.
 
-- Teach the context engine to read the current task board and include active
-  objective, accepted claims, unresolved claims, and archive pointers.
+- Extend `session_archive_search()` with role, tool name, task ID, node ID, and
+  time filters only if simple substring search becomes too noisy.
 - Verify that long sessions can compact even when recent user turns and tool
   outputs would otherwise exceed the protected tail budget.
 

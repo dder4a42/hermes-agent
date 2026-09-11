@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 from plugins.memory.session_archive import SessionArchiveProvider
 
@@ -52,3 +53,54 @@ def test_tools_search_expand_and_claims(tmp_path):
 
     claims = json.loads(provider.handle_tool_call("session_archive_get_claims", {}))
     assert claims["reports"][0]["child_session_id"] == "child-1"
+
+
+def test_llm_chunk_summary_is_stored_and_manifested(tmp_path, monkeypatch):
+    provider = SessionArchiveProvider()
+    provider.initialize("summary-session", hermes_home=str(tmp_path))
+    provider._config = {"llm_summary": {"enabled": True, "max_tokens": 200}}
+
+    def fake_call_llm(**kwargs):
+        assert kwargs["task"] == "session_archive_summary"
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="Phase: routing setup\nClaims/Evidence: curl reached SJTU",
+                        reasoning=None,
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+
+    manifest = provider.on_pre_compress([
+        {"role": "user", "content": "Configure SJTU VPN routing."},
+        {"role": "assistant", "content": "curl reached SJTU."},
+    ])
+
+    assert "Phase: routing setup" in manifest
+    result = provider.search("routing setup")
+    assert result["results"][0]["summary"].startswith("Phase: routing setup")
+    expanded = provider.expand(result["results"][0]["chunk_id"])
+    assert "curl reached SJTU" in expanded["summary"]
+
+
+def test_secondary_index_is_created_after_threshold(tmp_path):
+    provider = SessionArchiveProvider()
+    provider.initialize("secondary-session", hermes_home=str(tmp_path))
+    provider.secondary_index_chunk_threshold = 2
+    provider.secondary_index_group_size = 2
+    provider.max_messages_per_chunk = 1
+
+    provider.on_pre_compress([
+        {"role": "user", "content": "stage one"},
+        {"role": "assistant", "content": "stage two"},
+        {"role": "user", "content": "stage three"},
+    ])
+
+    secondary = provider._read_secondary_index()
+    assert secondary
+    assert secondary[0]["group_id"] == "recap-1"
+    assert len(secondary[0]["chunk_ids"]) == 2
