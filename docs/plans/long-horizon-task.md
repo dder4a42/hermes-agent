@@ -238,7 +238,9 @@ Implemented first pass:
 Compression output should preserve:
 
 - active user request and newest incomplete tool round;
-- task board manifest;
+- task board manifest, including objective, node status counts, ready frontier,
+  blocked/running nodes, recent terminal nodes, claims, report paths, and
+  verifier summaries;
 - current objective, accepted decisions, constraints, and open questions;
 - claim-evidence digest with archive chunk references;
 - retrieval instructions for expanding archived chunks.
@@ -260,6 +262,11 @@ memory:
   session_archive:
     llm_summary:
       enabled: true
+      provider: Models.sjtu.edu.cn
+      model: qwen
+      timeout: 30
+      max_tokens: 1200
+      secondary_max_tokens: 1600
 
 context:
   engine: long_horizon
@@ -275,11 +282,10 @@ Step 1: host integration test.
 - Assert the host invokes `on_pre_compress()`, writes archive chunks, and commits
   a compacted session containing the archive manifest.
 
-Step 2: structured handoff.
+Step 2: structured handoff follow-up.
 
-- Teach the context engine to read the current task board and include active
-  objective, current node frontier, accepted claims, unresolved claims,
-  decisions, and open questions.
+- Extend the implemented task-board handoff with explicit accepted vs rejected
+  claim groupings and node-level archive chunk references.
 - Prefer stage recap summaries and chunk IDs over raw historical tool output.
 
 Step 3: rolling summaries.
