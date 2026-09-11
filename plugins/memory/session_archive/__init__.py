@@ -6,10 +6,12 @@ large transcripts without making old tool evidence permanently unreachable.
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import logging
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List
@@ -111,12 +113,21 @@ class SessionArchiveProvider(MemoryProvider):
     # exceed it and the pass is abandoned — "Context compression made no
     # progress" — leaving the context over the provider limit. A 700-message
     # transcript is ~36 chunks; summarising each one sequentially (30s timeout,
-    # plus the client's own retry) blew straight through that budget, so both a
-    # count cap and a wall-clock budget are enforced here. Chunks are always
-    # written; only the progressive-disclosure summaries are rationed, newest
-    # first (recency is what retrieval actually hits).
-    max_llm_summaries_per_pass = 6
-    llm_summary_budget_seconds = 45.0
+    # plus the client's own retry) blew straight through that budget. Chunks are
+    # always written; only the progressive-disclosure summaries are rationed,
+    # newest first (recency is what retrieval actually hits).
+    #
+    # Budgets are an ABORT VALVE, not the normal path (user ruling, 2026-09-12:
+    # in-path summarisation is the design — a compression pass IS a context
+    # rebuild, so summary quality outranks pass latency). They stop a hung
+    # provider, and they sit just under the host's own inactivity window
+    # (compression.context_timeout_seconds, default 120s) so the archive degrades
+    # to deterministic recaps on its own terms instead of having the whole pass
+    # aborted mid-flight. Concurrency is what makes the full set affordable:
+    # 36 chunks × ~8s serially exceeds that window on its own.
+    max_llm_summaries_per_pass = 64
+    llm_summary_budget_seconds = 120.0
+    llm_summary_concurrency = 4
 
     def __init__(self) -> None:
         self._session_id = ""
@@ -124,6 +135,7 @@ class SessionArchiveProvider(MemoryProvider):
         self._config: Dict[str, Any] = {}
         self._llm_summary_calls = 0
         self._llm_summary_deadline: Optional[float] = None
+        self._llm_summary_lock = threading.Lock()
 
     @property
     def name(self) -> str:
@@ -174,6 +186,12 @@ class SessionArchiveProvider(MemoryProvider):
                 0,
                 600,
             )
+        )
+        self.llm_summary_concurrency = _bounded_int(
+            self._config.get("llm_summary_concurrency"),
+            self.llm_summary_concurrency,
+            1,
+            16,
         )
         self._session_dir().mkdir(parents=True, exist_ok=True)
 
@@ -383,7 +401,7 @@ class SessionArchiveProvider(MemoryProvider):
         groups = self._message_chunks(messages)
 
         # Decide which chunks may spend an LLM call BEFORE writing anything:
-        # only fresh ones (a cached chunk re-emits for free — see _store_chunk),
+        # only fresh ones (a cached chunk re-emits for free — see _prepare_chunk),
         # and only the newest few. Everything else is written with a deterministic
         # recap, so the pass stays bounded no matter how long the transcript is.
         allow_llm: set = set()
@@ -398,8 +416,8 @@ class SessionArchiveProvider(MemoryProvider):
         self._llm_summary_calls = 0
         self._llm_summary_deadline = time.monotonic() + self.llm_summary_budget_seconds
 
-        chunks = [
-            self._store_chunk(
+        prepared = [
+            self._prepare_chunk(
                 group,
                 start,
                 end,
@@ -408,11 +426,16 @@ class SessionArchiveProvider(MemoryProvider):
             )
             for start, end, group in groups
         ]
+        summaries = self._summarize_chunks_concurrently(prepared)
+        chunks = [
+            self._write_prepared_chunk(item, summary)
+            for item, summary in zip(prepared, summaries)
+        ]
         self._merge_index(chunks)
         self._maybe_write_secondary_index()
         return chunks
 
-    def _store_chunk(
+    def _prepare_chunk(
         self,
         messages: List[Dict[str, Any]],
         start: int,
@@ -421,6 +444,12 @@ class SessionArchiveProvider(MemoryProvider):
         source: str,
         allow_llm: bool = True,
     ) -> Dict[str, Any]:
+        """Deterministic per-chunk setup: no LLM call, no write.
+
+        Split out of :meth:`_store_chunk` so the LLM work for every chunk can be
+        dispatched to a pool before anything is written (see
+        :meth:`_summarize_chunks_concurrently`).
+        """
         joined = "\n\n".join(_message_text(m) for m in messages)
         chunk_id = self._chunk_id_for(start, end, messages)
         chunk_path = self._chunks_dir() / f"{chunk_id}.json"
@@ -431,33 +460,130 @@ class SessionArchiveProvider(MemoryProvider):
             # the whole transcript on every pass, so summarizing again burned one
             # LLM call per chunk per pass on inputs that had not changed —
             # measured: a byte-identical second pass still fired the summarizer.
-            return self._chunk_entry(
-                chunk_id,
-                start,
-                end,
-                str(cached["summary"]),
-                cached.get("messages") or messages,
-                cached.get("created_at"),
-            )
-        if allow_llm:
-            summary = self._summarize_chunk(joined, messages=messages)
-        else:
-            # Past the pass budget (or summaries disabled): keep the chunk and its
-            # deterministic recap, skip the model call.
-            summary = self._fallback_summary(messages, joined)
+            return {
+                "messages": messages,
+                "start": start,
+                "end": end,
+                "source": source,
+                "joined": joined,
+                "chunk_id": chunk_id,
+                "chunk_path": chunk_path,
+                "allow_llm": False,
+                "cached_entry": self._chunk_entry(
+                    chunk_id,
+                    start,
+                    end,
+                    str(cached["summary"]),
+                    cached.get("messages") or messages,
+                    cached.get("created_at"),
+                ),
+            }
+        return {
+            "messages": messages,
+            "start": start,
+            "end": end,
+            "source": source,
+            "joined": joined,
+            "chunk_id": chunk_id,
+            "chunk_path": chunk_path,
+            "allow_llm": bool(allow_llm),
+            "cached_entry": None,
+        }
+
+    def _summarize_chunks_concurrently(
+        self, prepared: List[Dict[str, Any]]
+    ) -> List[Optional[str]]:
+        """Summarise every LLM-eligible chunk, at most ``llm_summary_concurrency`` at a time.
+
+        Returns one entry per prepared chunk — ``None`` where no LLM call was
+        allowed or the call failed, in which case the caller writes the
+        deterministic recap. Results are collected in submission order, so a
+        summary can never land on the wrong chunk.
+        """
+        results: List[Optional[str]] = [None] * len(prepared)
+        pending = [i for i, item in enumerate(prepared) if item.get("allow_llm")]
+        if not pending:
+            return results
+        workers = max(1, min(int(self.llm_summary_concurrency), len(pending)))
+        if workers == 1:
+            for index in pending:
+                item = prepared[index]
+                results[index] = self._summarize_chunk(
+                    item["joined"], messages=item["messages"]
+                )
+            return results
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="archive-summary"
+        ) as pool:
+            futures = {
+                index: pool.submit(
+                    self._summarize_chunk,
+                    prepared[index]["joined"],
+                    messages=prepared[index]["messages"],
+                )
+                for index in pending
+            }
+            for index, future in futures.items():
+                try:
+                    results[index] = future.result()
+                except Exception:
+                    logger.debug(
+                        "chunk summary %s failed; falling back to a recap",
+                        prepared[index]["chunk_id"],
+                        exc_info=True,
+                    )
+        return results
+
+    def _write_prepared_chunk(
+        self, item: Dict[str, Any], summary: Optional[str]
+    ) -> Dict[str, Any]:
+        """Persist one chunk unconditionally and return its index entry."""
+        if item.get("cached_entry") is not None:
+            return item["cached_entry"]
+        if summary is None:
+            # Past the pass budget (or summaries disabled/failed): keep the chunk
+            # and its deterministic recap, skip the model call.
+            summary = self._fallback_summary(item["messages"], item["joined"])
         created_at = time.time()
         payload = {
-            "chunk_id": chunk_id,
+            "chunk_id": item["chunk_id"],
             "session_id": self._session_id,
-            "source": source,
+            "source": item["source"],
             "created_at": created_at,
-            "message_start": start,
-            "message_end": end,
+            "message_start": item["start"],
+            "message_end": item["end"],
             "summary": summary,
-            "messages": messages,
+            "messages": item["messages"],
         }
-        atomic_json_write(chunk_path, payload, indent=2, mode=0o600)
-        return self._chunk_entry(chunk_id, start, end, summary, messages, created_at)
+        atomic_json_write(item["chunk_path"], payload, indent=2, mode=0o600)
+        return self._chunk_entry(
+            item["chunk_id"],
+            item["start"],
+            item["end"],
+            summary,
+            item["messages"],
+            created_at,
+        )
+
+    def _store_chunk(
+        self,
+        messages: List[Dict[str, Any]],
+        start: int,
+        end: int,
+        *,
+        source: str,
+        allow_llm: bool = True,
+    ) -> Dict[str, Any]:
+        """Single-chunk path: prepare → summarise → write."""
+        item = self._prepare_chunk(
+            messages, start, end, source=source, allow_llm=allow_llm
+        )
+        summary = (
+            self._summarize_chunk(item["joined"], messages=item["messages"])
+            if item.get("allow_llm")
+            else None
+        )
+        return self._write_prepared_chunk(item, summary)
 
     def _chunk_entry(
         self,
@@ -501,7 +627,8 @@ class SessionArchiveProvider(MemoryProvider):
         try:
             from agent.auxiliary_client import call_llm, extract_content_or_reasoning
 
-            self._llm_summary_calls += 1
+            with self._llm_summary_lock:
+                self._llm_summary_calls += 1
             response = call_llm(
                 task="session_archive_summary",
                 provider=cfg.get("provider") or None,
@@ -602,7 +729,8 @@ class SessionArchiveProvider(MemoryProvider):
         try:
             from agent.auxiliary_client import call_llm, extract_content_or_reasoning
 
-            self._llm_summary_calls += 1
+            with self._llm_summary_lock:
+                self._llm_summary_calls += 1
             response = call_llm(
                 task="session_archive_summary",
                 provider=cfg.get("provider") or None,

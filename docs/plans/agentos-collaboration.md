@@ -198,19 +198,51 @@ compression work in parallel.
 
 ## 6. Incident log
 
-**2026-09-12 — compression abandoned as "no progress" (fixed in f11240ca28).**
-A 710-message / ~817k-token session triggered compression; the archive summarised
-every ~20-message chunk with its own blocking LLM call (30s timeout each, plus
-the auxiliary client's retry), and the host's inactivity watchdog fired at 120s
-(`compression.context_timeout_seconds`) — ten `session_archive_summary` calls
-between 03:49:52 and 03:51:51, then "continuing without compression". The context
-stayed at ~638k tokens and the next request died on the provider's token limit
-(HTTP 429).
+**2026-09-12 — compression abandoned as "no progress" (stopgap f11240ca28; config fixed; P7/P8).**
 
-Lesson for this port: **anything a plugin runs inside `on_pre_compress` sits on
-the compression critical path and is bounded by that watchdog.** Chunks (the
-recoverable evidence) must be written unconditionally; only enrichment — LLM
-summaries, stage recaps — may be rationed. The stopgap rations them
-(`max_llm_summaries_per_pass`, `llm_summary_budget_seconds`); P7 removes the
-enrichment from the pass entirely.
+Two halves, and the engine was never one of them:
+
+1. **The route.** `memory.session_archive.llm_summary` pinned the summariser to
+   `provider: Models.sjtu.edu.cn` / `model: qwen` — the provider value is a
+   *display name*, not a provider id. In a clean process that resolution ends in
+   `AuthenticationError: LiteLLM Virtual Key expected. Received=no-k…ired` (401)
+   in 1.2s; inside the live agent it silently rode the main runtime while
+   swapping the model to `qwen`, so nothing surfaced. Every chunk then stalled
+   into the 30s timeout (plus the auxiliary client's transient retry).
+2. **Invisibility.** Nothing in that stretch ticked the pass's progress fence, so
+   the host's inactivity watchdog (`compression.context_timeout_seconds`, default
+   120s) fired — ten `session_archive_summary` calls between 03:49:52 and
+   03:51:51, then "continuing without compression". The context stayed ~638k
+   tokens and the next request died on the provider's token limit (HTTP 429).
+
+The long_horizon handoff is local and fast; the earlier 02:56 pass committed a
+179-message session in 65.6s. Compression was not the failing part — a silent,
+slow, mistargeted auxiliary call inside it was.
+
+**Decision (user, 2026-09-12): in-path summarisation is the design, not the bug.**
+Triggering compression IS a context rebuild, and the rebuilt context is what the
+following turns reason from — so summary quality outranks pass latency. What
+therefore had to change:
+
+- **Summariser = the main model.** `provider: auto` / `model: auto` (measured
+  4.8s in `call_llm`, 7.7s through the archive's own `_summarize_chunk`, real LLM
+  output, served by the main route). Context and capability now track the main
+  agent; `max_input_chars` raised 12k → 24k so tool-heavy chunks are not clipped.
+- **The pass must be able to see the progress.** Chunk summaries run concurrently
+  (P7, measured: 12 chunks / 12 calls / 12 LLM summaries in 11.6s at
+  `llm_summary_concurrency: 4`, per-call 1.5-7.9s ⇒ ~35s extrapolated for the
+  36-chunk / 700-message case, versus ~139s serially). Heartbeating the fence is
+  the remaining piece for backlogs that outrun even that.
+- **Budgets become an abort valve, not the normal path** — `max_llm_summaries_per_pass`
+  (64) / `llm_summary_budget_seconds` (120s) exist to stop a hung provider, and
+  they sit just under the host's own inactivity window so the archive degrades to
+  deterministic recaps on its own terms instead of being killed mid-pass.
+
+Lesson for this port: anything a plugin runs inside `on_pre_compress` sits on the
+compression critical path and is **invisible to the host's progress tracker unless
+it ticks the fence**. Chunks (the recoverable evidence) must be written
+unconditionally; enrichment may be rationed only as an abort valve. And an
+unrecognized `provider` in auxiliary config must fail loudly rather than silently
+inheriting the main runtime with a substituted model (P8).
+
 

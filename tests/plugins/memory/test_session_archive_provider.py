@@ -1,4 +1,7 @@
 import json
+import re
+import threading
+import time
 from types import SimpleNamespace
 
 from plugins.memory.session_archive import SessionArchiveProvider
@@ -107,9 +110,15 @@ def test_secondary_index_is_created_after_threshold(tmp_path):
 
 
 def _summary_stub(calls, text="RECAP"):
-    """A call_llm stand-in that counts invocations."""
+    """A call_llm stand-in that counts invocations.
+
+    Chunk summaries run in a thread pool, so the counter is guarded.
+    """
+    lock = threading.Lock()
+
     def fake_call_llm(**_kwargs):
-        calls["n"] += 1
+        with lock:
+            calls["n"] += 1
         return SimpleNamespace(
             choices=[
                 SimpleNamespace(
@@ -183,9 +192,11 @@ def test_summarization_prefers_the_newest_chunks(tmp_path, monkeypatch):
     provider.max_messages_per_chunk = 1
     provider.max_llm_summaries_per_pass = 2
     calls = {"n": 0}
+    lock = threading.Lock()
 
     def fake_call_llm(**kwargs):
-        calls["n"] += 1
+        with lock:
+            calls["n"] += 1
         text = kwargs["messages"][-1]["content"]
         label = "OLD" if "msg 0" in text else "NEW"
         return SimpleNamespace(
@@ -273,3 +284,81 @@ def test_secondary_recaps_reuse_unchanged_groups(tmp_path, monkeypatch):
     calls["n"] = 0
     provider._maybe_write_secondary_index()
     assert calls["n"] == 1, "granular invalidation: only the changed group"
+
+
+def test_chunk_summaries_run_in_a_pool_and_stay_bound_to_their_chunk(
+    tmp_path, monkeypatch
+):
+    """Pooled summaries must not cross chunks.
+
+    A 700-message pass is ~36 chunks; at ~8s per summary, one blocking call per
+    chunk spends roughly five minutes inside compression and the host's
+    inactivity watchdog (compression.context_timeout_seconds, default 120s)
+    abandons the whole pass. The pool is what makes the in-path design
+    affordable, so the chunk→summary mapping has to survive out-of-order
+    completion.
+    """
+    provider = SessionArchiveProvider()
+    provider.initialize("parallel-session", hermes_home=str(tmp_path))
+    provider._config = {"llm_summary": {"enabled": True, "max_tokens": 200}}
+    provider.max_messages_per_chunk = 1
+    provider.max_llm_summaries_per_pass = 6
+    provider.llm_summary_concurrency = 3
+
+    state = {"active": 0, "peak": 0}
+    state_lock = threading.Lock()
+
+    def fake_call_llm(**kwargs):
+        text = kwargs["messages"][-1]["content"]
+        label = re.search(r"msg (\d+)", text).group(1)
+        with state_lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        # Completion order is the reverse of submission order.
+        time.sleep(0.3 if label == "0" else 0.01)
+        with state_lock:
+            state["active"] -= 1
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=f"summary-of-msg-{label}", reasoning=None
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+
+    provider.on_pre_compress(
+        [{"role": "user", "content": f"msg {i}"} for i in range(6)]
+    )
+
+    index = provider._read_index()
+    assert len(index) == 6, "every chunk is still archived"
+    for item in index:
+        assert item["summary"] == f"summary-of-msg-{item['message_start']}", (
+            "a pooled summary must land on the chunk it was computed from"
+        )
+    assert state["peak"] >= 2, "eligible summaries must actually overlap"
+
+
+def test_concurrency_one_serializes_without_losing_summaries(tmp_path, monkeypatch):
+    """The pool degrades to the old serial loop, same results."""
+    provider = SessionArchiveProvider()
+    provider.initialize("serial-session", hermes_home=str(tmp_path))
+    provider._config = {"llm_summary": {"enabled": True, "max_tokens": 200}}
+    provider.max_messages_per_chunk = 1
+    provider.max_llm_summaries_per_pass = 6
+    provider.llm_summary_concurrency = 1
+    calls = {"n": 0}
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", _summary_stub(calls))
+
+    provider.on_pre_compress(
+        [{"role": "user", "content": f"msg {i}"} for i in range(6)]
+    )
+
+    index = provider._read_index()
+    assert calls["n"] == 6, "one summary per eligible chunk"
+    assert len(index) == 6
+    assert all(item["summary"] == "RECAP" for item in index)
