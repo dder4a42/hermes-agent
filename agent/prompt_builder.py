@@ -478,6 +478,81 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "in doubt and the calls are independent, batch them."
 )
 
+# Subagent delegation.  Injected only when ``delegate_task`` is in THIS
+# session's schema.  The tool's own description already carries the hard rules
+# (child restrictions, self-reports, background semantics); this block exists
+# because that description is DO-NOT-heavy — a long "use these instead" list
+# with one terse USE-FOR clause — and models given only that framing default to
+# doing everything inline.  An explicit positive trigger is what actually moves
+# delegation rates.  Deliberately short: it rides in the cached prefix.
+DELEGATION_GUIDANCE = (
+    "# Subagent delegation\n"
+    "delegate_task spawns isolated subagents; only each child's final summary "
+    "returns to you, so your own context stays clean. Delegate when the work is:\n"
+    "- reasoning-heavy and would flood your context with intermediate data;\n"
+    "- two or more independent subtasks that can run in parallel — pass them "
+    "together in ONE batch (one entry per task) instead of one call per task;\n"
+    "- a bounded, self-contained investigation whose result you only need "
+    "summarized.\n"
+    "Do the work yourself when it is a couple of tool calls, purely mechanical, "
+    "or needs the user's input — subagents cannot ask questions.\n"
+    "Children know nothing of this conversation: pass every needed fact, path, "
+    "constraint, and required output language in the task's `context`. Treat "
+    "child summaries as self-reports, not verified facts — check external side "
+    "effects (writes, uploads, publishes) yourself before reporting success."
+)
+
+# Long-horizon task board.  Injected when the ``longtask`` toolset is in the
+# session's schema.  The board is what lets multi-phase work survive context
+# compression: plan, node status, and verification verdicts live on disk, not
+# in the window.  Needs no feature flag of its own — the tools' presence IS the
+# gate (the toolset is enabled per-platform via ``platform_toolsets``).
+LONGTASK_GUIDANCE_HEAD = (
+    "# Long-horizon task board\n"
+    "When a request spans many steps, has dependencies between them, or may "
+    "outlive this context window, keep the plan in the board instead of in "
+    "your head:\n"
+    "1. `longtask_create` the board — global objective plus small nodes with "
+    "explicit dependencies — before executing, or `longtask_read` to resume an "
+    "existing one.\n"
+    "2. `longtask_next` to get the ready nodes in dependency order.\n"
+)
+_LONGTASK_STEP_DELEGATE = (
+    "3. Delegate each ready node with `delegate_task` and require the child to "
+    "return a claim-evidence report.\n"
+)
+# Fallback for a longtask-only session (delegation toolset disabled): naming
+# delegate_task there would be a dangling reference.
+_LONGTASK_STEP_SOLO = (
+    "3. Work each ready node yourself and record its claim-evidence report.\n"
+)
+LONGTASK_GUIDANCE_TAIL = (
+    "4. `longtask_attach_report` the node's report, then "
+    "`longtask_verify_node`.\n"
+    "5. `longtask_update_node` only with concrete evidence or an explicit user "
+    "decision — never unlock downstream nodes before the upstream report has a "
+    "verification result.\n"
+    "Board state beats your memory of the conversation when they conflict; "
+    "after compression the board is where you recover. For a simple one-shot "
+    "request, answer directly — do not build a board for a single step."
+)
+
+
+def longtask_guidance_text(valid_tool_names=None) -> str:
+    """Render the long-horizon board guidance for the session's toolset.
+
+    Swaps in the solo step when ``delegate_task`` is absent, so the block never
+    names a tool the session doesn't have.  Deterministic per session (the
+    toolset is fixed at construction), so it stays cache-safe.
+    """
+    step = (
+        _LONGTASK_STEP_DELEGATE
+        if valid_tool_names is None or "delegate_task" in valid_tool_names
+        else _LONGTASK_STEP_SOLO
+    )
+    return LONGTASK_GUIDANCE_HEAD + step + LONGTASK_GUIDANCE_TAIL
+
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.

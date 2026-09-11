@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
+    DELEGATION_GUIDANCE,
     EXECUTION_GUIDANCE_MODELS,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
@@ -443,6 +444,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
+    # Subagent delegation + long-horizon board. Both are gated purely on the
+    # tool being in THIS session's schema (fixed at construction), so the
+    # rendered block is byte-stable for the life of the conversation. The
+    # longtask block names delegate_task only when that tool is also present;
+    # see longtask_guidance_text.
+    if "delegate_task" in agent.valid_tool_names:
+        tool_guidance.append(DELEGATION_GUIDANCE)
+    if any(name.startswith("longtask_") for name in agent.valid_tool_names):
+        from agent.prompt_builder import longtask_guidance_text
+        tool_guidance.append(longtask_guidance_text(agent.valid_tool_names))
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see
