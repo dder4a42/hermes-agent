@@ -68,6 +68,46 @@ def _handle_error(exc: Exception) -> str:
     return tool_error(f"longtask tool failed: {exc}")
 
 
+def _child_board_refusal() -> Optional[str]:
+    """Refuse board access from a delegate_task child.
+
+    The board is the parent agent's planning state, and a child could not act on
+    this board even if it tried: the board is keyed by the acting agent's
+    session_id, and a child gets its own generated id, so the call would resolve
+    a different directory (error, or a silently divergent shadow board). This is
+    the runtime half of ``DELEGATE_BLOCKED_TOOLS`` in tools/delegate_tool.py —
+    children normally never receive these schemas, and a future leak through a
+    composite toolset must not become board corruption.
+    """
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        if is_delegated_child_context():
+            return tool_error(
+                "Refused: the long-horizon board belongs to the parent agent. "
+                "A delegate_task child executes one bounded node and returns its "
+                "findings as a claim-evidence report; the parent attaches and "
+                "verifies it."
+            )
+    except Exception:
+        return None
+    return None
+
+
+def _board_handler(handler):
+    """Wrap a longtask handler with the delegated-child refusal."""
+
+    def wrapper(args: Dict[str, Any], **kw) -> str:
+        refusal = _child_board_refusal()
+        if refusal:
+            return refusal
+        return handler(args, **kw)
+
+    wrapper.__name__ = getattr(handler, "__name__", "longtask_handler")
+    wrapper.__doc__ = getattr(handler, "__doc__", None)
+    return wrapper
+
+
 def _load_longtask_config() -> Dict[str, Any]:
     try:
         from hermes_cli.config import load_config_readonly
@@ -259,7 +299,7 @@ registry.register(
             "required": ["objective", "nodes"],
         },
     },
-    handler=longtask_create_handler,
+    handler=_board_handler(longtask_create_handler),
 )
 
 registry.register(
@@ -277,7 +317,7 @@ registry.register(
             "required": [],
         },
     },
-    handler=longtask_read_handler,
+    handler=_board_handler(longtask_read_handler),
 )
 
 registry.register(
@@ -298,7 +338,7 @@ registry.register(
             "required": [],
         },
     },
-    handler=longtask_next_handler,
+    handler=_board_handler(longtask_next_handler),
 )
 
 registry.register(
@@ -337,7 +377,7 @@ registry.register(
             "required": ["node_id"],
         },
     },
-    handler=longtask_update_node_handler,
+    handler=_board_handler(longtask_update_node_handler),
 )
 
 registry.register(
@@ -363,7 +403,7 @@ registry.register(
             "required": ["node_id", "report"],
         },
     },
-    handler=longtask_attach_report_handler,
+    handler=_board_handler(longtask_attach_report_handler),
 )
 
 registry.register(
@@ -391,5 +431,5 @@ registry.register(
             "required": ["node_id"],
         },
     },
-    handler=longtask_verify_node_handler,
+    handler=_board_handler(longtask_verify_node_handler),
 )

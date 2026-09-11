@@ -43,12 +43,24 @@ The main agent owns the global objective and reasoning state. Subagents own
 bounded execution nodes only. Do not let child-agent intermediate context become
 the source of truth.
 
+The division of labour is enforced by the host, not by convention:
+
+- Subagents never receive the `longtask_*` board tools. They execute one bounded
+  node and return a claim-evidence report; the main agent attaches and verifies
+  it. Do not try to make a child update the board.
+- Attach the child's report with `longtask_attach_report`, verify it with
+  `longtask_verify_node`, and only then move the node to `done` with
+  `longtask_update_node`. A node's dependents unlock when it is `done`, so a
+  terminal status without a verification result unlocks downstream work on an
+  unverified claim.
+
 For complex work:
 
 1. Create or read a longtask board.
 2. Represent the work as a DAG of small nodes with explicit dependencies.
 3. Use `longtask_next` to select ready nodes in dependency order.
-4. Delegate ready nodes with `delegate_task` when parallelism or isolation helps.
+4. Delegate ready nodes with `delegate_task` — pass the report schema below as
+   `output_schema` so the child returns structured JSON.
 5. Require each subagent to return a claim-evidence report.
 6. Attach reports to the board with `longtask_attach_report`.
 7. Verify reports with `longtask_verify_node`.

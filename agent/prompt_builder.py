@@ -518,8 +518,10 @@ LONGTASK_GUIDANCE_HEAD = (
     "2. `longtask_next` to get the ready nodes in dependency order.\n"
 )
 _LONGTASK_STEP_DELEGATE = (
-    "3. Delegate each ready node with `delegate_task` and require the child to "
-    "return a claim-evidence report.\n"
+    "3. Delegate each ready node with `delegate_task`, passing the claim-evidence "
+    "report shape via `output_schema` so the child returns structured JSON "
+    "rather than prose you have to re-type. Children do NOT hold the board "
+    "tools — the board is yours; you attach and verify their reports.\n"
 )
 # Fallback for a longtask-only session (delegation toolset disabled): naming
 # delegate_task there would be a dangling reference.
@@ -527,11 +529,10 @@ _LONGTASK_STEP_SOLO = (
     "3. Work each ready node yourself and record its claim-evidence report.\n"
 )
 LONGTASK_GUIDANCE_TAIL = (
-    "4. `longtask_attach_report` the node's report, then "
-    "`longtask_verify_node`.\n"
+    "4. `longtask_attach_report` the report, then `longtask_verify_node`.\n"
     "5. `longtask_update_node` only with concrete evidence or an explicit user "
-    "decision — never unlock downstream nodes before the upstream report has a "
-    "verification result.\n"
+    "decision — a node's dependents unlock once it is `done`, so never mark a "
+    "node done before its report has a verification result.\n"
     "Board state beats your memory of the conversation when they conflict; "
     "after compression the board is where you recover. For a simple one-shot "
     "request, answer directly — do not build a board for a single step."

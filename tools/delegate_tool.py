@@ -47,6 +47,19 @@ from utils import base_url_hostname, is_truthy_value
 
 
 # Tools that children must never have access to
+#
+# The long-horizon board tools are on this list for a different reason than the
+# rest: the board is the MAIN agent's planning surface. A child is an executor
+# holding one bounded node, and it cannot even address the parent's board — the
+# board is keyed by the acting agent's session_id (tools/longtask_tool.py
+# ::_session_id), and a child gets its own generated session_id, so a child's
+# board call resolves a different (usually non-existent) directory and either
+# errors out or silently creates a shadow board nobody reads. Blocking them here
+# does two things at once: the `longtask` toolset is derived as fully blocked
+# and stripped from the child's toolset list, and `_blocked_toolsets_for_role`
+# adds it to the child's deny toolsets so the names are subtracted *after*
+# composite expansion (the `coding` posture toolset carries the board tools
+# inline). tools/longtask_tool.py keeps a runtime refusal as the second layer.
 DELEGATE_BLOCKED_TOOLS = frozenset(
     [
         "delegate_task",  # no recursive delegation
@@ -54,6 +67,14 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
         "cronjob",  # no scheduling more work in the parent's name
+        # Board state belongs to the parent agent's planning loop, not to a
+        # bounded executor child.
+        "longtask_create",
+        "longtask_read",
+        "longtask_next",
+        "longtask_update_node",
+        "longtask_attach_report",
+        "longtask_verify_node",
     ]
 )
 
