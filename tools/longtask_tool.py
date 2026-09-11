@@ -8,6 +8,7 @@ schedule subagents by dependency order and survive context compression.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -26,7 +27,16 @@ from tools.registry import registry, tool_error
 
 
 def _workspace_root(parent_agent: Any = None) -> Path:
-    candidates = []
+    """Resolve the workspace the board lives under.
+
+    ``TERMINAL_CWD`` is probed FIRST because it is the one input both sides can
+    see: the gateway bridges ``terminal.cwd`` into it, and the context engine
+    that renders the board into a compression handoff has no agent object to
+    consult (plugins/context_engine/long_horizon/__init__.py::_task_board_roots).
+    The probe order has to agree with that engine or the board silently drops out
+    of the handoff. The agent's own hints follow, then the process cwd.
+    """
+    candidates = [os.environ.get("TERMINAL_CWD")]
     if parent_agent is not None:
         candidates.extend(
             [
@@ -42,9 +52,27 @@ def _workspace_root(parent_agent: Any = None) -> Path:
     return Path.cwd().resolve()
 
 
-def _session_id(parent_agent: Any = None, explicit: Optional[str] = None) -> str:
+def _session_id(
+    parent_agent: Any = None,
+    explicit: Optional[str] = None,
+    runtime_session_id: Optional[str] = None,
+) -> str:
+    """Resolve which board a call addresses.
+
+    The runtime dispatch passes ``session_id`` but NEVER ``parent_agent`` —
+    ``model_tools.handle_function_call`` calls ``registry.dispatch(..., task_id=,
+    session_id=, user_task=)`` and only the plugin path injects a parent agent
+    (hermes_cli/plugins.py). Keying the board off ``parent_agent`` alone therefore
+    fell back to "default": every session in a workspace shared ONE board, while
+    the compression engine looked up the real session id and never found it.
+
+    Precedence: an explicit tool argument (a deliberate override) > the runtime
+    session id > the parent agent > "default".
+    """
     if explicit:
         return str(explicit)
+    if runtime_session_id:
+        return str(runtime_session_id)
     if parent_agent is not None:
         sid = getattr(parent_agent, "session_id", None)
         if sid:
@@ -122,7 +150,7 @@ def _load_longtask_config() -> Dict[str, Any]:
 def longtask_create_handler(args: Dict[str, Any], **kw) -> str:
     try:
         parent = kw.get("parent_agent")
-        sid = _session_id(parent, args.get("session_id"))
+        sid = _session_id(parent, args.get("session_id"), kw.get("session_id"))
         board = create_board(
             _root(parent, args.get("root")),
             sid,
@@ -145,7 +173,7 @@ def longtask_create_handler(args: Dict[str, Any], **kw) -> str:
 def longtask_read_handler(args: Dict[str, Any], **kw) -> str:
     try:
         parent = kw.get("parent_agent")
-        sid = _session_id(parent, args.get("session_id"))
+        sid = _session_id(parent, args.get("session_id"), kw.get("session_id"))
         data = read_board(
             _root(parent, args.get("root")),
             sid,
@@ -159,7 +187,7 @@ def longtask_read_handler(args: Dict[str, Any], **kw) -> str:
 def longtask_next_handler(args: Dict[str, Any], **kw) -> str:
     try:
         parent = kw.get("parent_agent")
-        sid = _session_id(parent, args.get("session_id"))
+        sid = _session_id(parent, args.get("session_id"), kw.get("session_id"))
         limit = args.get("limit")
         if limit is not None:
             limit = int(limit)
@@ -172,7 +200,7 @@ def longtask_next_handler(args: Dict[str, Any], **kw) -> str:
 def longtask_update_node_handler(args: Dict[str, Any], **kw) -> str:
     try:
         parent = kw.get("parent_agent")
-        sid = _session_id(parent, args.get("session_id"))
+        sid = _session_id(parent, args.get("session_id"), kw.get("session_id"))
         data = update_node(
             _root(parent, args.get("root")),
             sid,
@@ -192,7 +220,7 @@ def longtask_update_node_handler(args: Dict[str, Any], **kw) -> str:
 def longtask_attach_report_handler(args: Dict[str, Any], **kw) -> str:
     try:
         parent = kw.get("parent_agent")
-        sid = _session_id(parent, args.get("session_id"))
+        sid = _session_id(parent, args.get("session_id"), kw.get("session_id"))
         report = args.get("report")
         if not isinstance(report, dict):
             raise LongtaskBoardError("report must be an object")
@@ -211,7 +239,7 @@ def longtask_attach_report_handler(args: Dict[str, Any], **kw) -> str:
 def longtask_verify_node_handler(args: Dict[str, Any], **kw) -> str:
     try:
         parent = kw.get("parent_agent")
-        sid = _session_id(parent, args.get("session_id"))
+        sid = _session_id(parent, args.get("session_id"), kw.get("session_id"))
         root = _root(parent, args.get("root"))
         board = load_board(root, sid)
         node_id = str(args.get("node_id") or "")

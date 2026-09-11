@@ -138,3 +138,104 @@ class TestDelegatedChildIsolation:
                 f"board tools leaked into a child of {parent_toolsets}: "
                 f"{sorted(names & LONGTASK_TOOL_NAMES)}"
             )
+
+
+class TestRuntimeContextResolution:
+    """The runtime dispatch (`model_tools.handle_function_call` ->
+    `registry.dispatch(..., task_id=, session_id=, user_task=)`) passes
+    ``session_id`` but never ``parent_agent`` — only the plugin path injects a
+    parent agent. Keying the board off ``parent_agent`` alone silently wrote
+    every session's board into one shared "default" directory, while the
+    compression engine looked the board up under the real session id and never
+    found it."""
+
+    def _dispatch(self, args, **kwargs):
+        import tools.longtask_tool  # noqa: F401  (registers the tools)
+        from tools.registry import registry
+
+        result = registry.dispatch("longtask_create", args, **kwargs)
+        return result if isinstance(result, dict) else json.loads(result)
+
+    def test_dispatch_session_id_replaces_the_default_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+        result = self._dispatch(
+            {"objective": "obj", "nodes": [{"node_id": "N1", "goal": "g"}]},
+            session_id="sid-runtime",
+        )
+
+        assert result["session_id"] == "sid-runtime"
+        assert (tmp_path / ".hermes" / "tasks" / "sid-runtime" / "board.json").exists()
+        assert not (tmp_path / ".hermes" / "tasks" / "default").exists()
+
+    def test_explicit_argument_still_wins(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+        result = self._dispatch(
+            {
+                "objective": "obj",
+                "nodes": [{"node_id": "N1", "goal": "g"}],
+                "session_id": "sid-explicit",
+            },
+            session_id="sid-runtime",
+        )
+
+        assert result["session_id"] == "sid-explicit"
+
+    def test_terminal_cwd_decides_the_board_root(self, tmp_path, monkeypatch):
+        """The gateway bridges terminal.cwd into TERMINAL_CWD; the writer and the
+        compression engine must agree on that root or the board drops out of the
+        handoff."""
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        monkeypatch.setenv("TERMINAL_CWD", str(workspace))
+
+        self._dispatch(
+            {"objective": "obj", "nodes": [{"node_id": "N1", "goal": "g"}]},
+            session_id="sid-gateway",
+        )
+
+        assert (workspace / ".hermes" / "tasks" / "sid-gateway" / "board.json").exists()
+        assert not (elsewhere / ".hermes").exists()
+
+    def test_compression_engine_sees_a_dispatch_written_board(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end contract: whatever the writer resolves, the reader must
+        resolve too — otherwise the long-horizon handoff renders no board."""
+        from plugins.context_engine.long_horizon import LongHorizonContextEngine
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.chdir(workspace)
+
+        session_id = "sid-e2e"
+        self._dispatch(
+            {
+                "objective": "Gateway objective",
+                "nodes": [{"node_id": "N1", "goal": "Drain the queue"}],
+            },
+            session_id=session_id,
+        )
+
+        engine = LongHorizonContextEngine()
+        engine.update_model(model="test", context_length=1000)
+        engine.on_session_start(session_id, platform="gateway", model="test")
+
+        handoff = engine._handoff_message(
+            original_count=9,
+            retained_count=2,
+            current_tokens=1,
+            focus_topic=None,
+            memory_context="",
+        )
+
+        assert "Task board state:" in handoff["content"]
+        assert "Drain the queue" in handoff["content"]
