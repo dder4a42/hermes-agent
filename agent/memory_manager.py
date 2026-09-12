@@ -1087,6 +1087,7 @@ class MemoryManager:
         evidence_messages: Optional[List[Dict[str, Any]]] = None,
         require_checkpoint: bool = False,
         checkpoint_api_version: int = PRE_COMPRESS_CHECKPOINT_API_VERSION,
+        progress_cb: Optional[Callable[[], None]] = None,
     ) -> str:
         """Notify all providers before context compression.
 
@@ -1103,6 +1104,14 @@ class MemoryManager:
         advertising the requested checkpoint API must return successfully;
         its exception is propagated so the caller can preserve the
         uncompressed transcript.
+
+        ``progress_cb`` lets a provider report forward progress from inside its
+        own hook. A compression pass is abandoned when its commit fence has seen
+        no progress for ``compression.context_timeout_seconds`` (default 120s),
+        and a provider doing real in-path work — chunk summaries, uploads — is
+        otherwise indistinguishable from a hung one. It is forwarded only to
+        providers whose ``on_pre_compress`` declares the keyword, so the original
+        one-argument signature keeps working unchanged.
         """
         parts = []
         checkpoint_succeeded = False
@@ -1121,8 +1130,13 @@ class MemoryManager:
             provider_messages = messages
             if is_checkpoint_provider and evidence_messages is not None:
                 provider_messages = evidence_messages
+            provider_kwargs: Dict[str, Any] = {}
+            if progress_cb is not None and self._provider_accepts_pre_compress_progress(
+                provider
+            ):
+                provider_kwargs["progress_cb"] = progress_cb
             try:
-                result = provider.on_pre_compress(provider_messages)
+                result = provider.on_pre_compress(provider_messages, **provider_kwargs)
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -1141,6 +1155,27 @@ class MemoryManager:
                 f"API v{checkpoint_api_version}"
             )
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _provider_accepts_pre_compress_progress(provider: MemoryProvider) -> bool:
+        """Whether a provider's ``on_pre_compress`` declares ``progress_cb``.
+
+        Providers opt in by naming the keyword (or by taking ``**kwargs``); one
+        written against the original single-argument signature is called exactly
+        as before. Same additive-contract pattern as
+        :meth:`_provider_memory_write_metadata_mode`.
+        """
+        try:
+            signature = inspect.signature(provider.on_pre_compress)
+        except (TypeError, ValueError):
+            return False
+        parameters = signature.parameters
+        if any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            return True
+        return "progress_cb" in parameters
 
     @staticmethod
     def _provider_memory_write_metadata_mode(provider: MemoryProvider) -> str:

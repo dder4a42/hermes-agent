@@ -465,3 +465,27 @@ def test_chunk_boundaries_prefer_user_turns(tmp_path):
     )
     groups = provider._message_chunks(long_turn)
     assert groups[0][1] < 8, "a hard limit still bounds the wait for a turn"
+
+
+def test_progress_cb_is_ticked_for_every_unit_of_in_path_work(tmp_path, monkeypatch):
+    """The host abandons a pass whose fence sees no progress for its idle budget.
+
+    Chunk summaries are real network work (seconds each, minutes on a long
+    transcript), so the archive has to say so as each one lands — otherwise a
+    long in-path pass is indistinguishable from a hung provider.
+    """
+    provider = SessionArchiveProvider()
+    provider.initialize("progress-session", hermes_home=str(tmp_path))
+    provider._config = {"llm_summary": {"enabled": True, "max_tokens": 200}}
+    provider.max_messages_per_chunk = 1
+    calls = {"n": 0}
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", _summary_stub(calls))
+
+    ticks = []
+    provider.on_pre_compress(
+        [{"role": "user", "content": f"msg {i}"} for i in range(4)],
+        progress_cb=lambda: ticks.append(1),
+    )
+
+    assert calls["n"] == 4
+    assert len(ticks) >= 4, "one tick per completed summary (plus per chunk write)"

@@ -3263,6 +3263,18 @@ def compress_context(
         # instead of silently discarding the provider's return value.
         memory_context = ""
         memory_manager = getattr(agent, "_memory_manager", None)
+        # Forward progress a provider reports from inside on_pre_compress. The host
+        # abandons a pass whose commit fence has seen no progress for
+        # compression.context_timeout_seconds (default 120s), and in-path provider
+        # work — chunk summaries that legitimately take minutes on a long
+        # transcript — looked exactly like a hung worker: a 710-message pass was
+        # killed at 120s with ten summaries already produced. The callback is the
+        # provider's own progress signal, not a keep-alive: a hung provider still
+        # ticks nothing and still times out.
+        pre_compress_progress_cb: Optional[Callable[[], None]] = None
+        _fence_touch = getattr(commit_fence, "touch_progress", None)
+        if callable(_fence_touch):
+            pre_compress_progress_cb = _fence_touch
         # Raw messages remain the historical (API v1) provider contract; the
         # normalized evidence list is handed only to API v2+ checkpoint
         # providers inside MemoryManager.on_pre_compress().
@@ -3293,6 +3305,7 @@ def compress_context(
                     evidence_messages=evidence_messages,
                     require_checkpoint=True,
                     checkpoint_api_version=PRE_COMPRESS_CHECKPOINT_API_VERSION,
+                    progress_cb=pre_compress_progress_cb,
                 )
             except Exception as exc:
                 logger.warning(
@@ -3307,7 +3320,9 @@ def compress_context(
         elif memory_manager:
             try:
                 _maybe_ctx = memory_manager.on_pre_compress(
-                    messages, evidence_messages=evidence_messages
+                    messages,
+                    evidence_messages=evidence_messages,
+                    progress_cb=pre_compress_progress_cb,
                 )
                 if isinstance(_maybe_ctx, str):
                     memory_context = sanitize_memory_context(_maybe_ctx)

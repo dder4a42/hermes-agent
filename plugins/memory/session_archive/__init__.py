@@ -14,7 +14,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION
 from agent.redact import redact_sensitive_text
@@ -113,6 +113,22 @@ def _message_hash(message: Dict[str, Any]) -> str:
     else:
         payload = f"{message.get('role') or ''}\0{_message_text(message)}"
     return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _report_progress(progress_cb: Optional[Callable[[], None]]) -> None:
+    """Tick a host-supplied progress callback; never let it break the pass.
+
+    The compression pass is abandoned when the host's fence sees no progress for
+    ``compression.context_timeout_seconds``, so a provider doing real in-path work
+    has to say so. Ticking is a bare float store on the host side and safe from
+    the pool threads the summaries run on.
+    """
+    if progress_cb is None:
+        return
+    try:
+        progress_cb()
+    except Exception:
+        logger.debug("session_archive: progress callback failed", exc_info=True)
 
 
 def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -255,8 +271,22 @@ class SessionArchiveProvider(MemoryProvider):
             )
         return json.dumps({"error": f"Unknown session archive tool: {tool_name}"})
 
-    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        chunks = self._write_checkpoint(messages, source="pre_compress")
+    def on_pre_compress(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        progress_cb: Optional[Callable[[], None]] = None,
+    ) -> str:
+        """Archive the transcript, reporting progress as units of work land.
+
+        ``progress_cb`` is ticked per completed summary and per written chunk.
+        The chunk summaries are real network work (seconds each, minutes for a
+        long transcript), and without a tick the host reads that as a hung worker
+        and abandons the whole compression pass mid-flight.
+        """
+        chunks = self._write_checkpoint(
+            messages, source="pre_compress", progress_cb=progress_cb
+        )
         index = self._read_index()
         if not chunks and not index:
             return ""
@@ -508,7 +538,9 @@ class SessionArchiveProvider(MemoryProvider):
             runs.append((start, len(messages) - 1, current))
         return runs
 
-    def _upgrade_recap_chunks(self) -> int:
+    def _upgrade_recap_chunks(
+        self, *, progress_cb: Optional[Callable[[], None]] = None
+    ) -> int:
         """Re-summarize chunks that only carry a deterministic recap.
 
         The recap is the cheap baseline that always lands on disk; the LLM
@@ -548,6 +580,7 @@ class SessionArchiveProvider(MemoryProvider):
             payload["summary"] = summary
             payload["summary_kind"] = "llm"
             atomic_json_write(path, payload, indent=2, mode=0o600)
+            _report_progress(progress_cb)
             upgraded.append(
                 self._chunk_entry(
                     chunk_id,
@@ -563,7 +596,13 @@ class SessionArchiveProvider(MemoryProvider):
             self._merge_index(upgraded)
         return len(upgraded)
 
-    def _write_checkpoint(self, messages: List[Dict[str, Any]], *, source: str) -> List[Dict[str, Any]]:
+    def _write_checkpoint(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        source: str,
+        progress_cb: Optional[Callable[[], None]] = None,
+    ) -> List[Dict[str, Any]]:
         # Only material the archive has never seen is chunked. Every compression
         # re-hands the whole transcript, so without this a pass re-summarized the
         # same messages on each attempt, and a handoff replacing the head pushed
@@ -600,14 +639,14 @@ class SessionArchiveProvider(MemoryProvider):
             )
             for start, end, group in groups
         ]
-        summaries = self._summarize_chunks_concurrently(prepared)
+        summaries = self._summarize_chunks_concurrently(prepared, progress_cb=progress_cb)
         chunks = [
-            self._write_prepared_chunk(item, summary)
+            self._write_prepared_chunk(item, summary, progress_cb=progress_cb)
             for item, summary in zip(prepared, summaries)
         ]
         # Recaps written above are the trigger for their own upgrade: whatever the
         # budget did not cover is picked up by the next pass.
-        self._upgrade_recap_chunks()
+        self._upgrade_recap_chunks(progress_cb=progress_cb)
         self._merge_index(chunks)
         self._maybe_write_secondary_index()
         return chunks
@@ -669,7 +708,10 @@ class SessionArchiveProvider(MemoryProvider):
         }
 
     def _summarize_chunks_concurrently(
-        self, prepared: List[Dict[str, Any]]
+        self,
+        prepared: List[Dict[str, Any]],
+        *,
+        progress_cb: Optional[Callable[[], None]] = None,
     ) -> List[Optional[str]]:
         """Summarise every LLM-eligible chunk, at most ``llm_summary_concurrency`` at a time.
 
@@ -710,10 +752,16 @@ class SessionArchiveProvider(MemoryProvider):
                         prepared[index]["chunk_id"],
                         exc_info=True,
                     )
+                # One completed summary = one unit of forward progress.
+                _report_progress(progress_cb)
         return results
 
     def _write_prepared_chunk(
-        self, item: Dict[str, Any], summary: Optional[str]
+        self,
+        item: Dict[str, Any],
+        summary: Optional[str],
+        *,
+        progress_cb: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """Persist one chunk unconditionally and return its index entry."""
         if item.get("cached_entry") is not None:
@@ -736,6 +784,7 @@ class SessionArchiveProvider(MemoryProvider):
             "messages": item["messages"],
         }
         atomic_json_write(item["chunk_path"], payload, indent=2, mode=0o600)
+        _report_progress(progress_cb)
         return self._chunk_entry(
             item["chunk_id"],
             item["start"],
@@ -754,6 +803,7 @@ class SessionArchiveProvider(MemoryProvider):
         *,
         source: str,
         allow_llm: bool = True,
+        progress_cb: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """Single-chunk path: prepare → summarise → write."""
         item = self._prepare_chunk(
@@ -764,7 +814,7 @@ class SessionArchiveProvider(MemoryProvider):
             if item.get("allow_llm")
             else None
         )
-        return self._write_prepared_chunk(item, summary)
+        return self._write_prepared_chunk(item, summary, progress_cb=progress_cb)
 
     def _chunk_entry(
         self,

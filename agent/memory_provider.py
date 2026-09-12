@@ -320,6 +320,13 @@ class MemoryProvider(ABC):
         Use to extract insights from messages about to be compressed.
         messages is the list that will be summarized/discarded.
 
+        A provider that does slow work in this hook (model calls, uploads) should
+        declare an optional keyword-only ``progress_cb`` —
+        ``def on_pre_compress(self, messages, *, progress_cb=None)`` — and call it
+        as each unit of work completes. The host passes it only when declared, so
+        the one-argument signature above stays valid. Ticking it is what tells the
+        compression watchdog that a long pass is progressing rather than hung.
+
         Return text to include in the compression summary prompt so the
         compressor preserves provider-extracted insights. Return empty
         string for no contribution (backwards-compatible default).
