@@ -29,6 +29,39 @@ def _threshold_tokens(context_length: int, threshold_percent: float) -> int:
     return max(int(context_length * threshold_percent), MINIMUM_CONTEXT_LENGTH)
 
 
+def _project_tokens(compressor: Any, rough_tokens: int) -> int:
+    """Project the rough request size onto the provider's measurement basis.
+
+    The preflight compaction *decision* (``should_defer_preflight_to_real_usage``)
+    and the turn prologue's reported size both read
+    ``ContextCompressor.projected_request_tokens()`` — the last real provider
+    reading advanced by the growth the rough estimator saw since that reading was
+    paired (#P13). The switch warning must decide on the same number or it fires
+    *early*: a CJK/dense-JSON session whose rough estimate runs ~24% high
+    (937,546 rough vs 754,271 real in the motivating session) can clear the
+    *target* model's threshold while the projected real request does not.
+
+    Switching model changes the window the number is compared AGAINST, not the
+    request being measured — the projection is still the best available estimate
+    of how big THIS request really is, so it is the right basis on both sides of
+    the switch. Falls back to the raw estimate when the compressor cannot project
+    (first turn, no paired reading, test doubles, older plugin engines).
+    """
+    project = getattr(compressor, "projected_request_tokens", None)
+    if callable(project):
+        try:
+            tokens, _basis = project(int(rough_tokens or 0))
+            if (
+                isinstance(tokens, int)
+                and not isinstance(tokens, bool)
+                and tokens > 0
+            ):
+                return int(tokens)
+        except Exception:
+            pass
+    return int(rough_tokens or 0)
+
+
 def _estimate_tokens(agent: Any, messages: Optional[List[dict]]) -> Optional[int]:
     cc = getattr(agent, "context_compressor", None)
     if cc is None:
@@ -45,13 +78,17 @@ def _estimate_tokens(agent: Any, messages: Optional[List[dict]]) -> Optional[int
 
             system_prompt = getattr(agent, "_cached_system_prompt", None) or ""
             tools = getattr(agent, "tools", None)
-            return int(
+            rough = int(
                 estimate_request_tokens_rough(
                     messages,
                     system_prompt=system_prompt,
                     tools=tools or None,
                 )
             )
+            # Same basis as the preflight trigger: project the last real
+            # provider reading forward instead of deciding on the raw rough
+            # number (see _project_tokens).
+            return _project_tokens(cc, rough)
         except Exception:
             pass
 
