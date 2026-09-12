@@ -3681,6 +3681,42 @@ class ContextCompressor(ContextEngine):
         except (TypeError, ValueError):
             self._pending_request_rough_tokens = 0
 
+    def projected_request_tokens(self, rough_tokens: int) -> tuple[int, str]:
+        """Best available size of the NEXT request, plus its measurement basis.
+
+        Returns ``(tokens, source)``. ``source`` is ``"provider"`` when a real
+        provider reading for this conversation can be projected forward by the
+        growth the rough estimator observed since that reading was paired (the
+        same projection ``should_defer_preflight_to_real_usage`` decides on),
+        else ``"estimate"`` for the raw local number.
+
+        The TRIGGER and everything surfaced to the user read this method, so the
+        number that fires a compaction is the number that gets reported (#P13).
+        Before that, a session whose rough estimate runs high (CJK text, dense
+        JSON, reasoning replay) logged ``~937,546 tokens`` for a request the
+        provider billed at 754,271 — which reads as a compressor
+        mis-calibration rather than a second measurement basis, and makes "how
+        much did compression reclaim" unanswerable from the two numbers.
+        """
+        rough = max(0, int(rough_tokens or 0))
+        if self.awaiting_real_usage_after_compression:
+            # The post-compression path parks ``last_prompt_tokens = -1`` while
+            # ``last_real_prompt_tokens`` still holds the STALE pre-compression
+            # reading for a transcript that no longer exists. The new, shorter
+            # transcript's rough estimate is the honest basis until the provider
+            # reports real usage for it.
+            return rough, "estimate"
+        real = self.last_real_prompt_tokens
+        if real <= 0:
+            real = self.last_prompt_tokens if self.last_prompt_tokens > 0 else 0
+        baseline = (
+            self.last_rough_tokens_when_real_prompt_fit
+            or self.last_compression_rough_tokens
+        )
+        if real <= 0 or baseline <= 0:
+            return rough, "estimate"
+        return int(real + max(0, rough - baseline)), "provider"
+
     def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
         """Return True when a high rough preflight estimate is known-noisy.
 
@@ -3734,21 +3770,18 @@ class ContextCompressor(ContextEngine):
         # arrives.  (#36718)
         if self.awaiting_real_usage_after_compression:
             return True
-        if self.last_real_prompt_tokens <= 0:
-            return False
-        if self.last_real_prompt_tokens >= self.threshold_tokens:
-            return False
-
-        baseline = self.last_rough_tokens_when_real_prompt_fit or self.last_compression_rough_tokens
-        if baseline <= 0:
-            return False
-
         # No baseline ratchet here: the (rough, real) pair is refreshed by
         # update_from_response() on every fitting response. Advancing the
         # rough baseline without a matching real reading would shrink
         # apparent growth and defer on stale data — the unsafe direction.
-        growth = max(0, rough_tokens - baseline)
-        projected_real = self.last_real_prompt_tokens + growth
+        # ``projected_request_tokens`` owns the projection, so this decision and
+        # the number the turn prologue reports are the same basis (#P13). A
+        # reading at/over the threshold yields a projection that cannot sit
+        # below it, so the old explicit ``>= threshold_tokens`` bail-out is
+        # implied by the branch below.
+        projected_real, source = self.projected_request_tokens(rough_tokens)
+        if source != "provider":
+            return False
         return projected_real < self.threshold_tokens
 
     def should_compress(self, prompt_tokens: int = None) -> bool:

@@ -370,3 +370,45 @@ class TestIdleSinceLastTurn:
         assert snapshot["idle_since"].startswith("✓ ")
 
 
+def test_transitional_context_reading_is_unknown_not_zero():
+    """Right after a compaction ``last_prompt_tokens`` parks at the -1 sentinel.
+
+    The bar used to clamp it to 0 and read "0/1.0M · 0%" for that turn — which
+    claims an EMPTY context and hides that a compaction just landed (#P13). It
+    must report unknown instead: "--" for the used tokens and no percentage.
+    """
+    cli_obj = _attach_agent(
+        _make_cli(),
+        prompt_tokens=90_000,
+        completion_tokens=1_000,
+        total_tokens=91_000,
+        api_calls=3,
+        context_tokens=-1,
+        context_length=1_000_000,
+    )
+
+    snapshot = cli_obj._get_status_bar_snapshot()
+    text = cli_obj._build_status_bar_text(width=120)
+
+    assert snapshot["context_tokens_unknown"] is True
+    assert snapshot["context_percent"] is None
+    assert f"--/{cli_mod._format_context_length(1_000_000)}" in text
+
+
+def test_a_real_reading_still_renders_its_percentage():
+    """Control for the test above: the unknown path must not swallow real data."""
+    cli_obj = _attach_agent(
+        _make_cli(),
+        prompt_tokens=12_450,
+        completion_tokens=2_220,
+        total_tokens=12_450,
+        api_calls=7,
+        context_tokens=12_450,
+        context_length=200_000,
+    )
+
+    snapshot = cli_obj._get_status_bar_snapshot()
+
+    assert snapshot["context_tokens_unknown"] is False
+    assert snapshot["context_percent"] == 6
+    assert "12.4K/200K" in cli_obj._build_status_bar_text(width=120)
