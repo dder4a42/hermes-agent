@@ -2239,6 +2239,15 @@ def init_agent(
             _compression_cfg.get("proactive_prune_min_reclaim_tokens", 4096), 4096
         ),
     )
+    # Tier-1 tool-observation eviction (board item P5). Both keys drive the
+    # cheap, no-LLM tier of a compression pass; the compressor applies the
+    # sanity floors/ceilings, these just carry the operator's intent through.
+    compression_tier1_min_observation_chars = _parse_prune_int(
+        _compression_cfg.get("tier1_min_observation_chars", 2000), 2000
+    )
+    compression_tier1_keep_recent = _parse_prune_int(
+        _compression_cfg.get("tier1_keep_recent_observations", 4), 4
+    )
     # protect_first_n is the number of non-system messages to protect at
     # the head, in addition to the system prompt (which is always
     # implicitly protected by the compressor).  Floor at 0 — a value of
@@ -2791,6 +2800,8 @@ def init_agent(
             proactive_prune_tokens=compression_proactive_prune_tokens,
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
+            tier1_min_observation_chars=compression_tier1_min_observation_chars,
+            tier1_keep_recent_observations=compression_tier1_keep_recent,
             min_tail_user_messages=compression_min_tail_users,
             tail_mode=compression_tail_mode,
         )

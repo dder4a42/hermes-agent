@@ -859,6 +859,20 @@ DEFAULT_CONFIG = {
                                       # for a full trigger-sized token runway to
                                       # regrow before rearming. Keeps prompt-cache
                                       # breaks episodic. 0 = no minimum-savings gate.
+        "tier1_min_observation_chars": 2000,  # tiered compression: bodies of old
+                                      # tool observations larger than this (chars)
+                                      # are replaced with a bounded recovery
+                                      # marker BEFORE the expensive summarizer
+                                      # runs — no LLM call. Must be >= 200 so a
+                                      # generated marker cannot itself be
+                                      # re-evicted; clamped to <= 200000.
+        "tier1_keep_recent_observations": 4,  # how many of the NEWEST tool
+                                      # observations always survive verbatim
+                                      # (the active turn's working set). Fan-in
+                                      # reports (delegate_task / board reports) and
+                                      # compression handoff/checkpoint bodies are
+                                      # never evicted regardless. 0 disables the
+                                      # recency protection (clamped to <= 64).
         "micro_compact": False,       # opt-in: after each completed turn, fold the
                                       # oldest un-absorbed exchange into a rolling
                                       # summary, amortizing compression cost instead

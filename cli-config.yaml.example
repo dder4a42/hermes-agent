@@ -717,6 +717,25 @@ compression:
   # prune. Default 4096.
   proactive_prune_min_reclaim_tokens: 4096
 
+  # Tier-1 tool-observation eviction (tiered compression). Independent of the
+  # knobs above: every compression pass first elides the BODIES of old tool
+  # observations larger than this many characters, replacing them with a
+  # bounded recovery marker that names the tool, roughly how much was removed,
+  # and where to recover it (the spilled-to-disk copy or
+  # session_archive_search / session_archive_expand). No model call. If that
+  # alone brings the request under `threshold`, the expensive summarizer is
+  # skipped entirely; otherwise the normal summary handoff still runs. The
+  # message list's shape (count/roles/order) is preserved. Clamped to >= 200
+  # (so a marker can't be re-evicted) and <= 200000. Default 2000.
+  tier1_min_observation_chars: 2000
+
+  # How many of the NEWEST tool observations always survive tier-1 eviction
+  # verbatim — the active turn's working set. Fan-in reports (delegate_task and
+  # the longtask board report tools) and compression handoff/checkpoint bodies
+  # are never evicted regardless of position. 0 disables the recency
+  # protection; clamped to <= 64. Default 4.
+  tier1_keep_recent_observations: 4
+
   # To pin a specific model/provider for compression summaries, use the
   # auxiliary section below (auxiliary.compression.provider / model).
 

@@ -12,6 +12,8 @@ Improvements over v2:
   - Iterative summary updates (preserves info across multiple compactions)
   - Token-budget tail protection instead of fixed message count
   - Tool output pruning before LLM summarization (cheap pre-pass)
+  - Tiered compression: evict old tool-observation bodies first (no LLM);
+    the summary handoff only runs when that alone did not clear the trigger
   - Scaled summary budget (proportional to compressed content)
   - Richer tool call/result detail in summarizer input
 """
@@ -762,6 +764,130 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 # summary cap (which must stay strictly BELOW this so a preserved user answer
 # is never re-summarized away on a later prune pass).
 _PRUNE_MIN_CHARS = 200
+
+# ── Tier-1 tool-observation eviction (board item P5) ─────────────────────────
+# The CHEAP tier of a compression pass: replace the BODIES of oversized old
+# tool observations with a bounded, self-describing marker instead of paying for
+# the summarizer (tier 2). Tier 1 runs first; when it alone brings the request
+# under the compression threshold the handoff is skipped entirely, so a session
+# whose size is mostly re-sent tool output never pays for a summary LLM call.
+#
+# Both knobs are config.yaml keys under ``compression.*`` — NOT env vars.
+# AGENTS.md is explicit: .env is for secrets; behavioural settings live in
+# config.yaml. The upper bounds keep a typo'd key from disarming the pass
+# (keep_recent) or letting it swallow nearly every body (min_chars).
+_TIER1_MAX_KEEP_RECENT_OBSERVATIONS = 64
+_TIER1_MAX_MIN_OBSERVATION_CHARS = 200_000
+_TIER1_DEFAULT_KEEP_RECENT_OBSERVATIONS = 4
+_TIER1_DEFAULT_MIN_OBSERVATION_CHARS = 2000
+
+# Fan-in tools whose results ARE the deliverable and must never be elided.
+# ``delegate_task`` is the subagent fan-out boundary (mirrors
+# agent/context_breakdown._SUBAGENT_TOOL_NAMES); the longtask tools deliver a
+# board item's claim/evidence report. Eliding one would leave the model
+# believing it had read a report whose evidence is gone — and the fan-in is the
+# one place a single tool result carries unreconstructable content.
+_FANIN_TOOL_NAMES = frozenset({
+    "delegate_task",
+    "longtask_attach_report",
+    "longtask_read",
+    "longtask_next",
+    "longtask_verify_node",
+})
+
+# Content markers identifying a load-bearing observation tier-1 must never
+# elide. The archive checkpoint is the session-archive memory provider's
+# pre-compress pointer (plugins/memory/session_archive/__init__.py) — it IS the
+# recovery index, so dropping it strands the archived chunks. Compaction
+# handoff / checkpoint bodies are matched separately via
+# ``classify_summary_content`` (prefix + metadata flag), not re-listed here.
+_TIER1_LOAD_BEARING_CONTENT_MARKERS = (
+    "[SESSION ARCHIVE CHECKPOINT]",
+)
+
+
+def _spilled_output_path(content: str) -> Optional[str]:
+    """Return the spillover file path embedded in a ``<persisted-output>`` block.
+
+    Large tool results are already spilled to ``$HERMES_HOME/cache/spillover``
+    with the path recorded in the body (tools/tool_result_storage.py). When a
+    body being elided carries one, the marker can point the model at the real
+    copy instead of claiming the content is unrecoverable.
+    """
+    try:
+        from tools.tool_result_storage import extract_persisted_path
+    except Exception:
+        return None
+    try:
+        return extract_persisted_path(content)
+    except Exception:
+        return None
+
+
+def _build_elided_observation_marker(
+    tool_name: str,
+    original: str,
+    *,
+    spill_path: Optional[str] = None,
+) -> str:
+    """Bounded recovery pointer replacing an elided tool-observation body.
+
+    Names the producer and roughly how much was elided, and points at the real
+    recovery routes this tree provides: the spilled-to-disk copy when the result
+    was already persisted, and the session-archive memory provider's
+    ``session_archive_search`` / ``session_archive_expand`` tools. When no
+    spilled copy exists the marker says so plainly rather than implying the
+    content is still somewhere it is not.
+
+    The ``"({n:,} chars)"`` shape is deliberate: ``_demote_tool_result_at``
+    treats any short ``[``-leading body containing ``" chars)"`` as already
+    pruned, so a later Phase-1 pass over a mixed list leaves this marker alone
+    instead of re-summarizing the recovery pointer away.
+    """
+    elided = len(original or "")
+    if spill_path:
+        recovery = (
+            f"Recovery: full output at {spill_path} — page it with read_file "
+            "(offset/limit), or search the pre-compression archive with "
+            "session_archive_search / session_archive_expand"
+        )
+    else:
+        recovery = (
+            "Recovery: body dropped by tier-1 context eviction (no spilled "
+            "copy) — search the pre-compression archive with "
+            "session_archive_search / session_archive_expand, or re-run the tool"
+        )
+    return (
+        f"[elided tool observation — tool={tool_name or 'unknown'} "
+        f"({elided:,} chars). {recovery}]"
+    )
+
+
+def _elide_oversized_tool_call_arguments(
+    tool_calls: List[Any],
+    min_chars: int,
+) -> tuple[List[Any], bool]:
+    """Bound oversized ``tool_call`` argument payloads, preserving JSON validity.
+
+    Reuses ``_truncate_tool_call_args_json`` because slicing raw JSON at a byte
+    offset produces unparseable arguments and every downstream provider 400s on
+    the poisoned history (#11762); the shrink happens inside the parsed
+    structure. Returns ``(new_tool_calls, changed)``.
+    """
+    new_tcs: List[Any] = []
+    changed = False
+    floor = max(int(min_chars), 500)
+    for tc in tool_calls:
+        if isinstance(tc, dict):
+            fn = tc.get("function", {})
+            args = fn.get("arguments", "") if isinstance(fn, dict) else ""
+            if isinstance(args, str) and len(args) > floor:
+                new_args = _truncate_tool_call_args_json(args)
+                if new_args != args:
+                    tc = {**tc, "function": {**fn, "arguments": new_args}}
+                    changed = True
+        new_tcs.append(tc)
+    return new_tcs, changed
 
 # Non-response sentinels the clarify callbacks embed as ``user_response`` when
 # the user never actually answered (timeout / no-user contexts). These must
@@ -2156,6 +2282,9 @@ class ContextCompressor(ContextEngine):
     """Default context engine — compresses conversation context via lossy summarization.
 
     Algorithm:
+      0. Tier 1 (no LLM call): evict the BODIES of oversized old tool
+         observations, keeping the list's shape. When this alone clears the
+         compression trigger the summary handoff is skipped entirely.
       1. Prune old tool results (cheap, no LLM call)
       2. Protect head messages (system prompt + first exchange)
       3. Protect tail messages by token budget (most recent ~20K tokens)
@@ -2255,6 +2384,12 @@ class ContextCompressor(ContextEngine):
             "commit_status": "unknown",
             "split_status": "unknown",
             "failure_class": None,
+            # Tier-1 tool-observation eviction outcome (board item P5).
+            # ``tier1_tokens_source`` records whether the trigger decision rode
+            # the provider's real prompt count or the local rough estimate.
+            "tier1_evicted_observations": 0,
+            "tier1_reclaimed_tokens": 0,
+            "tier1_tokens_source": None,
         }
         self._active_compression_telemetry = telemetry
         self._last_compression_telemetry = telemetry
@@ -3207,6 +3342,8 @@ class ContextCompressor(ContextEngine):
         proactive_prune_tokens: int = 0,
         proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096,
+        tier1_min_observation_chars: int = _TIER1_DEFAULT_MIN_OBSERVATION_CHARS,
+        tier1_keep_recent_observations: int = _TIER1_DEFAULT_KEEP_RECENT_OBSERVATIONS,
         min_tail_user_messages: int = 1,
         tail_mode: str = "lean",
     ):
@@ -3270,6 +3407,27 @@ class ContextCompressor(ContextEngine):
         # A committed prune is a prompt-cache boundary. Do not permit the next
         # one until the prompt has regrown the tokens just reclaimed.
         self._proactive_prune_rearm_tokens: int = 0
+        # Tier-1 tool-observation eviction (board item P5). ``min_observation_
+        # chars`` is the size above which an old tool body is worth eliding;
+        # ``keep_recent_observations`` is how many of the newest observations
+        # always survive verbatim. Both clamped: a negative keep_recent would
+        # disable the recent-working-set protection, and a min_chars floor below
+        # a marker's own length would make the pass churn its own output.
+        # Config surface: compression.tier1_* (config.yaml, not env).
+        self.tier1_keep_recent_observations = max(
+            0,
+            min(
+                int(tier1_keep_recent_observations or 0),
+                _TIER1_MAX_KEEP_RECENT_OBSERVATIONS,
+            ),
+        )
+        self.tier1_min_observation_chars = max(
+            _PRUNE_MIN_CHARS,
+            min(
+                int(tier1_min_observation_chars or _TIER1_DEFAULT_MIN_OBSERVATION_CHARS),
+                _TIER1_MAX_MIN_OBSERVATION_CHARS,
+            ),
+        )
         self.min_tail_user_messages = min_tail_user_messages
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
@@ -4109,6 +4267,226 @@ class ContextCompressor(ContextEngine):
                     )
 
         return result, pruned
+
+    # ------------------------------------------------------------------
+    # Tier-1: cheap tool-observation body eviction (no LLM call)
+    # ------------------------------------------------------------------
+
+    def authoritative_context_tokens(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        *,
+        local_estimate: int | None = None,
+    ) -> tuple[int, str]:
+        """Size of the NEXT request plus where that number came from.
+
+        Returns ``(tokens, source)``. ``source`` is ``"provider"`` when the last
+        provider response reported actual prompt tokens for this conversation,
+        else ``"estimate"`` from the local rough estimator.
+
+        The provider reading is authoritative because it already includes the
+        system prompt and tool schemas the messages-only estimate cannot see
+        (#14695): a session can sit over the compression threshold on schema
+        weight alone while the message list still looks small. It is unavailable
+        on the first turn, on auxiliary paths, and in tests — there the local
+        estimate is the fallback (both arms are pinned by tests).
+        """
+        # ``last_real_prompt_tokens`` is written only by update_from_response()
+        # from a real reading, so it is preferred. ``last_prompt_tokens`` is
+        # also provider-reported but is seeded speculatively by the preflight
+        # display path, so only a positive value counts (the -1
+        # "awaiting real usage" sentinel must not).
+        provider_tokens = self.last_real_prompt_tokens
+        if provider_tokens <= 0:
+            provider_tokens = self.last_prompt_tokens
+        # Right after a committed compaction the post-compression path parks
+        # ``awaiting_real_usage_after_compression`` and ``last_prompt_tokens =
+        # -1``, but ``last_real_prompt_tokens`` still holds the STALE
+        # pre-compression reading for a conversation that no longer exists.
+        # Trusting it would project the old, larger size onto the new, shorter
+        # transcript. The sibling guard in should_defer_preflight_to_real_usage
+        # documents the same hazard on the preflight path.
+        if self.awaiting_real_usage_after_compression:
+            provider_tokens = 0
+        if provider_tokens > 0:
+            return int(provider_tokens), "provider"
+        if local_estimate is None:
+            local_estimate = (
+                estimate_messages_tokens_rough(messages) if messages else 0
+            )
+        return int(local_estimate or 0), "estimate"
+
+    def _tier1_load_bearing_reason(
+        self,
+        msg: Dict[str, Any],
+        call_id_to_tool: Dict[str, str],
+    ) -> Optional[str]:
+        """Why this observation must survive tier-1 eviction (None = eligible).
+
+        Pins the load-bearing classes in code: the compaction handoff /
+        checkpoint body (the tier-2 summary itself, plus the memory provider's
+        pre-compress archive pointer, which IS the recovery index), fan-in
+        reports (``delegate_task`` and the longtask board report tools), and
+        anything already flagged as a compressed summary.
+        """
+        if msg.get(COMPRESSED_SUMMARY_METADATA_KEY):
+            return "compression handoff"
+        content = msg.get("content")
+        if isinstance(content, str):
+            if self._is_context_summary_content(content):
+                return "compression handoff"
+            for marker in _TIER1_LOAD_BEARING_CONTENT_MARKERS:
+                if marker in content:
+                    return marker
+        if msg.get("role") == "tool":
+            tool_name = call_id_to_tool.get(str(msg.get("tool_call_id") or ""), "")
+            if tool_name in _FANIN_TOOL_NAMES:
+                return f"fan-in report ({tool_name})"
+        return None
+
+    def evict_old_tool_observation_bodies(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        keep_recent: int | None = None,
+        min_chars: int | None = None,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Tier-1: replace old tool-observation BODIES with bounded markers.
+
+        No LLM call. The message list's SHAPE is preserved — same length, same
+        roles, same order — because only ``content`` bodies (and oversized
+        ``tool_calls`` argument strings) are rewritten. That is what lets this
+        pass run without the handoff's message-list surgery: role alternation
+        and the provider prompt structure survive untouched.
+
+        Never elided:
+        - the newest ``tier1_keep_recent_observations`` observations, and every
+          message after them (the active turn's working set);
+        - fan-in reports, compression/checkpoint bodies, and observations
+          carrying the archive marker (see ``_tier1_load_bearing_reason``).
+
+        Returns ``(messages, stats)``. On a no-op the INPUT list object is
+        returned unchanged (standard caller contract: callers gate bookkeeping
+        on ``result is not input``).
+        """
+        stats: Dict[str, Any] = {
+            "evicted": 0,
+            "reclaimed_tokens": 0,
+            "estimate_before": 0,
+            "estimate_after": 0,
+        }
+        if not messages:
+            return messages, stats
+        if keep_recent is None:
+            keep_recent = self.tier1_keep_recent_observations
+        else:
+            keep_recent = max(
+                0, min(int(keep_recent), _TIER1_MAX_KEEP_RECENT_OBSERVATIONS)
+            )
+        if min_chars is None:
+            min_chars = self.tier1_min_observation_chars
+        else:
+            min_chars = max(0, int(min_chars))
+
+        # Map tool_call_id -> producing tool name so an observation can tell
+        # whether it IS a fan-in report (those are never elided).
+        call_id_to_tool: Dict[str, str] = {}
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    cid = tc.get("id", "")
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "") if isinstance(fn, dict) else ""
+                else:
+                    cid = getattr(tc, "id", "") or ""
+                    fn = getattr(tc, "function", None)
+                    name = getattr(fn, "name", "") if fn else ""
+                if isinstance(cid, str) and cid:
+                    call_id_to_tool[cid] = name if isinstance(name, str) else ""
+
+        # Protect the newest ``keep_recent`` observations AND everything from
+        # there on: an assistant tool_call row sitting beside a protected
+        # observation belongs to the same live exchange.
+        if keep_recent <= 0:
+            protect_from = len(messages)
+        else:
+            protect_from = 0
+            seen = 0
+            for idx in range(len(messages) - 1, -1, -1):
+                probe = messages[idx]
+                if isinstance(probe, dict) and probe.get("role") == "tool":
+                    seen += 1
+                    if seen >= keep_recent:
+                        protect_from = idx
+                        break
+            if seen < keep_recent:
+                # Fewer observations than the protected count — all are recent.
+                protect_from = 0
+
+        result = [m.copy() if isinstance(m, dict) else m for m in messages]
+        stats["estimate_before"] = estimate_messages_tokens_rough(messages)
+        for idx in range(len(result)):
+            if idx >= protect_from:
+                break  # everything from here on is protected
+            msg = result[idx]
+            if not isinstance(msg, dict):
+                continue
+            if self._tier1_load_bearing_reason(msg, call_id_to_tool):
+                continue
+            if msg.get("role") == "tool":
+                content = msg.get("content")
+                if not isinstance(content, str) or len(content) <= min_chars:
+                    continue
+                tool_name = call_id_to_tool.get(
+                    str(msg.get("tool_call_id") or ""), "unknown"
+                )
+                msg["content"] = _build_elided_observation_marker(
+                    tool_name, content, spill_path=_spilled_output_path(content)
+                )
+                # Its bodies were rewritten, so a prior persistence stamp no
+                # longer describes what is on disk (#57491).
+                msg.pop(_DB_PERSISTED_MARKER, None)
+                stats["evicted"] += 1
+                continue
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                new_tcs, changed = _elide_oversized_tool_call_arguments(
+                    msg.get("tool_calls") or [], min_chars
+                )
+                if changed:
+                    msg["tool_calls"] = new_tcs
+                    msg.pop(_DB_PERSISTED_MARKER, None)
+                    stats["evicted"] += 1
+        if not stats["evicted"]:
+            # Standard no-op contract: hand back the INPUT object.
+            return messages, stats
+        stats["estimate_after"] = estimate_messages_tokens_rough(result)
+        stats["reclaimed_tokens"] = max(
+            0, stats["estimate_before"] - stats["estimate_after"]
+        )
+        return result, stats
+
+    def _tier1_clears_trigger(
+        self,
+        pre_messages: List[Dict[str, Any]],
+        stats: Dict[str, Any],
+    ) -> tuple[bool, int, str]:
+        """Whether tier-1 alone brought the request under the compression trigger.
+
+        Provider-reported tokens win when present: the reading already covers
+        the system prompt and tool schemas, so subtracting the message-only
+        reclaim projects the next request's honest size. Without a provider
+        reading, the post-eviction local estimate is authoritative. Returns
+        ``(clears, post_tokens, source)`` for logging/telemetry.
+        """
+        tokens, source = self.authoritative_context_tokens(pre_messages)
+        if source == "provider":
+            post_tokens = max(0, tokens - int(stats.get("reclaimed_tokens") or 0))
+        else:
+            post_tokens = int(stats.get("estimate_after") or 0)
+        threshold = int(self.threshold_tokens or 0)
+        return (threshold > 0 and post_tokens < threshold), post_tokens, source
 
     def prune_tool_results_only(
         self, messages: List[Dict[str, Any]], current_tokens: int | None = None,
@@ -7477,6 +7855,62 @@ This compaction should PRIORITISE preserving all information related to the focu
             }
         else:
             self._lean_pristine_tools = {}
+
+        # ── Tier 1 (board item P5): evict old tool-observation bodies, no LLM ─
+        # Cheap tier FIRST: replace the bodies of oversized old tool
+        # observations with bounded recovery markers while keeping the list's
+        # shape (same count/roles/order) so role alternation and the provider
+        # prompt structure survive. When this ALONE brings the request under the
+        # trigger the handoff below is skipped entirely — a session whose size
+        # is mostly re-sent tool output never pays for a summary LLM call.
+        # Placed AFTER the pristine-tools snapshot above so a tier-2 chunk
+        # digest still summarizes what actually happened, not an elided stub.
+        _tier1_pre = messages
+        messages, _tier1_stats = self.evict_old_tool_observation_bodies(messages)
+        if _tier1_stats["evicted"]:
+            _tier1_clears, _tier1_post, _tier1_source = self._tier1_clears_trigger(
+                _tier1_pre, _tier1_stats
+            )
+            telemetry["tier1_evicted_observations"] = _tier1_stats["evicted"]
+            telemetry["tier1_reclaimed_tokens"] = _tier1_stats["reclaimed_tokens"]
+            telemetry["tier1_tokens_source"] = _tier1_source
+            if _tier1_clears:
+                # The elision IS this cycle's compression. Mark progress so the
+                # host records a real boundary: it detects a no-op by list
+                # equality, and the bodies genuinely changed. Record the
+                # message-only savings too so the /compress status readout
+                # (gateway/slash_commands.py) reflects this pass.
+                self._last_compression_made_progress = True
+                _tier1_before = int(_tier1_stats.get("estimate_before") or 0)
+                _tier1_after = int(_tier1_stats.get("estimate_after") or 0)
+                self._last_compression_savings_pct = (
+                    (_tier1_before - _tier1_after) / _tier1_before * 100
+                    if _tier1_before > 0
+                    else 0.0
+                )
+                if not self.quiet_mode:
+                    logger.info(
+                        "Tier-1 tool-observation eviction cleared the trigger "
+                        "(evicted %d observation(s), reclaimed ~%d tokens; %s "
+                        "size ~%d < %d threshold) — skipping the summary handoff",
+                        _tier1_stats["evicted"],
+                        _tier1_stats["reclaimed_tokens"],
+                        _tier1_source,
+                        _tier1_post,
+                        self.threshold_tokens,
+                    )
+                return messages
+            if not self.quiet_mode:
+                logger.info(
+                    "Tier-1 tool-observation eviction insufficient (evicted %d "
+                    "observation(s), reclaimed ~%d tokens; %s size ~%d >= %d "
+                    "threshold) — continuing to the summary handoff (tier 2)",
+                    _tier1_stats["evicted"],
+                    _tier1_stats["reclaimed_tokens"],
+                    _tier1_source,
+                    _tier1_post,
+                    self.threshold_tokens,
+                )
 
         # Phase 1: Prune old tool results (cheap, no LLM call)
         messages, pruned_count = self._prune_old_tool_results(
