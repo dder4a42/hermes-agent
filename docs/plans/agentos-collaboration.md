@@ -241,9 +241,31 @@ therefore had to change:
 Lesson for this port: anything a plugin runs inside `on_pre_compress` sits on the
 compression critical path and is **invisible to the host's progress tracker unless
 it ticks the fence**. Chunks (the recoverable evidence) must be written
-unconditionally; enrichment may be rationed only as an abort valve. And an
-unrecognized `provider` in auxiliary config must fail loudly rather than silently
-inheriting the main runtime with a substituted model (P8).
+unconditionally; enrichment may be rationed only as an abort valve.
+
+**Correction (2026-09-12, verified in code).** The earlier reading of this
+incident — "an unrecognized `provider` silently inherited the main runtime and
+substituted the configured model" — was **partly wrong**, and the fix was reshaped
+after verifying it:
+
+- `Models.sjtu.edu.cn` is **not** an unrecognized provider. `~/.hermes/config.yaml`
+  declares it in `custom_providers:` (`name` + `base_url` + `key_env`), and
+  `resolve_provider_client` matches it **by display name**, builds a client against
+  the declared endpoint, and sends the request with the placeholder key
+  `no-key-required` — which is exactly the measured `401 (LiteLLM Virtual Key
+  expected. Received=no-k…ired)`. That branch already logs its own warning:
+  *"named custom provider 'Models.sjtu.edu.cn' has no resolvable api_key — request
+  will be sent with placeholder no-key-required and will 401"*.
+- So the 401 was **a missing key for a config-declared provider**, not a silent
+  fallback. What was genuinely wrong is narrower: the value is a *display name*
+  where a provider id is expected, and nothing said so at the point of use.
+- P8 therefore ships as **diagnostics-only**: one warning per distinct value per
+  process naming the value and the canonical fix (`provider: auto` to inherit the
+  main runtime, or a real provider id from `hermes model`), with routing and the
+  resolved tuple unchanged. A hard failure was deliberately rejected — auxiliary
+  calls run mid-conversation, and breaking setups that limp along today is worse
+  than naming the misconfiguration.
+
 
 **Incremental archiving (P9, shipped 2026-09-12).** Chunking is content-driven and
 the "needs summarizing?" decision is per *message*, not per chunk position:
