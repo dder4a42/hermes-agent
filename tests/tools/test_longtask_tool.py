@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from tools.longtask_tool import (
     _board_handler,
@@ -406,3 +407,138 @@ class TestBoardSlashCommand:
         assert resolve_command("longtask").name == "board"
         # /tasks belongs to /agents — this alias must not have shadowed it.
         assert resolve_command("tasks").name == "agents"
+
+
+class TestArtifactIndexSurface:
+    """Artifact registration + delivery manifest through the existing tools.
+
+    The index lives under the profile home (HERMES_HOME), NOT the workspace, and
+    the verifier tool consumes it: a claim citing a scratch path is refused while
+    a final deliverable is accepted and listed in the manifest it returns.
+    """
+
+    def _env(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("TERMINAL_CWD", str(ws))
+        return home, ws
+
+    def _common(self, tmp_path, sid):
+        return {"root": str(tmp_path / "board"), "session_id": sid}
+
+    def _create(self, tmp_path, sid):
+        common = self._common(tmp_path, sid)
+        _loads(
+            longtask_create_handler(
+                {
+                    **common,
+                    "objective": "Ship the deliverable",
+                    "nodes": [{"node_id": "N1", "goal": "Produce the report"}],
+                }
+            )
+        )
+        return common
+
+    def _attach(self, common, ref):
+        _loads(
+            longtask_attach_report_handler(
+                {
+                    **common,
+                    "node_id": "N1",
+                    "report": {
+                        "status": "success",
+                        "claims": [
+                            {
+                                "claim": "The report was produced",
+                                "evidence": [
+                                    {"kind": "file", "ref": ref, "quote": "delivered"}
+                                ],
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+
+    def test_update_node_registers_and_verify_reports_the_manifest(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.longtask_board import artifact_index_path
+
+        home, ws = self._env(tmp_path, monkeypatch)
+        (ws / "report.md").write_text("delivered\n", encoding="utf-8")
+        common = self._create(tmp_path, "sess-final")
+
+        updated = _loads(
+            longtask_update_node_handler(
+                {
+                    **common,
+                    "node_id": "N1",
+                    "artifacts": [{"path": "report.md", "kind": "final"}],
+                }
+            )
+        )
+
+        assert updated["artifacts"]["counts"]["final"] == 1
+        assert updated["artifacts"]["registered"][0]["producing_node_id"] == "N1"
+        # Stored under the profile home, not the workspace or the board root.
+        assert str(home) in updated["artifacts"]["index_path"]
+        assert artifact_index_path("sess-final").exists()
+
+        self._attach(common, "report.md")
+        verified = _loads(longtask_verify_node_handler({**common, "node_id": "N1"}))
+
+        assert verified["verification"]["verdict"] == "accepted"
+        assert verified["deliverables"]["counts"]["final"] == 1
+        assert Path(verified["manifest_path"]).exists()
+        assert Path(verified["manifest_path"]).parent == artifact_index_path(
+            "sess-final"
+        ).parent
+
+    def test_scratch_artifact_is_refused_as_a_deliverable(
+        self, tmp_path, monkeypatch
+    ):
+        _home, ws = self._env(tmp_path, monkeypatch)
+        (ws / "tmp-work.txt").write_text("delivered\n", encoding="utf-8")
+        common = self._create(tmp_path, "sess-scratch")
+
+        _loads(
+            longtask_update_node_handler(
+                {
+                    **common,
+                    "node_id": "N1",
+                    "artifacts": [{"path": "tmp-work.txt", "kind": "scratch"}],
+                }
+            )
+        )
+        self._attach(common, "tmp-work.txt")
+
+        verified = _loads(longtask_verify_node_handler({**common, "node_id": "N1"}))
+
+        assert verified["verification"]["verdict"] == "rejected"
+        assert verified["deliverables"]["counts"]["scratch"] == 1
+        assert verified["deliverables"]["final"] == []
+
+    def test_read_can_return_the_delivery_manifest(self, tmp_path, monkeypatch):
+        from tools.longtask_tool import longtask_read_handler
+
+        _home, ws = self._env(tmp_path, monkeypatch)
+        (ws / "ship.txt").write_text("delivered\n", encoding="utf-8")
+        common = self._create(tmp_path, "sess-read")
+        _loads(
+            longtask_update_node_handler(
+                {
+                    **common,
+                    "node_id": "N1",
+                    "artifacts": [{"path": "ship.txt", "kind": "final"}],
+                }
+            )
+        )
+
+        without = _loads(longtask_read_handler(common))
+        assert "deliverables" not in without
+
+        with_manifest = _loads(longtask_read_handler({**common, "include_artifacts": True}))
+        assert with_manifest["deliverables"]["counts"]["final"] == 1

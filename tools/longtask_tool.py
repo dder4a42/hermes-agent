@@ -19,10 +19,14 @@ from agent.longtask_board import (
     board_dir,
     cancel_node,
     create_board,
+    delivery_manifest,
+    load_artifact_index,
     load_board,
     next_ready_nodes,
     read_board,
+    register_artifacts,
     update_node,
+    write_delivery_manifest,
 )
 from agent.longtask_verifier import verify_report_with_llm
 from tools.registry import registry, tool_error
@@ -149,6 +153,33 @@ def _load_longtask_config() -> Dict[str, Any]:
         return {}
 
 
+def _register_node_artifacts(
+    parent: Any,
+    sid: str,
+    node_id: str,
+    artifacts: Any,
+    node: Any,
+) -> Optional[Dict[str, Any]]:
+    """Register a node's declared artifacts, inheriting its provenance.
+
+    The producer ids default to the node's recorded provenance, so an artifact
+    produced by a delegated child keeps the same child_session_id /
+    delegation_id the host wrote on the report — the join key between board,
+    report, and artifact index. Storage is the profile home (no ``root``
+    argument here), which is what keeps the index out of the workspace.
+    """
+    provenance = node.get("provenance") if isinstance(node, dict) else None
+    provenance = provenance if isinstance(provenance, dict) else {}
+    return register_artifacts(
+        sid,
+        artifacts,
+        workspace_root=_workspace_root(parent),
+        producing_node_id=node_id,
+        child_session_id=provenance.get("child_session_id"),
+        delegation_id=provenance.get("delegation_id"),
+    )
+
+
 def longtask_create_handler(args: Dict[str, Any], **kw) -> str:
     try:
         parent = kw.get("parent_agent")
@@ -210,7 +241,14 @@ def longtask_read_handler(args: Dict[str, Any], **kw) -> str:
             sid,
             node_id=args.get("node_id"),
         )
-        return _ok({"status": "ok", "session_id": sid, "board": data})
+        payload = {"status": "ok", "session_id": sid, "board": data}
+        if args.get("include_artifacts"):
+            # The delivery manifest a verifier would read: final deliverables
+            # vs scratch, from the profile-scoped artifact index.
+            payload["deliverables"] = delivery_manifest(
+                sid, workspace_root=_workspace_root(parent)
+            )
+        return _ok(payload)
     except Exception as exc:
         return _handle_error(exc)
 
@@ -246,7 +284,13 @@ def longtask_update_node_handler(args: Dict[str, Any], **kw) -> str:
             verification=args.get("verification"),
             notes=args.get("notes"),
         )
-        return _ok({"status": "ok", "session_id": sid, **data})
+        payload = {"status": "ok", "session_id": sid, **data}
+        artifacts = args.get("artifacts")
+        if artifacts:
+            payload["artifacts"] = _register_node_artifacts(
+                parent, sid, str(args.get("node_id") or ""), artifacts, data.get("node")
+            )
+        return _ok(payload)
     except Exception as exc:
         return _handle_error(exc)
 
@@ -305,18 +349,30 @@ def longtask_verify_node_handler(args: Dict[str, Any], **kw) -> str:
         max_reviews = longtask_cfg.get("verifier_max_claim_reviews")
         if max_reviews is not None:
             verifier_cfg["max_claim_reviews"] = max_reviews
+        # The artifact index is what lets the deterministic pass tell a FINAL
+        # deliverable from a SCRATCH intermediate (agent/longtask_board.py).
+        # Loaded here, from the profile home, so verification consumes the same
+        # manifest a reader would.
+        artifact_index = load_artifact_index(sid)
+        workspace = _workspace_root(parent)
         verification = verify_report_with_llm(
             report,
             node_goal=str(node.get("goal") or ""),
             objective=str(board.get("objective") or ""),
-            workspace_root=_workspace_root(parent),
+            workspace_root=workspace,
             llm_config=verifier_cfg,
+            artifact_index=artifact_index,
         )
+        # Persist the delivery manifest next to the index: the final-vs-scratch
+        # read of the run, written where the verifier just read it from.
+        manifest_path = write_delivery_manifest(sid, workspace_root=workspace)
         updated = update_node(root, sid, node_id, verification=verification)
         return _ok({
             "status": "ok",
             "session_id": sid,
             "verification": verification,
+            "deliverables": manifest_path["manifest"],
+            "manifest_path": manifest_path["manifest_path"],
             **updated,
         })
     except Exception as exc:
@@ -450,6 +506,14 @@ registry.register(
             "type": "object",
             "properties": {
                 "node_id": {"type": "string", "description": "Optional node id."},
+                "include_artifacts": {
+                    "type": "boolean",
+                    "description": (
+                        "Also return the delivery manifest: registered "
+                        "artifacts split into final deliverables vs scratch, "
+                        "with hash checks and missing files."
+                    ),
+                },
                 **_COMMON_OPTIONAL,
             },
             "required": [],
@@ -529,6 +593,31 @@ registry.register(
                 "evidence": {"type": "array", "items": {"type": "object"}},
                 "verification": {"type": "object"},
                 "notes": {"type": "string"},
+                "artifacts": {
+                    "type": "array",
+                    "description": (
+                        "Artifacts this item produced, recorded in the "
+                        "profile-scoped index (path + sha256 + producer). "
+                        "kind=final for a deliverable, scratch for a "
+                        "throwaway/intermediate file; a scratch path cannot "
+                        "stand in for a deliverable during verification."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "File path (absolute, or relative to the workspace).",
+                            },
+                            "kind": {
+                                "type": "string",
+                                "enum": ["final", "scratch"],
+                                "description": "final = deliverable; scratch = temporary/intermediate.",
+                            },
+                        },
+                        "required": ["path", "kind"],
+                    },
+                },
                 **_COMMON_OPTIONAL,
             },
             "required": ["node_id"],

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import hashlib
 import json
 import re
 import threading
@@ -219,9 +220,14 @@ def _thread_lock(path: Path) -> "threading.RLock":
 
 
 @contextlib.contextmanager
-def board_lock(root: str | Path, session_id: str) -> Iterator[None]:
-    """Serialize one board's read-modify-write cycle."""
-    path = board_path(root, session_id)
+def _path_lock(path: Path) -> Iterator[None]:
+    """Serialize a load -> mutate -> save cycle on one JSON file.
+
+    Shared by the board and the artifact index: both are read-modify-write
+    documents that two worker threads (or two Hermes processes on one
+    workspace) can race. The RLock covers the in-process case, the flock the
+    cross-process one; on Windows fcntl is absent and only the RLock applies.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with _thread_lock(path):
         handle = None
@@ -242,6 +248,13 @@ def board_lock(root: str | Path, session_id: str) -> Iterator[None]:
                         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                 finally:
                     handle.close()
+
+
+@contextlib.contextmanager
+def board_lock(root: str | Path, session_id: str) -> Iterator[None]:
+    """Serialize one board's read-modify-write cycle."""
+    with _path_lock(board_path(root, session_id)):
+        yield
 
 
 
@@ -1040,3 +1053,377 @@ def render_board_summary(
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ---------------------------------------------------------------------------
+# Artifact index (I_t) + delivery manifest   [P6, minimal]
+# ---------------------------------------------------------------------------
+# The board records what was DONE; the artifact index records what was
+# PRODUCED, and by whom. Two jobs, both deterministic (no model call):
+#
+#   1. register each produced artifact with a content hash (sha256) and its
+#      producer (producing node_id / child session / delegation run), so a
+#      reader can join "this path" to "which node and which delegation made
+#      it" without replaying the run;
+#   2. declare, per artifact, whether it is FINAL (a deliverable) or SCRATCH
+#      (an intermediate, e.g. a /tmp by-product). The verifier consumes the
+#      second half: a claim that cites a scratch path as if it were the
+#      delivered result is refused, so a temporary file can never stand in
+#      for the artifact the task was supposed to hand over.
+#
+# Storage is PROFILE-SCOPED under ``get_hermes_home()`` — never a hardcoded
+# ``~/.hermes`` — so two profiles cannot share (or corrupt) one index. The
+# board itself stays workspace-scoped (<workspace>/.hermes/tasks/<sid>); the
+# index is keyed by session id under the profile home.
+ARTIFACT_KINDS = frozenset({"final", "scratch"})
+
+# Synonyms accepted on write so a caller's wording does not have to match the
+# two canonical values exactly. There is deliberately NO default: the
+# final-vs-scratch call is the whole point, so it must be stated.
+_ARTIFACT_KIND_ALIASES = {
+    "final": "final",
+    "deliverable": "final",
+    "deliverables": "final",
+    "output": "final",
+    "result": "final",
+    "shipped": "final",
+    "committed": "final",
+    "scratch": "scratch",
+    "temp": "scratch",
+    "tmp": "scratch",
+    "temporary": "scratch",
+    "intermediate": "scratch",
+    "work": "scratch",
+    "workfile": "scratch",
+}
+
+
+def normalize_artifact_kind(value: Any) -> str:
+    """Normalise an artifact's final/scratch label; reject the unknown.
+
+    Unlike ``report_status`` (advisory data that is kept verbatim), this label
+    decides whether the verifier may treat a path as a deliverable, so an
+    unrecognised value is an error rather than silently stored.
+    """
+    kind = str(value or "").strip().lower()
+    if kind in ARTIFACT_KINDS:
+        return kind
+    mapped = _ARTIFACT_KIND_ALIASES.get(kind)
+    if mapped:
+        return mapped
+    raise LongtaskBoardError(
+        f"Invalid artifact kind: {kind!r}. Expected one of {sorted(ARTIFACT_KINDS)}"
+    )
+
+
+def artifact_index_root(root: Optional[str | Path] = None) -> Path:
+    """Directory holding every session's artifact index.
+
+    Defaults to ``get_hermes_home() / "longtask"``: the profile home, so the
+    index follows the active profile instead of a hardcoded path. ``root`` is
+    an explicit override (used by tests) and is treated as the base directly.
+    """
+    if root:
+        return Path(root).expanduser().resolve()
+    from hermes_constants import get_hermes_home  # local import: avoid import cycles
+
+    return (get_hermes_home() / "longtask").expanduser()
+
+
+def artifact_index_dir(session_id: str, *, root: Optional[str | Path] = None) -> Path:
+    return artifact_index_root(root) / "artifacts" / safe_id(session_id)
+
+
+def artifact_index_path(session_id: str, *, root: Optional[str | Path] = None) -> Path:
+    return artifact_index_dir(session_id, root=root) / "index.json"
+
+
+def delivery_manifest_path(session_id: str, *, root: Optional[str | Path] = None) -> Path:
+    return artifact_index_dir(session_id, root=root) / "manifest.json"
+
+
+def _artifact_index_document(index: Dict[str, Any]) -> Dict[str, Any]:
+    """The on-disk shape of the index (no derived keys like index_path)."""
+    return {
+        "session_id": str(index.get("session_id") or "default"),
+        "updated_at": str(index.get("updated_at") or _now()),
+        "artifacts": [dict(entry) for entry in index.get("artifacts") or []],
+    }
+
+
+def _normalize_artifact_index(
+    data: Any, *, session_id: str, index_path: Path
+) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise LongtaskBoardError("Artifact index must be a JSON object")
+    index = copy.deepcopy(data)
+    index["session_id"] = str(index.get("session_id") or session_id)
+    index["updated_at"] = str(index.get("updated_at") or _now())
+    raw = index.get("artifacts")
+    if not isinstance(raw, list):
+        raw = []
+    # Sorted by path so the document (and any diff of it) is deterministic.
+    entries = [dict(item) for item in raw if isinstance(item, dict) and item.get("path")]
+    entries.sort(key=lambda item: str(item.get("path")))
+    index["artifacts"] = entries
+    index["index_path"] = str(index_path)
+    return index
+
+
+def load_artifact_index(
+    session_id: str, *, root: Optional[str | Path] = None
+) -> Dict[str, Any]:
+    """Read the session's artifact index (an empty one when none exists yet)."""
+    path = artifact_index_path(session_id, root=root)
+    if not path.exists():
+        return _normalize_artifact_index(
+            {"artifacts": []}, session_id=str(session_id), index_path=path
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise LongtaskBoardError(f"Could not read artifact index: {exc}") from exc
+    return _normalize_artifact_index(data, session_id=str(session_id), index_path=path)
+
+
+def _opt_str(value: Any) -> Optional[str]:
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
+def _hash_and_size(path: Path) -> tuple[Optional[str], Optional[int]]:
+    """Streaming sha256 + byte size, or ``(None, None)`` when unreadable."""
+    try:
+        digest = hashlib.sha256()
+        size = 0
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                size += len(chunk)
+        return digest.hexdigest(), size
+    except OSError:
+        return None, None
+
+
+def _resolve_artifact_path(raw: str, workspace: Optional[Path]) -> str:
+    path = Path(raw).expanduser()
+    if not path.is_absolute() and workspace is not None:
+        path = workspace / path
+    return str(path.resolve())
+
+
+def _artifact_rel_path(raw: str, workspace: Optional[Path]) -> Optional[str]:
+    if workspace is None:
+        return None
+    try:
+        return str(Path(_resolve_artifact_path(raw, workspace)).relative_to(workspace))
+    except ValueError:
+        return None
+
+
+def _artifact_counts(entries: Iterable[Dict[str, Any]]) -> Dict[str, int]:
+    items = list(entries)
+    return {
+        "final": sum(1 for e in items if e.get("kind") == "final"),
+        "scratch": sum(1 for e in items if e.get("kind") == "scratch"),
+        "total": len(items),
+    }
+
+
+def register_artifacts(
+    session_id: str,
+    artifacts: Any,
+    *,
+    workspace_root: Optional[str | Path] = None,
+    producing_node_id: Optional[str] = None,
+    child_session_id: Optional[str] = None,
+    delegation_id: Optional[str] = None,
+    root: Optional[str | Path] = None,
+) -> Dict[str, Any]:
+    """Register produced artifacts: path + sha256 + producer + final/scratch.
+
+    ``artifacts`` is a list of objects ``{"path": ..., "kind": "final"|"scratch",
+    ...}``. The batch-level ``producing_node_id`` / ``child_session_id`` /
+    ``delegation_id`` are defaults a per-artifact value overrides, so a node
+    can register its own output and inherit the provenance the host recorded
+    on the item. Registration is an upsert keyed by the RESOLVED absolute path:
+    re-registering the same file updates its label/hash instead of duplicating
+    it. A relative path is resolved against ``workspace_root``.
+    """
+    if isinstance(artifacts, dict):
+        artifacts = [artifacts]
+    if not isinstance(artifacts, list) or not artifacts:
+        raise LongtaskBoardError("register_artifacts requires at least one artifact")
+
+    index_path = artifact_index_path(session_id, root=root)
+    workspace = (
+        Path(str(workspace_root)).expanduser().resolve() if workspace_root else None
+    )
+    with _path_lock(index_path):
+        index = load_artifact_index(session_id, root=root)
+        by_path = {str(entry.get("path")): entry for entry in index["artifacts"]}
+        registered: List[Dict[str, Any]] = []
+        for item in artifacts:
+            if not isinstance(item, dict):
+                raise LongtaskBoardError("artifact entries must be objects")
+            raw = str(item.get("path") or item.get("ref") or "").strip()
+            if not raw:
+                raise LongtaskBoardError("artifact entry needs a non-empty path")
+            resolved = _resolve_artifact_path(raw, workspace)
+            existing = by_path.get(resolved) or {}
+            sha256, size = _hash_and_size(Path(resolved))
+            entry = {
+                "path": resolved,
+                "rel_path": _artifact_rel_path(raw, workspace),
+                "kind": normalize_artifact_kind(item.get("kind")),
+                "sha256": sha256,
+                "size": size,
+                "producing_node_id": _opt_str(item.get("producing_node_id"))
+                or _opt_str(producing_node_id),
+                "child_session_id": _opt_str(item.get("child_session_id"))
+                or _opt_str(child_session_id),
+                "delegation_id": _opt_str(item.get("delegation_id"))
+                or _opt_str(delegation_id),
+                "recorded_at": existing.get("recorded_at") or _now(),
+            }
+            by_path[resolved] = entry
+            registered.append(entry)
+        index["session_id"] = str(session_id)
+        index["updated_at"] = _now()
+        index["artifacts"] = sorted(by_path.values(), key=lambda e: str(e.get("path")))
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json_write(index_path, _artifact_index_document(index), indent=2, sort_keys=True)
+    return {
+        "session_id": str(session_id),
+        "index_path": str(index_path),
+        "registered": registered,
+        "counts": _artifact_counts(index["artifacts"]),
+    }
+
+
+def index_artifact_lookup(
+    artifact_index: Any, *, workspace_root: Optional[str | Path] = None
+) -> Dict[str, Dict[str, Any]]:
+    """Map resolved path -> entry for a consumer (e.g. the verifier).
+
+    Pure: takes the index dict (or a bare entry list) and returns the lookup
+    table. Both the absolute ``path`` and the workspace-relative ``rel_path``
+    are indexed, so a caller may cite either form.
+    """
+    entries = artifact_index
+    if isinstance(artifact_index, dict):
+        entries = artifact_index.get("artifacts") or []
+    if not isinstance(entries, list):
+        entries = []
+    workspace = (
+        Path(str(workspace_root)).expanduser().resolve() if workspace_root else None
+    )
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        keys: List[str] = []
+        raw = str(entry.get("path") or "").strip()
+        if raw:
+            keys.append(str(Path(raw).expanduser().resolve()))
+        rel = str(entry.get("rel_path") or "").strip()
+        if rel and workspace is not None:
+            keys.append(str((workspace / rel).resolve()))
+        for key in keys:
+            lookup.setdefault(key, entry)
+    return lookup
+
+
+def artifact_kind_for(
+    session_id: str,
+    ref: str,
+    *,
+    workspace_root: Optional[str | Path] = None,
+    root: Optional[str | Path] = None,
+) -> Optional[str]:
+    """``"final"`` / ``"scratch"`` for a registered path, else ``None``."""
+    raw = str(ref or "").strip()
+    if not raw:
+        return None
+    workspace = (
+        Path(str(workspace_root)).expanduser().resolve() if workspace_root else None
+    )
+    lookup = index_artifact_lookup(
+        load_artifact_index(session_id, root=root), workspace_root=workspace
+    )
+    entry = lookup.get(_resolve_artifact_path(raw, workspace))
+    return str(entry.get("kind")) if entry else None
+
+
+def delivery_manifest(
+    session_id: str,
+    *,
+    workspace_root: Optional[str | Path] = None,
+    root: Optional[str | Path] = None,
+    check_hashes: bool = True,
+) -> Dict[str, Any]:
+    """The delivery manifest: final deliverables vs scratch, plus missing files.
+
+    Deterministic and LLM-free. ``final`` / ``scratch`` are the registered
+    artifacts, each annotated with whether the file still exists and whether
+    its content still hashes to the registered sha256 (a silent post-hoc edit
+    is visible). ``missing`` is registered-but-gone: a deliverable that was
+    promised and is no longer there.
+    """
+    index = load_artifact_index(session_id, root=root)
+    final: List[Dict[str, Any]] = []
+    scratch: List[Dict[str, Any]] = []
+    missing: List[Dict[str, Any]] = []
+    for entry in index["artifacts"]:
+        record = dict(entry)
+        raw_path = str(entry.get("path") or "")
+        path = Path(raw_path)
+        exists = bool(raw_path) and path.is_file()
+        record["exists"] = exists
+        if exists and check_hashes:
+            current, _size = _hash_and_size(path)
+            record["current_sha256"] = current
+            record["hash_matches"] = bool(current) and current == entry.get("sha256")
+        else:
+            record["hash_matches"] = None
+        if not exists:
+            missing.append(record)
+        elif record.get("kind") == "scratch":
+            scratch.append(record)
+        else:
+            final.append(record)
+    return {
+        "session_id": str(session_id),
+        "index_path": index["index_path"],
+        "final": final,
+        "scratch": scratch,
+        "missing": missing,
+        "counts": {
+            "final": len(final),
+            "scratch": len(scratch),
+            "missing": len(missing),
+        },
+    }
+
+
+def write_delivery_manifest(
+    session_id: str,
+    *,
+    workspace_root: Optional[str | Path] = None,
+    root: Optional[str | Path] = None,
+    check_hashes: bool = True,
+) -> Dict[str, Any]:
+    """Persist the delivery manifest under the profile home; returns it too.
+
+    The manifest is the "report" half of the requirement: index.json records
+    the raw registrations, manifest.json records the final-vs-scratch read of
+    them at verification time.
+    """
+    manifest = delivery_manifest(
+        session_id, workspace_root=workspace_root, root=root, check_hashes=check_hashes
+    )
+    path = delivery_manifest_path(session_id, root=root)
+    with _path_lock(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_json_write(path, manifest, indent=2, sort_keys=True)
+    return {"manifest_path": str(path), "manifest": manifest}

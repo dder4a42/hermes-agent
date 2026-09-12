@@ -24,6 +24,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import json
 import re
 
+from agent.longtask_board import index_artifact_lookup
+
 
 # Cap on how many claims one report may send to the LLM. A 20-claim report must
 # not turn into 20 unbounded model calls: the cap bounds the spend, and claims
@@ -62,6 +64,11 @@ _CONSTRAINT_LIBRARY = {
         "The claim must stay inside the node goal and the board objective, and "
         "must not assert more than its evidence shows."
     ),
+    "artifact": (
+        "A cited file must be the artifact actually delivered: a path registered "
+        "as SCRATCH (an intermediate temp file) cannot stand in for a FINAL "
+        "deliverable."
+    ),
 }
 
 
@@ -69,6 +76,7 @@ def verify_report(
     report: Dict[str, Any],
     *,
     workspace_root: Optional[str | Path] = None,
+    artifact_index: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Verify a subagent report without running another model.
 
@@ -76,6 +84,12 @@ def verify_report(
     so an LLM review can be layered on per claim without re-deriving the
     deterministic part (and so a deterministic failure is visible per claim,
     with the quote that was searched for).
+
+    ``artifact_index`` (the delivery manifest's index, from
+    ``agent.longtask_board.load_artifact_index``) lets the deterministic pass
+    tell a FINAL deliverable from a SCRATCH intermediate: a claim that cites a
+    scratch path as its delivered artifact is refused here, with no model call.
+    Omit it and file checks behave exactly as before.
     """
     if not isinstance(report, dict):
         return _result(
@@ -97,7 +111,9 @@ def verify_report(
     missing = []
     records: List[Dict[str, Any]] = []
     root = Path(workspace_root).expanduser().resolve() if workspace_root else None
-
+    artifact_lookup = index_artifact_lookup(
+        artifact_index, workspace_root=root
+    )
     for index, claim in enumerate(claims, start=1):
         if not isinstance(claim, dict):
             rejected.append({"index": index, "reason": "claim is not an object"})
@@ -133,7 +149,10 @@ def verify_report(
                 bad=[{"ok": False, "reason": "claim has no evidence"}],
             ))
             continue
-        checks = [_check_evidence(item, root=root) for item in evidence]
+        checks = [
+            _check_evidence(item, root=root, artifact_lookup=artifact_lookup)
+            for item in evidence
+        ]
         bad = [item for item in checks if not item["ok"]]
         records.append(_claim_record(
             index,
@@ -177,15 +196,19 @@ def verify_report_with_llm(
     objective: str = "",
     workspace_root: Optional[str | Path] = None,
     llm_config: Optional[Dict[str, Any]] = None,
+    artifact_index: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Verify a report with deterministic checks plus per-claim LLM reviews.
 
     One review per claim instead of one per report, capped by
     ``max_claim_reviews`` (``longtask.verifier_max_claim_reviews``). With no LLM
     configured this returns exactly the deterministic result — the degradation
-    path is unchanged.
+    path is unchanged. ``artifact_index`` is forwarded to the deterministic
+    pass, so final-vs-scratch classification holds with or without a judge.
     """
-    deterministic = verify_report(report, workspace_root=workspace_root)
+    deterministic = verify_report(
+        report, workspace_root=workspace_root, artifact_index=artifact_index
+    )
     cfg = llm_config or {}
     if not cfg.get("enabled"):
         return deterministic
@@ -509,6 +532,7 @@ def _applicable_constraints(
     if kinds & {"file", "test"}:
         constraints.append(_CONSTRAINT_LIBRARY["file"])
         constraints.append(_CONSTRAINT_LIBRARY["quote"])
+        constraints.append(_CONSTRAINT_LIBRARY["artifact"])
     for kind in ("command", "url", "observation"):
         if kind in kinds:
             constraints.append(_CONSTRAINT_LIBRARY[kind])
@@ -640,7 +664,12 @@ def _as_str_list(value: Any) -> List[str]:
     return []
 
 
-def _check_evidence(item: Any, *, root: Optional[Path]) -> Dict[str, Any]:
+def _check_evidence(
+    item: Any,
+    *,
+    root: Optional[Path],
+    artifact_lookup: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     if not isinstance(item, dict):
         return {"ok": False, "reason": "evidence is not an object"}
     kind = str(item.get("kind") or item.get("type") or "").strip().lower()
@@ -648,9 +677,19 @@ def _check_evidence(item: Any, *, root: Optional[Path]) -> Dict[str, Any]:
     quote = str(item.get("quote") or item.get("output") or "").strip()
 
     if kind == "file":
-        return _check_file_evidence(kind, ref, quote, root=root)
+        return _classify_artifact(
+            _check_file_evidence(kind, ref, quote, root=root),
+            ref,
+            artifact_lookup,
+            root,
+        )
     if kind == "test":
-        return _check_test_evidence(ref, quote, item, root=root)
+        return _classify_artifact(
+            _check_test_evidence(ref, quote, item, root=root),
+            ref,
+            artifact_lookup,
+            root,
+        )
     if kind == "command":
         has_command = bool(ref or item.get("command"))
         has_result = bool(quote or item.get("exit_code") is not None)
@@ -679,6 +718,42 @@ def _check_evidence(item: Any, *, root: Optional[Path]) -> Dict[str, Any]:
             "reason": "observation has content" if ok else "observation needs ref or quote",
         }
     return {"ok": False, "kind": kind, "ref": ref, "reason": "unknown evidence kind"}
+
+
+def _classify_artifact(
+    check: Dict[str, Any],
+    ref: str,
+    artifact_lookup: Optional[Dict[str, Dict[str, Any]]],
+    root: Optional[Path],
+) -> Dict[str, Any]:
+    """Annotate a file/test check with the artifact's final-vs-scratch label.
+
+    A SCRATCH registration turns the check into a failure: the point of the
+    delivery manifest is that a temp by-product cannot stand in for the
+    delivered artifact, and this is where that is enforced (no model call).
+    An UNREGISTERED path is annotated and otherwise left alone — the index is
+    opt-in, so an un-indexed workspace keeps the verifier's old behaviour.
+    """
+    if not artifact_lookup:
+        return check
+    path_ref, _line = _parse_file_ref(ref)
+    resolved = _resolve_path(path_ref, root)
+    if resolved is None:
+        return check
+    entry = artifact_lookup.get(str(resolved))
+    if entry is None:
+        return {**check, "artifact_kind": "unregistered"}
+    kind = str(entry.get("kind") or "")
+    if kind == "scratch":
+        return {
+            **check,
+            "artifact_kind": "scratch",
+            "ok": False,
+            "reason": (
+                f"cites a scratch artifact (not a deliverable): {path_ref}"
+            ),
+        }
+    return {**check, "artifact_kind": kind}
 
 
 def _check_file_evidence(
