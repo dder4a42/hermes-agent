@@ -295,6 +295,16 @@ def longtask_verify_node_handler(args: Dict[str, Any], **kw) -> str:
         verifier_cfg = longtask_cfg.get("verifier") or {}
         if not isinstance(verifier_cfg, dict):
             verifier_cfg = {}
+        else:
+            # Copy: the knob below is added here, and the config dict is shared.
+            verifier_cfg = dict(verifier_cfg)
+        # Per-claim LLM reviews are fanned out one call per claim, so the cap
+        # (longtask.verifier_max_claim_reviews) is what keeps a 20-claim report
+        # from becoming 20 unbounded calls. Claims past the cap stay
+        # `unverified` on the stored verification, never accepted.
+        max_reviews = longtask_cfg.get("verifier_max_claim_reviews")
+        if max_reviews is not None:
+            verifier_cfg["max_claim_reviews"] = max_reviews
         verification = verify_report_with_llm(
             report,
             node_goal=str(node.get("goal") or ""),

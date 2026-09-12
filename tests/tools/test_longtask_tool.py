@@ -91,6 +91,74 @@ def test_longtask_tool_minimal_flow(tmp_path):
     assert [node["node_id"] for node in second["ready"]] == ["N2"]
 
 
+def test_verifier_review_cap_comes_from_config(tmp_path, monkeypatch):
+    """The per-claim LLM fan-out is bounded by longtask.verifier_max_claim_reviews.
+
+    Without the cap a 20-claim report becomes 20 unbounded model calls. Claims
+    past the cap stay `unverified` on the stored verification, and an unverified
+    load-bearing claim must not read as an accepted verdict.
+    """
+    calls = []
+
+    class _Msg:
+        content = (
+            '{"contested": false, "disconfirming_evidence": [], "required_repair": ""}'
+        )
+
+    class _Choice:
+        message = _Msg()
+
+    class _Response:
+        choices = [_Choice()]
+
+    def fake_call_llm(**kwargs):
+        calls.append(kwargs)
+        return _Response()
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "longtask": {
+                "verifier": {"enabled": True},
+                "verifier_max_claim_reviews": 1,
+            }
+        },
+    )
+
+    common = {"root": str(tmp_path), "session_id": "s"}
+    _loads(
+        longtask_create_handler(
+            {**common, "objective": "obj", "nodes": [{"node_id": "N1", "goal": "g"}]}
+        )
+    )
+    _loads(longtask_update_node_handler({**common, "node_id": "N1", "resolution": "in_progress"}))
+    _loads(
+        longtask_attach_report_handler(
+            {
+                **common,
+                "node_id": "N1",
+                "report": {
+                    "status": "success",
+                    "claims": [
+                        {"claim": "First", "evidence": [{"kind": "observation", "ref": "obs-1"}]},
+                        {"claim": "Second", "evidence": [{"kind": "observation", "ref": "obs-2"}]},
+                    ],
+                },
+            }
+        )
+    )
+
+    verified = _loads(longtask_verify_node_handler({**common, "node_id": "N1"}))
+    verification = verified["verification"]
+
+    assert len(calls) == 1
+    assert verification["llm_verification"]["max_claim_reviews"] == 1
+    assert [c["claim"] for c in verification["unverified_claims"]] == ["Second"]
+    assert [c["claim"] for c in verification["accepted_claims"]] == ["First"]
+    assert verification["verdict"] != "accepted"
+
+
 class TestDelegatedChildIsolation:
     """Division of labour: the main agent plans and owns the board; a subagent
     executes one bounded node and reports back. A child used to receive all six
