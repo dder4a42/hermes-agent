@@ -927,6 +927,24 @@ DEFAULT_CONFIG = {
                                       # warning channel while the host keeps
                                       # waiting in bounded increments for the
                                       # commit to finish.
+        "context_timeout_scale_per_100k_tokens_seconds": 15,  # extra idle seconds the
+                                      # in-agent compress_context watchdog grants per
+                                      # 100K estimated input tokens, ON TOP of
+                                      # context_timeout_seconds (rounded up per 100K).
+                                      # A summary over a ~900K-token transcript can
+                                      # legitimately think for minutes before its FIRST
+                                      # streamed token, so a fixed 120s inactivity
+                                      # budget aborted real compressions that a later
+                                      # attempt finished in ~124s. The total ceiling
+                                      # grows by the same delta, so a slow-but-still-
+                                      # progressing summary of a huge transcript is not
+                                      # killed by the ceiling either. 0 disables the
+                                      # scaling and restores the fixed historical
+                                      # budget.
+        "context_timeout_max_seconds": 600,  # absolute cap on the SCALED
+                                      # context_timeout_seconds above, so a bogus
+                                      # token estimate cannot grant an unbounded wait.
+                                      # <= 0 removes the cap.
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt
                                       # (which is always implicitly protected). Set to

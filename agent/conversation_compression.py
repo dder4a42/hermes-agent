@@ -188,6 +188,23 @@ CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE = (
     "session or /compress to retry immediately."
 )
 
+# FAILURE-CLASS notice — a deliberate carve-out from routine-compression
+# silence (#16775 class): the progress-aware watchdog aborted this turn's
+# compression because the summary model stopped producing output (a stalled
+# endpoint, not a slow-but-progressing one) and the same-turn retry did not
+# recover, so the context stays over the compression threshold and will keep
+# growing toward the hard provider token limit. This MUST stay visible on chat
+# gateways. Do NOT add it to ROUTINE_COMPRESSION_STATUS_SAMPLES or the gateway
+# noise regex (_TELEGRAM_NOISY_STATUS_RE); it is pinned un-swallowed in
+# tests/gateway/test_telegram_noise_filter.py::VISIBLE_COMPRESSION_MESSAGES.
+COMPRESSION_NO_PROGRESS_ABORT_WARNING_TEMPLATE = (
+    "⚠ Context compression could not make progress (the summary model stopped "
+    "producing output) and the same-turn retry did not recover. No messages "
+    "were dropped, but the conversation keeps growing toward the model's hard "
+    "token limit — run /compress to retry now, or /new to start a fresh "
+    "session."
+)
+
 # Sample-formatted instances of every routine compression status line, for
 # behavioral tests that iterate the ACTUAL emitted wording (formatted from the
 # same constants the emission sites use) through the gateway noise filter.
@@ -204,6 +221,49 @@ ROUTINE_COMPRESSION_STATUS_SAMPLES = (
         new_ctx=120000, old_ctx=250000
     ),
 )
+
+
+def _emit_compression_no_progress_warning(agent: Any) -> None:
+    """Surface a no-progress abort to the USER, not just the logs.
+
+    Historically the watchdog abort wrote a WARNING to the log and a
+    ``failure_class="no_progress"`` telemetry line and nothing else, so a user
+    whose summary route had stalled saw the conversation keep growing toward
+    the hard provider token limit with no explanation (P12). This is a
+    FAILURE-CLASS notice and a deliberate carve-out from routine-compression
+    silence — see :data:`COMPRESSION_NO_PROGRESS_ABORT_WARNING_TEMPLATE`.
+
+    Dedup mirrors the established ``_last_compression_summary_warning`` pattern
+    (the identical notice is not repeated), and
+    :func:`_clear_compression_no_progress_warning` re-arms it after a compaction
+    actually completes, so a later stall in the same session can warn again.
+    Fail-soft: an agent without the warning channel is a no-op.
+    """
+    emit = getattr(agent, "_emit_warning", None)
+    if not callable(emit):
+        return
+    if (
+        getattr(agent, "_last_compression_no_progress_notice", None)
+        == COMPRESSION_NO_PROGRESS_ABORT_WARNING_TEMPLATE
+    ):
+        return
+    try:
+        agent._last_compression_no_progress_notice = (
+            COMPRESSION_NO_PROGRESS_ABORT_WARNING_TEMPLATE
+        )
+        emit(COMPRESSION_NO_PROGRESS_ABORT_WARNING_TEMPLATE)
+    except Exception:
+        logger.debug(
+            "compression no-progress abort notice emit failed", exc_info=True
+        )
+
+
+def _clear_compression_no_progress_warning(agent: Any) -> None:
+    """Re-arm the no-progress abort notice once a compaction completes."""
+    try:
+        agent._last_compression_no_progress_notice = None
+    except Exception:
+        pass
 
 
 def _builtin_memory_prompt_snapshot(agent: Any) -> Optional[Tuple[str, str]]:
@@ -721,6 +781,19 @@ class CompressionCommitFence:
 # Mirror hermes_cli.config.DEFAULT_CONFIG["compression"] keys of the same name.
 DEFAULT_CONTEXT_TIMEOUT_SECONDS = 120.0
 DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS = 600.0
+# Input-scale adaptation for the same watchdog (P12). A summary over a
+# ~900K-token transcript legitimately spends far longer before its FIRST
+# streamed token than a small one (the model is reading a book before it
+# answers), so the fixed 120s inactivity budget false-aborted two real
+# compressions that a later attempt completed in ~124s. The budget now grows
+# with the size of the input the summary must read: `..._scale_per_100k_tokens`
+# extra idle seconds per 100K estimated input tokens (rounded up), on top of the
+# configured base, clamped to `..._max_seconds` so a degenerate estimate cannot
+# grant an unbounded wait. The total ceiling grows by the same amount, so a
+# slow-but-still-progressing summary of a huge transcript is not killed by the
+# ceiling either. Set the scale to 0 to restore the historical fixed budget.
+DEFAULT_CONTEXT_TIMEOUT_SCALE_PER_100K_TOKENS_SECONDS = 15.0
+DEFAULT_CONTEXT_TIMEOUT_MAX_SECONDS = 600.0
 
 # Shared daemon pool for sync compress_context timeout wraps — analogous to
 # asyncio's default executor used by gateway session hygiene's
@@ -802,15 +875,30 @@ def _get_compress_timeout_executor():
 
 def resolve_context_compression_timeouts(
     compression_cfg: Optional[dict] = None,
+    estimated_tokens: Optional[float] = None,
 ) -> Tuple[float, float]:
     """Return ``(idle_timeout_seconds, total_ceiling_seconds)``.
 
     ``idle_timeout_seconds <= 0`` disables the owned progress-aware wrapper.
     The ceiling is clamped to at least one idle window when the idle budget
     is positive, matching gateway hygiene semantics.
+
+    ``estimated_tokens`` is the size of the transcript the summary has to read
+    (the caller's own request estimate). When given, both budgets grow with it
+    by ``compression.context_timeout_scale_per_100k_tokens_seconds`` per 100K
+    tokens (rounded up), the idle budget clamped to
+    ``compression.context_timeout_max_seconds``. A fixed budget does not survive
+    contact with a 900K-token summary: the model can legitimately think for
+    minutes before its first streamed token, and the old 120s window aborted
+    passes that a later attempt finished in ~124s (P12). Scaling is skipped
+    entirely when the base idle budget is disabled or the estimate is not a
+    positive number, so a fenceless caller that omits the estimate keeps the
+    historical behaviour.
     """
     idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
     ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
+    scale_per_100k = DEFAULT_CONTEXT_TIMEOUT_SCALE_PER_100K_TOKENS_SECONDS
+    max_idle = DEFAULT_CONTEXT_TIMEOUT_MAX_SECONDS
     cfg = compression_cfg
     if cfg is None:
         try:
@@ -838,6 +926,33 @@ def resolve_context_compression_timeouts(
                     ceiling = parsed
             except (TypeError, ValueError):
                 pass
+        raw_scale = cfg.get("context_timeout_scale_per_100k_tokens_seconds")
+        if raw_scale is not None:
+            try:
+                scale_per_100k = float(raw_scale)
+            except (TypeError, ValueError):
+                pass
+        raw_max_idle = cfg.get("context_timeout_max_seconds")
+        if raw_max_idle is not None:
+            try:
+                max_idle = float(raw_max_idle)
+            except (TypeError, ValueError):
+                pass
+    # Input-scale adaptation: only meaningful for a live idle budget and a real
+    # (positive) estimate. Clamp to the max so a bogus estimate cannot grant an
+    # unbounded wait; the ceiling grows by the same delta so it never re-kills
+    # the pass the idle budget was widened for.
+    if idle > 0 and scale_per_100k > 0 and estimated_tokens is not None:
+        try:
+            tokens = float(estimated_tokens)
+        except (TypeError, ValueError):
+            tokens = 0.0
+        if tokens > 0:
+            scaled_idle = idle + math.ceil(tokens / 100_000.0) * scale_per_100k
+            if max_idle > 0:
+                scaled_idle = min(scaled_idle, max_idle)
+            ceiling += scaled_idle - idle
+            idle = scaled_idle
     if idle > 0:
         ceiling = max(ceiling, idle)
     return idle, ceiling
@@ -907,6 +1022,115 @@ def resolve_compression_fallback_route() -> Optional[dict]:
     return None
 
 
+def _mint_retry_fence(
+    new_fence: Optional[Callable[[], CompressionCommitFence]],
+    *,
+    label: str,
+) -> CompressionCommitFence:
+    """Return the fresh fence a post-abort retry must run on.
+
+    The aborted attempt's fence refuses every future commit, so a retry that
+    reused it could never publish. Mint through the host's factory when it has
+    one: hosts publish the active fence for hard-interrupt admission, so a
+    /stop during the retry serializes against THIS attempt's commit boundary.
+    A host without a factory still gets a working (unpublished) fence, plus a
+    warning that a mid-retry /stop cannot serialize against it.
+    """
+    retry_fence = None
+    if new_fence is not None:
+        try:
+            retry_fence = new_fence()
+        except Exception:
+            logger.warning(
+                "compression %s fence factory failed; the retry will run on "
+                "an unpublished fence (a /stop mid-retry cannot serialize "
+                "against its commit boundary)",
+                label,
+                exc_info=True,
+            )
+    if not isinstance(retry_fence, CompressionCommitFence):
+        logger.warning(
+            "compression %s retry running on an unpublished fence; "
+            "hard-interrupt admission will read the aborted attempt's fence "
+            "rather than the retry's commit boundary",
+            label,
+        )
+        retry_fence = CompressionCommitFence()
+    return retry_fence
+
+
+def _retry_compression_after_abort(
+    *,
+    worker: Callable[[CompressionCommitFence], Tuple[list, str]],
+    messages: list,
+    system_prompt_fallback: Any,
+    idle_timeout_seconds: float,
+    total_ceiling_seconds: float,
+    on_commit_overrun: Optional[Callable[[float, float], None]] = None,
+    telemetry_agent: Any = None,
+    new_fence: Optional[Callable[[], CompressionCommitFence]] = None,
+) -> Optional[Tuple[list, str]]:
+    """Re-run an aborted compression ONCE, in the SAME turn (P12).
+
+    An inactivity abort means the summary route went silent, not that the
+    transcript is uncompressible — the observed stalls recovered ~2 minutes
+    later, but only on the NEXT turn's preflight, so the session spent those
+    turns growing further past the threshold toward the hard provider token
+    limit. This makes that recovery happen inside the same turn.
+
+    Bounded by construction: the retry re-enters
+    :func:`run_compress_context_with_progress_timeout` with
+    ``retry_on_abort=False`` and ``stall_fallback=False``, on a fresh fence, so
+    it can neither recurse nor loop, and it is attempted at most once per
+    aborted attempt. Returns the retry's ``(messages, system_prompt)`` when it
+    actually compressed, else ``None`` so the caller degrades exactly as before.
+    Never touches an in-flight commit: the caller invokes this only after
+    cancellation won BEFORE the commit boundary, and an attempt that reached
+    ``begin_commit`` is waited on instead of aborted.
+    """
+    # An explicit stop is not a stalled route, and the retry worker would abort
+    # on the same event anyway; starting one at all makes /stop look ignored.
+    hard_cancel = getattr(telemetry_agent, "_hard_interrupt_requested", None)
+    cancel_is_set = getattr(hard_cancel, "is_set", None)
+    if callable(cancel_is_set) and cancel_is_set():
+        return None
+
+    retry_fence = _mint_retry_fence(new_fence, label="post-abort")
+    logger.warning(
+        "Context compression made no progress — retrying once in this turn "
+        "before continuing without compression"
+    )
+    try:
+        result_msgs, result_prompt = run_compress_context_with_progress_timeout(
+            worker=worker,
+            messages=messages,
+            system_prompt_fallback=system_prompt_fallback,
+            idle_timeout_seconds=idle_timeout_seconds,
+            total_ceiling_seconds=total_ceiling_seconds,
+            on_commit_overrun=on_commit_overrun,
+            fence=retry_fence,
+            telemetry_agent=telemetry_agent,
+            stall_fallback=False,
+            retry_on_abort=False,
+        )
+    except Exception:
+        # The primary already aborted; a failing retry must degrade, never turn
+        # "continue without compression" into a raised turn.
+        logger.warning(
+            "Context compression retry after a stalled attempt failed",
+            exc_info=True,
+        )
+        return None
+    if result_msgs is messages:
+        # Aborted or no-op: the worker hands back the caller's own list.
+        return None
+    logger.info(
+        "Context compression recovered on the same-turn retry after the "
+        "summary route went silent"
+    )
+    return result_msgs, result_prompt
+
+
 def _retry_compression_on_fallback_chain(
     *,
     worker: Callable[[CompressionCommitFence], Tuple[list, str]],
@@ -945,24 +1169,7 @@ def _retry_compression_on_fallback_chain(
     # fresh one. Mint it through the host's factory when it has one: hosts
     # publish the active fence for hard-interrupt admission, and a /stop
     # during the retry must serialize against THIS attempt's commit boundary.
-    retry_fence = None
-    if new_fence is not None:
-        try:
-            retry_fence = new_fence()
-        except Exception:
-            logger.warning(
-                "compression stall-fallback fence factory failed; the retry "
-                "will run on an unpublished fence (a /stop mid-retry cannot "
-                "serialize against its commit boundary)",
-                exc_info=True,
-            )
-    if not isinstance(retry_fence, CompressionCommitFence):
-        logger.warning(
-            "compression stall-fallback retry running on an unpublished fence; "
-            "hard-interrupt admission will read the aborted attempt's fence "
-            "rather than the retry's commit boundary",
-        )
-        retry_fence = CompressionCommitFence()
+    retry_fence = _mint_retry_fence(new_fence, label="stall-fallback")
     idle = float(route.get("timeout") or idle_timeout_seconds)
     ceiling = max(float(total_ceiling_seconds), idle)
     logger.warning(
@@ -1023,6 +1230,7 @@ def run_compress_context_with_progress_timeout(
     fence: Optional[CompressionCommitFence] = None,
     telemetry_agent: Any = None,
     stall_fallback: bool = True,
+    retry_on_abort: bool = False,
     new_fence: Optional[Callable[[], CompressionCommitFence]] = None,
 ) -> Tuple[list, str]:
     """Run ``worker(fence)`` under a sync progress-aware timeout.
@@ -1059,9 +1267,21 @@ def run_compress_context_with_progress_timeout(
     configured ``auxiliary.compression.fallback_chain`` once — pinned onto a
     fresh fence — before degrading to "continue without compression". Nothing
     raises out of a silent stall, so the auxiliary client's own fallback
-    handling (exception-path only) never sees it (#78981). ``on_timeout``
-    therefore fires only after that attempt has also failed, which keeps its
-    cooldown bookkeeping from suppressing the retry it precedes.
+    handling (exception-path only) never sees it (#78981).
+
+    ``retry_on_abort`` (default off; the in-agent host turns it on) then makes
+    ONE retry of the SAME route in the SAME turn, on a fresh fence, when the
+    fallback route was absent or also stalled (P12). The retry's safety comes
+    from the same property as the fallback's: it re-enters this function with
+    ``stall_fallback=False`` / ``retry_on_abort=False``, so it cannot recurse,
+    loop, or outlive the one attempt it was granted. Both retries run only
+    after cancellation won BEFORE ``begin_commit`` — an attempt whose commit is
+    already in flight is waited on and returns its result, so nothing here can
+    intervene in a running commit.
+
+    ``on_timeout`` therefore fires only after those retries have also failed,
+    which keeps its cooldown bookkeeping from suppressing the retries it
+    precedes.
 
     ``new_fence`` mints that retry's fence. Hosts that publish the active
     fence for hard-interrupt admission pass a factory that publishes the new
@@ -1074,10 +1294,20 @@ def run_compress_context_with_progress_timeout(
             "idle_timeout_seconds > 0; call compress_context directly to disable"
         )
 
+    # Resolved at most ONCE per call, even when a post-abort retry also has to
+    # hand a prompt back (the retry re-enters this function): a second rebuild
+    # would pay the prompt-construction cost twice for one attempt, and the
+    # memoized callable is what keeps the lazily-resolved-fallback contract
+    # intact across the retry hop.
+    _fallback_prompt_cache: list = []
+
     def _resolve_fallback_prompt() -> str:
-        if callable(system_prompt_fallback):
-            return system_prompt_fallback()
-        return system_prompt_fallback
+        if not _fallback_prompt_cache:
+            if callable(system_prompt_fallback):
+                _fallback_prompt_cache.append(system_prompt_fallback())
+            else:
+                _fallback_prompt_cache.append(system_prompt_fallback)
+        return _fallback_prompt_cache[0]
 
     fence = fence if fence is not None else CompressionCommitFence()
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
@@ -1269,15 +1499,36 @@ def run_compress_context_with_progress_timeout(
         fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started
         since_progress = fence.seconds_since_progress()
-        # The durable lease is free again (above), so a fallback attempt can
-        # acquire it immediately. Run it BEFORE on_timeout: that callback
+        # The durable lease is free again (above), so a fallback/retry attempt
+        # can acquire it immediately. Run them BEFORE on_timeout: that callback
         # records the summary-failure cooldown, which would make the retry's
         # own summary call a no-op.
+        #
+        # Ordering (P12): the configured fallback route first (#78981 — the user
+        # declared it the answer to an unhealthy primary route), then the
+        # same-turn retry of the primary route when no route was configured or
+        # the fallback also stalled. Both are single-shot and re-enter with
+        # stall_fallback=False / retry_on_abort=False, so this abort branch can
+        # never loop or recurse, and it is only reachable when cancellation won
+        # BEFORE the commit boundary (an in-flight commit is waited on above).
         if stall_fallback:
             recovered = _retry_compression_on_fallback_chain(
                 worker=worker,
                 messages=messages,
-                system_prompt_fallback=system_prompt_fallback,
+                system_prompt_fallback=_resolve_fallback_prompt,
+                idle_timeout_seconds=idle,
+                total_ceiling_seconds=ceiling,
+                on_commit_overrun=on_commit_overrun,
+                telemetry_agent=telemetry_agent,
+                new_fence=new_fence,
+            )
+            if recovered is not None:
+                return recovered
+        if retry_on_abort:
+            recovered = _retry_compression_after_abort(
+                worker=worker,
+                messages=messages,
+                system_prompt_fallback=_resolve_fallback_prompt,
                 idle_timeout_seconds=idle,
                 total_ceiling_seconds=ceiling,
                 on_commit_overrun=on_commit_overrun,
@@ -1303,6 +1554,12 @@ def run_compress_context_with_progress_timeout(
                 waited,
                 ceiling,
             )
+        # FAILURE-class, user-visible (P12): whatever the host did or did not do
+        # about it, the caller must not be left believing the transcript was
+        # compacted — it is still over the threshold and keeps growing. Emitted
+        # through the shared dedup helper, so a host callback that already
+        # reported this same abort (run_agent's _on_timeout) does not double it.
+        _emit_compression_no_progress_warning(telemetry_agent)
         # Leave the future on the shared pool: fence cancel won, so a late
         # commit cannot land (same detachment model as gateway hygiene).
         return messages, _resolve_fallback_prompt()
@@ -3574,6 +3831,12 @@ def compress_context(
                 split_status="aborted",
                 failure_class="no_progress",
             )
+            # P12: a no-progress abort is a FAILURE the user has to act on (the
+            # transcript stays over the threshold and keeps growing). It used to
+            # be log/telemetry-only, so the stall was invisible from the chat
+            # surface; deduped against the host's timeout notice, which reports
+            # the same failure for this attempt.
+            _emit_compression_no_progress_warning(agent)
             _release_lock()
             return messages, _existing_sp
 
@@ -4488,6 +4751,11 @@ def compress_context(
             f"{_compressed_est:,}",
         )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
+        if _commit_status == "committed":
+            # A completed boundary re-arms the no-progress abort notice: the
+            # "context keeps growing toward the hard limit" warning a stalled
+            # attempt raised is no longer true.
+            _clear_compression_no_progress_warning(agent)
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,

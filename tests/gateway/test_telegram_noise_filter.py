@@ -3,6 +3,7 @@
 import pytest
 
 from agent.conversation_compression import (
+    COMPRESSION_NO_PROGRESS_ABORT_WARNING_TEMPLATE,
     CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE,
     ROUTINE_COMPRESSION_STATUS_SAMPLES,
 )
@@ -101,6 +102,12 @@ VISIBLE_COMPRESSION_MESSAGES = [
     CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
         tokens=85_000, threshold=72_000, reason="ineffective"
     ),
+    # No-progress abort notice (P12): the progress-aware watchdog aborted every
+    # attempt this turn with the summary model silent, so the session keeps
+    # growing toward the hard token limit. FAILURE-CLASS — must reach chat
+    # users. Formatted from the SAME constant the emit sites use, so a
+    # rewording that drifts into the noise regex fails here.
+    COMPRESSION_NO_PROGRESS_ABORT_WARNING_TEMPLATE,
 ]
 
 

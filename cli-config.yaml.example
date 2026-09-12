@@ -1064,6 +1064,12 @@ agent:
   #                                         # compress_context (0 = disable)
   #   context_total_ceiling_seconds: 600    # absolute cap on the pre-commit
   #                                         # wait even while tokens stream
+  #   context_timeout_scale_per_100k_tokens_seconds: 15  # extra idle seconds the
+  #                                         # watchdog grants per 100K estimated
+  #                                         # input tokens, so a ~900K-token
+  #                                         # summary gets a wider inactivity
+  #                                         # window (0 = fixed historical budget)
+  #   context_timeout_max_seconds: 600      # cap on the SCALED idle budget above
 
   # Graceful drain timeout for gateway stop/restart (seconds).
   # Default 0 = no drain: a restart interrupts in-flight agents immediately,
