@@ -25,6 +25,7 @@ from tools.delegation_output_schema import (
     append_output_contract,
     build_retry_message,
     coerce_output_schema,
+    jsonschema_available,
     validate_output,
 )
 
@@ -41,6 +42,25 @@ ADDRESS_SCHEMA = {
 # ---------------------------------------------------------------------------
 # Helper-module unit tests
 # ---------------------------------------------------------------------------
+
+
+class TestJsonschemaDependency:
+    """The strict path must actually run — jsonschema is a declared dep.
+
+    When jsonschema was undeclared it arrived only transitively (via the
+    ``mcp`` extra), so everywhere else ``validate_output`` silently degraded to
+    accepting every document. Asserting availability here makes the intended
+    mode explicit: an undeclared dependency fails loudly instead of passing on
+    the fallback.
+    """
+
+    def test_strict_validator_is_installed(self):
+        assert jsonschema_available() is True
+
+    def test_invalid_document_is_rejected_not_auto_accepted(self):
+        ok, errors = validate_output('{"zip": "10115"}', ADDRESS_SCHEMA)
+        assert ok is False, "strict validation did not run (jsonschema missing?)"
+        assert errors
 
 
 class TestValidateOutput:
