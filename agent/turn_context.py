@@ -679,6 +679,19 @@ def build_turn_context(
         agent._run_budget_started_at = None
     agent._run_budget_wrapup_injected = False
 
+    # Long-horizon board re-injection (P4) is run-scoped, not session-scoped: the
+    # idle counter starts fresh and the one-shot "wrap-up refused" latch from a
+    # prior turn is cleared, so a later turn can never inherit a spent refusal
+    # (and the hard gate can never loop across turns). The render dedup hash is
+    # deliberately NOT reset — it must survive a user "continue" so the same
+    # board is not re-appended every turn.
+    try:
+        from agent.longtask_reinjection import begin_board_run
+
+        begin_board_run(agent)
+    except Exception:
+        pass
+
     # Log conversation turn start for debugging/observability.
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text

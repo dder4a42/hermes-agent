@@ -189,6 +189,47 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
     return False
 
 
+def _maybe_reinject_board(agent: Any, messages: List[Dict[str, Any]]) -> bool:
+    """Event-driven long-horizon board snapshot (P4).
+
+    Cache-safe delivery: the snapshot is appended to the NEWEST ``role:"tool"``
+    message — the channel ``/steer`` and the run-budget notice already use — so no
+    synthetic user message is inserted mid-loop and no past context is rewritten.
+    The reinjection module hash-dedups the render, so an unchanged board leaves
+    the tool result byte-identical. Dormant when the session has no board.
+    """
+    try:
+        from agent.longtask_reinjection import maybe_reinject_board
+
+        return bool(maybe_reinject_board(agent, messages))
+    except Exception:
+        logger.debug("Longtask board reinjection failed", exc_info=True)
+        return False
+
+
+def _apply_board_final_gate(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    final_response: Optional[str],
+    finish_reason: Optional[str],
+) -> "tuple[Optional[str], bool]":
+    """Finalization gate for a no-tool-call response (P4).
+
+    Returns ``(final_response, continue_turn)``; True asks the loop for exactly
+    ONE more iteration (the note rides the newest tool result — never a synthetic
+    user message). Dormant with no board or ``enforce_finalization_gate: off``.
+    """
+    try:
+        from agent.longtask_reinjection import apply_final_gate
+
+        return apply_final_gate(
+            agent, messages, final_response, finish_reason=finish_reason
+        )
+    except Exception:
+        logger.debug("Longtask board final gate failed", exc_info=True)
+        return final_response, False
+
+
 def _restore_user_after_reference_handoff(
     messages: List[Dict[str, Any]], user_message: Any
 ) -> bool:
@@ -2160,6 +2201,14 @@ def run_conversation(
         # result); dormant when no budget is set.
         if getattr(agent, "run_budget_seconds", None):
             _maybe_inject_run_budget_wrapup(agent, messages)
+
+        # ── Long-horizon board re-injection (P4) ───────────────────────
+        # Event-driven, never clock-driven: when the board materially changed
+        # since the last render (or the model has not consulted it for
+        # longtask.board_reinject_idle_turns while items remain unresolved),
+        # append a numbered snapshot to the newest tool result. Same cache-safe
+        # channel as /steer; hash-deduped, so an unchanged board is a no-op.
+        _maybe_reinject_board(agent, messages)
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages
@@ -7682,6 +7731,24 @@ def run_conversation(
                 # chokepoint below, after final_msg is built, so it catches
                 # every path that reaches turn finalization, not just this one.)
                 final_response = assistant_message.content or ""
+
+                # ── Long-horizon board finalization gate (P4) ──────────────
+                # The model is about to wrap up while the board still has
+                # unresolved items. "warn" (default) appends the unresolved list
+                # to the newest tool result and finishes; "hard" refuses ONCE —
+                # the note rides that same tool result and we take exactly one
+                # more iteration (the latch in longtask_reinjection forbids a
+                # second). Never a synthetic user message; nothing is inserted.
+                final_response, _board_continue = _apply_board_final_gate(
+                    agent, messages, final_response, finish_reason
+                )
+                if _board_continue:
+                    logger.info(
+                        "Longtask final gate: continuing one bounded turn "
+                        "(session=%s)",
+                        getattr(agent, "session_id", None) or "none",
+                    )
+                    continue
                 
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery

@@ -2111,6 +2111,24 @@ DEFAULT_CONFIG = {
         "surface_child_process_notifications": False,
     },
 
+    # Long-horizon task board (agent/longtask_board.py + tools/longtask_tool.py).
+    # The board is deliberately NOT re-injected on a clock: a timed render lives
+    # in the transcript and is re-sent on every later API call, so its cost grows
+    # quadratically over a long run. Instead it rides tool results the model
+    # already receives, deduped by the rendered board's content hash.
+    "longtask": {
+        # Safety net only: after this many consecutive turns in which the model
+        # did not touch the board (and the board changed since the last render,
+        # with items still unresolved), emit ONE snapshot. Clamped to [1, 1000];
+        # set it very high to effectively disable the net.
+        "board_reinject_idle_turns": 5,
+        # Wrap-up gate when a run finishes while the board still has unresolved
+        # items: "warn" (default) surfaces the items and finishes, "hard" refuses
+        # the wrap-up ONCE (the model gets exactly one more turn, then is
+        # honoured), "off" disables the gate. true/false map to hard/off.
+        "enforce_finalization_gate": "warn",
+    },
+
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
     # injected at the start of every API call for few-shot priming.
     # Never saved to sessions, logs, or trajectories.
