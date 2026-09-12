@@ -144,6 +144,73 @@ def test_compute_ready_nodes_is_pure_for_loaded_board(tmp_path):
     assert [node["node_id"] for node in ready] == ["N1"]
 
 
+def test_attach_report_records_supplied_provenance_and_returns_report_id(tmp_path):
+    """Host-mediated backfill needs the report's identity handed back.
+
+    The host supplies the ids it owns (child session, task slot, delegation run)
+    and the board merges in the report_id it just minted, so node and caller
+    agree on which persisted report this is. Provenance is reader metadata, like
+    report_status — it must not move the resolution axis.
+    """
+    create_board(tmp_path, "s", "obj", _nodes())
+
+    result = attach_report(
+        tmp_path,
+        "s",
+        "N1",
+        {"status": "success"},
+        provenance={
+            "child_session_id": "child-1",
+            "task_index": 0,
+            "delegation_id": "deleg_abc123",
+        },
+    )
+
+    assert result["report_id"]
+    assert result["node"]["provenance"] == {
+        "child_session_id": "child-1",
+        "task_index": 0,
+        "delegation_id": "deleg_abc123",
+        "report_id": result["report_id"],
+    }
+    assert result["node"]["execution"] == "reported"
+    assert result["node"]["resolution"] == "open"
+
+
+def test_provenance_survives_a_load_save_cycle(tmp_path):
+    """The board rebuilds every node on load: provenance must be preserved.
+
+    A key the normalizer drops vanishes on the next unrelated write, which would
+    silently lose the link between a reported item and the child that produced
+    it.
+    """
+    create_board(tmp_path, "s", "obj", _nodes())
+    attach_report(
+        tmp_path,
+        "s",
+        "N1",
+        {"status": "success"},
+        provenance={"child_session_id": "child-1", "task_index": 0, "delegation_id": "d1"},
+    )
+
+    reloaded = load_board(tmp_path, "s")["nodes"][0]
+    assert reloaded["provenance"]["child_session_id"] == "child-1"
+
+    # An unrelated write on ANOTHER node must not drop it either.
+    update_node(tmp_path, "s", "N2", notes="touched")
+    again = load_board(tmp_path, "s")["nodes"][0]
+    assert again["provenance"]["delegation_id"] == "d1"
+
+
+def test_attach_without_provenance_leaves_the_node_shape_unchanged(tmp_path):
+    create_board(tmp_path, "s", "obj", _nodes())
+
+    result = attach_report(tmp_path, "s", "N1", {"status": "success"})
+
+    assert "provenance" not in result["node"]
+    assert result["report_id"]
+
+
 class TestLegacyBoardMigration:
     """Boards written before the execution/resolution split must keep loading."""
 

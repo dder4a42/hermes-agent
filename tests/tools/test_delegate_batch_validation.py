@@ -182,5 +182,72 @@ class TestValidBatchStillRuns(unittest.TestCase):
         self.assertNotIn("error", result)
 
 
+class TestBatchNodeIdShape(unittest.TestCase):
+    """`node_id` binds a task item to a long-horizon board item.
+
+    Only the SHAPE is checked here. Existence is an attach-time question — the
+    host backfill reports an unknown/missing node on the result entry — because a
+    stale or typo'd id must not fail a fan-out whose children can still do
+    useful work (see tests/tools/test_delegate_board_backfill.py).
+    """
+
+    def _completed(self, idx):
+        return {"task_index": idx, "status": "completed", "summary": "ok",
+                "api_calls": 1, "duration_seconds": 1.0, "_child_role": None}
+
+    def _call_with_host_stubbed(self, tasks):
+        # The host backfill is exercised directly in
+        # tests/tools/test_delegate_board_backfill.py; stub it here so this
+        # MagicMock parent never reaches the filesystem.
+        with patch("tools.delegate_tool._host_attach_report_to_board", return_value=""):
+            with patch("tools.delegate_tool._run_single_child") as mock_run:
+                mock_run.side_effect = [self._completed(i) for i in range(len(tasks))]
+                return _call(tasks)
+
+    def test_valid_node_id_passes(self):
+        result = self._call_with_host_stubbed(
+            [{"goal": GOOD_A, "node_id": "N1"}, {"goal": GOOD_B, "node_id": "N2"}]
+        )
+        self.assertNotIn("error", result)
+        self.assertEqual(len(result["results"]), 2)
+
+    def test_unknown_node_id_does_not_fail_the_batch(self):
+        result = self._call_with_host_stubbed(
+            [{"goal": GOOD_A, "node_id": "N-DOES-NOT-EXIST"}]
+        )
+        self.assertNotIn("error", result)
+
+    def test_non_string_node_id_rejected(self):
+        result = _call([{"goal": GOOD_A, "node_id": 7}])
+        self.assertIn("error", result)
+        self.assertIn("node_id", result["error"])
+
+    def test_empty_node_id_rejected(self):
+        for empty in ("", "   "):
+            result = _call([{"goal": GOOD_A, "node_id": empty}])
+            self.assertIn("error", result, empty)
+            self.assertIn("node_id", result["error"], empty)
+
+    def test_absent_node_id_still_valid(self):
+        result = self._call_with_host_stubbed([{"goal": GOOD_A}])
+        self.assertNotIn("error", result)
+
+    def test_model_facing_strip_keeps_node_id_and_drops_hidden_fields(self):
+        """node_id is model-facing; the hidden-field strip must not eat it.
+
+        The registry handler funnels every model call through
+        _strip_model_hidden_task_fields, so a node_id dropped there would make
+        the whole binding invisible no matter what the rest of the host does.
+        """
+        from tools.delegate_tool import _strip_model_hidden_task_fields
+
+        stripped = _strip_model_hidden_task_fields(
+            [{"goal": GOOD_A, "node_id": "N1", "acp_command": "internal-only"}]
+        )
+
+        self.assertEqual(stripped[0]["node_id"], "N1")
+        self.assertNotIn("acp_command", stripped[0])
+
+
 if __name__ == "__main__":
     unittest.main()

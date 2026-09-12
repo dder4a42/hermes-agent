@@ -139,9 +139,17 @@ def test_public_lifecycle_runs_host_aggregation(monkeypatch):
     handle = service.launch(SubagentLaunchRequest(goal="aggregate me"))
     assert service.wait(handle, timeout_seconds=1).state is SubagentState.SUCCEEDED
 
-    memory.on_delegation.assert_called_once_with(
-        task="aggregate me", result="aggregated", child_session_id="child-session"
-    )
+    memory.on_delegation.assert_called_once()
+    kwargs = memory.on_delegation.call_args.kwargs
+    assert kwargs["task"] == "aggregate me"
+    assert kwargs["result"] == "aggregated"
+    assert kwargs["child_session_id"] == "child-session"
+    assert kwargs["task_index"] == 0
+    # This task declares no board node, so the provenance ids stay empty rather
+    # than being invented — the host backfill reports nothing to attach.
+    assert kwargs["delegation_id"] == ""
+    assert kwargs["report_id"] == ""
+    assert kwargs["board_node_id"] == ""
     hook.assert_called_once_with(
         "subagent_stop",
         parent_session_id="parent-aggregate",

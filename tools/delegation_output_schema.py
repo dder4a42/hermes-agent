@@ -135,6 +135,22 @@ def validate_output(
     return False, rendered
 
 
+def parse_output_object(text: str) -> Optional[Dict[str, Any]]:
+    """Return the JSON object a validated child answer carries, or ``None``.
+
+    Deliberately reuses ``extract_json_candidate`` — the same extraction
+    ``validate_output`` ran — so the object that gets attached to a board node
+    is exactly the one that passed validation. A second, independent parser
+    could accept a fenced/prose-wrapped answer the validator rejected (or vice
+    versa), which would attach a report the contract never approved.
+    """
+    try:
+        parsed = json.loads(extract_json_candidate(text or ""))
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def build_retry_message(errors: List[str]) -> str:
     """Build the single bounded retry turn sent to the child.
 

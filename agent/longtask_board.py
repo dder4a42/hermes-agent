@@ -538,10 +538,16 @@ def attach_report(
     report: Dict[str, Any],
     *,
     report_status: Optional[str] = None,
+    provenance: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     with board_lock(root, session_id):
         return _attach_report_locked(
-            root, session_id, node_id, report, report_status=report_status
+            root,
+            session_id,
+            node_id,
+            report,
+            report_status=report_status,
+            provenance=provenance,
         )
 
 
@@ -552,6 +558,7 @@ def _attach_report_locked(
     report: Dict[str, Any],
     *,
     report_status: Optional[str] = None,
+    provenance: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     board = load_board(root, session_id)
     node = _node_by_id(board, node_id)
@@ -559,7 +566,11 @@ def _attach_report_locked(
     report_data.setdefault("recorded_at", _now())
     reports_dir = board_dir(root, session_id) / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
-    path = reports_dir / f"{safe_id(node_id)}-{int(time.time())}.json"
+    # The file name IS the report's identity, so it is materialised once and
+    # returned: a caller that backfilled this report onto the node (the host,
+    # see tools/delegate_tool.py) quotes the same id the node records.
+    report_id = f"{safe_id(node_id)}-{int(time.time())}"
+    path = reports_dir / f"{report_id}.json"
     atomic_json_write(path, report_data, indent=2, sort_keys=True)
 
     rel_path = str(path.relative_to(board_dir(root, session_id)))
@@ -577,6 +588,16 @@ def _attach_report_locked(
     node["report_status"] = normalize_report_status(
         report_status if report_status is not None else report_data.get("status")
     )
+    # Host-supplied provenance (which child produced this report). Recorded, not
+    # interpreted: like report_status it is metadata FOR THE READER, and it never
+    # touches the resolution axis. `report_id` is merged in here because the
+    # board owns the persisted report's identity — a caller cannot know it
+    # before the file exists.
+    if provenance:
+        node["provenance"] = {
+            **_normalize_dict(provenance, "provenance"),
+            "report_id": report_id,
+        }
     node["execution"] = "reported"
     node["updated_at"] = _now()
     _refresh_ready_nodes(board)
@@ -585,6 +606,7 @@ def _attach_report_locked(
         "task_id": board["task_id"],
         "node": _public_node(node),
         "report_path": str(path),
+        "report_id": report_id,
     }
 
 
@@ -757,6 +779,12 @@ def _normalize_nodes(
         }
         if raw.get("report_preview") is not None:
             node["report_preview"] = str(raw.get("report_preview"))
+        # Same preservation contract as report_preview/notes: the board is
+        # load -> normalize -> save, so a key missing here is silently dropped on
+        # the next write (that is how a report's provenance would vanish the
+        # moment any other node was updated).
+        if isinstance(raw.get("provenance"), dict):
+            node["provenance"] = _normalize_dict(raw["provenance"], "provenance")
         if raw.get("notes") is not None:
             node["notes"] = str(raw.get("notes"))
         if not node["goal"]:
@@ -912,6 +940,7 @@ def _public_node(node: Dict[str, Any]) -> Dict[str, Any]:
         "report_path",
         "report_preview",
         "report_status",
+        "provenance",
         "verification",
         "notes",
     )
