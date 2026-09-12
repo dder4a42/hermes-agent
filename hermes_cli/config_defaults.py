@@ -859,6 +859,20 @@ DEFAULT_CONFIG = {
                                       # for a full trigger-sized token runway to
                                       # regrow before rearming. Keeps prompt-cache
                                       # breaks episodic. 0 = no minimum-savings gate.
+        "tier1_min_observation_chars": 2000,  # tiered compression: bodies of old
+                                      # tool observations larger than this (chars)
+                                      # are replaced with a bounded recovery
+                                      # marker BEFORE the expensive summarizer
+                                      # runs — no LLM call. Must be >= 200 so a
+                                      # generated marker cannot itself be
+                                      # re-evicted; clamped to <= 200000.
+        "tier1_keep_recent_observations": 4,  # how many of the NEWEST tool
+                                      # observations always survive verbatim
+                                      # (the active turn's working set). Fan-in
+                                      # reports (delegate_task / board reports) and
+                                      # compression handoff/checkpoint bodies are
+                                      # never evicted regardless. 0 disables the
+                                      # recency protection (clamped to <= 64).
         "micro_compact": False,       # opt-in: after each completed turn, fold the
                                       # oldest un-absorbed exchange into a rolling
                                       # summary, amortizing compression cost instead
@@ -913,6 +927,24 @@ DEFAULT_CONFIG = {
                                       # warning channel while the host keeps
                                       # waiting in bounded increments for the
                                       # commit to finish.
+        "context_timeout_scale_per_100k_tokens_seconds": 15,  # extra idle seconds the
+                                      # in-agent compress_context watchdog grants per
+                                      # 100K estimated input tokens, ON TOP of
+                                      # context_timeout_seconds (rounded up per 100K).
+                                      # A summary over a ~900K-token transcript can
+                                      # legitimately think for minutes before its FIRST
+                                      # streamed token, so a fixed 120s inactivity
+                                      # budget aborted real compressions that a later
+                                      # attempt finished in ~124s. The total ceiling
+                                      # grows by the same delta, so a slow-but-still-
+                                      # progressing summary of a huge transcript is not
+                                      # killed by the ceiling either. 0 disables the
+                                      # scaling and restores the fixed historical
+                                      # budget.
+        "context_timeout_max_seconds": 600,  # absolute cap on the SCALED
+                                      # context_timeout_seconds above, so a bogus
+                                      # token estimate cannot grant an unbounded wait.
+                                      # <= 0 removes the cap.
         "protect_first_n": 3,         # non-system head messages always preserved
                                       # verbatim, in ADDITION to the system prompt
                                       # (which is always implicitly protected). Set to
@@ -2095,6 +2127,24 @@ DEFAULT_CONFIG = {
         # Set to true to restore delivery of child process notifications
         # (with subagent attribution lines).
         "surface_child_process_notifications": False,
+    },
+
+    # Long-horizon task board (agent/longtask_board.py + tools/longtask_tool.py).
+    # The board is deliberately NOT re-injected on a clock: a timed render lives
+    # in the transcript and is re-sent on every later API call, so its cost grows
+    # quadratically over a long run. Instead it rides tool results the model
+    # already receives, deduped by the rendered board's content hash.
+    "longtask": {
+        # Safety net only: after this many consecutive turns in which the model
+        # did not touch the board (and the board changed since the last render,
+        # with items still unresolved), emit ONE snapshot. Clamped to [1, 1000];
+        # set it very high to effectively disable the net.
+        "board_reinject_idle_turns": 5,
+        # Wrap-up gate when a run finishes while the board still has unresolved
+        # items: "warn" (default) surfaces the items and finishes, "hard" refuses
+        # the wrap-up ONCE (the model gets exactly one more turn, then is
+        # honoured), "off" disables the gate. true/false map to hard/off.
+        "enforce_finalization_gate": "warn",
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

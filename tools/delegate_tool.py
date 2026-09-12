@@ -47,6 +47,19 @@ from utils import base_url_hostname, is_truthy_value
 
 
 # Tools that children must never have access to
+#
+# The long-horizon board tools are on this list for a different reason than the
+# rest: the board is the MAIN agent's planning surface. A child is an executor
+# holding one bounded node, and it cannot even address the parent's board — the
+# board is keyed by the acting agent's session_id (tools/longtask_tool.py
+# ::_session_id), and a child gets its own generated session_id, so a child's
+# board call resolves a different (usually non-existent) directory and either
+# errors out or silently creates a shadow board nobody reads. Blocking them here
+# does two things at once: the `longtask` toolset is derived as fully blocked
+# and stripped from the child's toolset list, and `_blocked_toolsets_for_role`
+# adds it to the child's deny toolsets so the names are subtracted *after*
+# composite expansion (the `coding` posture toolset carries the board tools
+# inline). tools/longtask_tool.py keeps a runtime refusal as the second layer.
 DELEGATE_BLOCKED_TOOLS = frozenset(
     [
         "delegate_task",  # no recursive delegation
@@ -54,6 +67,16 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
         "cronjob",  # no scheduling more work in the parent's name
+        # Board state belongs to the parent agent's planning loop, not to a
+        # bounded executor child.
+        "longtask_create",
+        "longtask_add_node",
+        "longtask_cancel_node",
+        "longtask_read",
+        "longtask_next",
+        "longtask_update_node",
+        "longtask_attach_report",
+        "longtask_verify_node",
     ]
 )
 
@@ -2960,13 +2983,24 @@ def _run_single_child(
         _schema_valid: Optional[bool] = None
         _schema_errors: List[str] = []
         _schema_retries = 0
+        # The text the surviving validation verdict applies to (first answer, or
+        # the single retry's answer when one was sent).
+        _schema_text = ""
+        # Parsed report object, captured HERE and not re-derived at finalization:
+        # _apply_summary_budget() can trim `summary` before the host attaches the
+        # report to its board node, and a truncated JSON blob no longer parses —
+        # which would silently drop exactly the report this feature exists to
+        # backfill (see _host_attach_report_to_board).
+        _structured_report: Optional[Dict[str, Any]] = None
         if isinstance(_output_schema, dict):
             from tools.delegation_output_schema import (
                 build_retry_message,
+                parse_output_object,
                 validate_output,
             )
 
             _first_text = result.get("final_response") or ""
+            _schema_text = _first_text
             _schema_valid, _schema_errors = validate_output(
                 _first_text, _output_schema
             )
@@ -3010,6 +3044,12 @@ def _run_single_child(
                     _schema_valid, _schema_errors = validate_output(
                         _retry_text, _output_schema
                     )
+                    _schema_text = _retry_text
+
+            if _schema_valid:
+                # Same extraction the validator ran, so the attached report is
+                # the object the contract approved (or nothing at all).
+                _structured_report = parse_output_object(_schema_text)
 
         # Linearization boundary for registry steering. From this point on the
         # child cannot consume another steer. Closing under the registry lock
@@ -3172,6 +3212,11 @@ def _run_single_child(
                 entry["schema_retries"] = _schema_retries
             if not _schema_valid and _schema_errors:
                 entry["schema_errors"] = _schema_errors
+            if _structured_report is not None:
+                # Hidden field (leading underscore): consumed and popped by the
+                # host board backfill in _finalize_child_results, never
+                # serialised back to the model.
+                entry["_structured_report"] = _structured_report
 
         # A steer that queued after the child's final assistant turn had no
         # tool batch left to drain into.  The finalizer hands the undelivered
@@ -3428,16 +3473,155 @@ def _parent_finalization_lock(parent_agent) -> threading.RLock:
     return lock
 
 
+def _new_delegation_id() -> str:
+    """Fallback batch delegation id, same shape as the live/async ids."""
+    try:
+        from tools.delegation_live_log import new_live_delegation_id
+
+        return new_live_delegation_id()
+    except Exception:
+        import uuid
+
+        return f"deleg_{uuid.uuid4().hex[:8]}"
+
+
+def _host_attach_report_to_board(
+    entry: Dict[str, Any],
+    task: Any,
+    child,
+    parent_agent,
+    batch_delegation_id: str,
+) -> str:
+    """Attach one child's structured report to the board node it declared.
+
+    WHY the host does this: a child's structured report used to reach the
+    long-horizon board only if the PARENT MODEL noticed the child's result and
+    called longtask_attach_report itself — exactly the per-child bookkeeping that
+    gets skipped once a run is long enough to lose track of it, leaving a board
+    whose dispatched items never show the reports that came back (AgentOS
+    §3.2/3.3). The host attaches at the one point every delegation passes
+    through, so the board cannot lag the children. No model tool call is
+    involved.
+
+    Attaching records the report (``execution=reported``) and NEVER advances
+    ``resolution``: whether the result is *sufficiently checked* stays the
+    coordinator's judgement, with its own evidence (two-axis contract in
+    agent/longtask_board.py). Only a cleanly finished child (status
+    ``completed``) with a schema-valid report is attached — a failed or
+    interrupted child's text is an artifact of a run that did not deliver, and
+    recording it as the item's report would misrepresent the item.
+
+    Returns the delegation id used, or "" when nothing was attached. Never
+    raises: the delegation result is the deliverable, the board write is
+    bookkeeping, and a board that is missing/unwritable/unknown must not turn a
+    completed delegation into a failed one.
+    """
+    task_index = entry.get("task_index", -1)
+    # Popped for EVERY entry before any early return — the internal field must
+    # never ride back to the model, including when the task declares no node or
+    # the task index no longer resolves to a task entry.
+    report = entry.pop("_structured_report", None)
+
+    node_id = str(task.get("node_id") or "").strip() if isinstance(task, dict) else ""
+    if not node_id:
+        return ""
+
+    status = str(entry.get("status") or "")
+    if status != "completed":
+        entry["board_attach_skipped"] = (
+            f"node {node_id}: child did not complete (status={status or 'unknown'})"
+        )
+        return ""
+
+    if not isinstance(report, dict):
+        # Observable on the entry on purpose: a silent skip is the failure mode
+        # this feature removes, so the parent must be able to see why.
+        entry["board_attach_skipped"] = (
+            f"node {node_id}: child returned no schema-valid structured report"
+        )
+        return ""
+
+    delegation_id = str(
+        getattr(child, "_delegation_id", "") or batch_delegation_id or ""
+    ).strip()
+    if not delegation_id:
+        delegation_id = _new_delegation_id()
+    child_session_id = str(getattr(child, "session_id", "") or "")
+    try:
+        # Reuse the board tools' own root/session resolution so the report lands
+        # on the same board those tools read (<workspace>/.hermes/tasks/<sid>).
+        from agent.longtask_board import attach_report
+        from tools.longtask_tool import _root, _session_id
+
+        attached = attach_report(
+            _root(parent_agent),
+            _session_id(parent_agent),
+            node_id,
+            report,
+            provenance={
+                "child_session_id": child_session_id,
+                "task_index": task_index,
+                "delegation_id": delegation_id,
+            },
+        )
+    except Exception as exc:
+        # Unknown node, no board for this session, unwritable root — all
+        # reported, none fatal.
+        logger.debug(
+            "Host board attach failed (task %s -> node %s): %s",
+            task_index,
+            node_id,
+            exc,
+        )
+        entry["board_attach_skipped"] = f"node {node_id}: attach failed ({exc})"
+        return ""
+
+    entry["board_node_id"] = node_id
+    entry["child_session_id"] = child_session_id
+    entry["delegation_id"] = delegation_id
+    entry["report_id"] = attached.get("report_id") or ""
+    return delegation_id
+
+
 def _finalize_child_results(
     results: List[Dict[str, Any]],
     task_list: List[Dict[str, Any]],
     children: List[tuple[int, Dict[str, Any], Any]],
     parent_agent,
+    *,
+    delegation_id: Optional[str] = None,
 ) -> None:
-    """Apply host-owned summary, memory, hook, and cost contracts once."""
+    """Apply host-owned summary, board, memory, hook, and cost contracts once."""
     with _parent_finalization_lock(parent_agent):
-        _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
+
+        # Board backfill runs BEFORE _apply_summary_budget so the report text is
+        # still the child's full answer (see _host_attach_report_to_board).
+        batch_delegation_id = str(delegation_id or "").strip()
+        for entry in results:
+            try:
+                task_index = entry.get("task_index", -1)
+                task = (
+                    task_list[task_index]
+                    if isinstance(task_index, int)
+                    and 0 <= task_index < len(task_list)
+                    else None
+                )
+                used_id = _host_attach_report_to_board(
+                    entry,
+                    task,
+                    child_by_index.get(task_index),
+                    parent_agent,
+                    batch_delegation_id,
+                )
+                if used_id and not batch_delegation_id:
+                    # One id for the whole fan-out: every attached entry in a
+                    # batch reports the same delegation run.
+                    batch_delegation_id = used_id
+            except Exception:
+                logger.debug("Host board backfill failed", exc_info=True)
+
+        _apply_summary_budget(results, parent_agent)
 
         if parent_agent and getattr(parent_agent, "_memory_manager", None):
             for entry in results:
@@ -3450,10 +3634,19 @@ def _finalize_child_results(
                         else ""
                     )
                     child = child_by_index.get(task_index)
+                    # Provenance ids ride along so a memory provider can tie the
+                    # observation to the board node/report it produced
+                    # (session_archive stores them in metadata).
                     parent_agent._memory_manager.on_delegation(
                         task=task_goal,
                         result=entry.get("summary", "") or "",
                         child_session_id=getattr(child, "session_id", ""),
+                        task_index=task_index,
+                        delegation_id=entry.get("delegation_id")
+                        or batch_delegation_id
+                        or "",
+                        report_id=entry.get("report_id", "") or "",
+                        board_node_id=entry.get("board_node_id", "") or "",
                     )
                 except Exception:
                     pass
@@ -3594,6 +3787,20 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     for i, task in enumerate(task_list):
         goal = str(task.get("goal", "")).strip()
         normalized = " ".join(goal.lower().split())
+
+        # Optional board node binding. Only the SHAPE is validated here: whether
+        # that node exists on the caller's board is decided at attach time, by
+        # the host (tools/delegate_tool.py::_host_attach_report_to_board), which
+        # reports an unknown node on the result entry instead of failing a
+        # fan-out that may still do useful work.
+        if "node_id" in task:
+            node_id = task.get("node_id")
+            if not isinstance(node_id, str) or not node_id.strip():
+                return (
+                    f"Task {i} node_id must be a non-empty string (the "
+                    "long-horizon board item to attach this child's structured "
+                    "report to), or omitted entirely."
+                )
 
         if _PLACEHOLDER_GOAL_RE.match(normalized):
             return (
@@ -4087,7 +4294,9 @@ def delegate_task(
         # headroom (split across the batch) before they enter the parent's
         # conversation. Full text is spilled to disk so nothing is lost.
         # Covers both the single-task and batch paths. See PR #9126.
-        _finalize_child_results(results, task_list, children, parent_agent)
+        _finalize_child_results(
+            results, task_list, children, parent_agent, delegation_id=live_deleg_id
+        )
 
         total_duration = round(time.monotonic() - overall_start, 2)
 
@@ -4686,14 +4895,9 @@ def _build_top_level_description() -> str:
         "terminal session, and toolset, and only its final summary returns to "
         "you. Pass every task in `tasks` — one entry spawns one subagent, "
         "several run in parallel (limit in the tasks description).\n\n"
-        "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message, "
-        "results in task order) re-enters the conversation on its own. Do NOT "
-        "wait or poll; continue other work. While children run, `action` "
-        "(list/steer/stop) controls them live — steer when a transcript shows "
-        "a child drifting.\n\n"
-        "USE FOR: reasoning-heavy subtasks, work that would flood your context "
-        "with intermediate data, or independent parallel workstreams.\n"
+        "USE THIS for reasoning-heavy subtasks, work that would flood your "
+        "context with intermediate data, and independent parallel "
+        "workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
         "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
         "- A single tool call -> call the tool directly\n"
@@ -4701,6 +4905,11 @@ def _build_top_level_description() -> str:
         "- Durable work that must survive this session -> cronjob or "
         "terminal(background=True, notify=True); /stop, /new, or "
         "process exit discards running subagents.\n\n"
+        "Dispatch returns immediately with live transcript paths, and the "
+        "completed result (one consolidated message, results in task order) "
+        "re-enters the conversation on its own. Do NOT wait or poll; continue "
+        "other work. While children run, `action` (list/steer/stop) controls "
+        "them live — steer when a transcript shows a child drifting.\n\n"
         "RULES:\n"
         "- Children know nothing of this conversation: pass everything needed "
         "via 'context', including any required output language, tone, or "
@@ -4726,7 +4935,11 @@ def _build_tasks_param_description() -> str:
         f"The task(s), up to {max_children} in parallel for this user (set "
         "via delegation.max_concurrent_children). Each entry spawns one "
         "subagent with isolated context and terminal session; a single task "
-        "is a one-entry array. Required when spawning."
+        "is a one-entry array. Required when spawning. An entry may bind "
+        "itself to a long-horizon board item with node_id (plus "
+        "output_schema); the host then attaches that child's structured "
+        "report to the item itself — you never re-attach or resolve it on "
+        "its behalf."
     )
 
 
@@ -4829,6 +5042,22 @@ DELEGATE_TASK_SCHEMA = {
                                 "schema_valid, plus schema_errors on "
                                 "failure). Keep it forgiving — require only "
                                 "fields you will read."
+                            ),
+                        },
+                        "node_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional long-horizon board item (a "
+                                "longtask_* node_id) this child BINDS to. "
+                                "When set, the host attaches the child's "
+                                "schema-valid structured report to that item "
+                                "itself as soon as the child finishes — no "
+                                "longtask_attach_report call needed. Needs "
+                                "output_schema (the report must be "
+                                "structured). Attaching records the report "
+                                "(execution=reported); it never resolves the "
+                                "item — resolve it yourself once the report "
+                                "is verified."
                             ),
                         },
                     },

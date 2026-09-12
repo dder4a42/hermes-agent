@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.conversation_compression import (
+    COMPRESSION_NO_PROGRESS_ABORT_WARNING_TEMPLATE,
     CompressionCommitFence,
     resolve_context_compression_timeouts,
     run_compress_context_with_progress_timeout,
@@ -407,7 +408,7 @@ class TestCompressContextForwarderOwnsTimeout:
         )
         monkeypatch.setattr(
             "agent.conversation_compression.resolve_context_compression_timeouts",
-            lambda compression_cfg=None: (0.05, 0.2),
+            lambda compression_cfg=None, **_kwargs: (0.05, 0.2),
         )
         monkeypatch.setattr(
             "agent.portal_tags.get_conversation_context",
@@ -422,8 +423,16 @@ class TestCompressContextForwarderOwnsTimeout:
 
         assert out_msgs is original
         assert out_prompt == "sys"
-        assert calls["n"] == 1
+        # P12: one same-turn retry on top of the aborted attempt — and no more
+        # (the retry itself runs with retry_on_abort=False, so a hung summary
+        # cannot loop).
+        assert calls["n"] == 2
         agent._emit_warning.assert_called_once()
+        # The abort notice is the single FAILURE template the gateway noise
+        # filter is pinned against — never an ad-hoc literal.
+        assert agent._emit_warning.call_args[0][0] == (
+            COMPRESSION_NO_PROGRESS_ABORT_WARNING_TEMPLATE
+        )
         assert agent.context_compressor._consecutive_timeout_failures == 1
         agent.context_compressor._record_compression_failure_cooldown.assert_called_once()
         cooldown_args = (
@@ -474,7 +483,7 @@ class TestCompressContextForwarderOwnsTimeout:
         )
         monkeypatch.setattr(
             "agent.conversation_compression.resolve_context_compression_timeouts",
-            lambda compression_cfg=None: (0.05, 0.2),
+            lambda compression_cfg=None, **_kwargs: (0.05, 0.2),
         )
         monkeypatch.setattr(
             "agent.portal_tags.get_conversation_context",

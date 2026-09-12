@@ -6498,6 +6498,16 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
         int(_compressor_ctor_default("proactive_prune_min_reclaim_tokens", 4096)),
     )
     _assign_int(
+        "tier1_min_observation_chars",
+        "tier1_min_observation_chars",
+        int(_compressor_ctor_default("tier1_min_observation_chars", 2000)),
+    )
+    _assign_int(
+        "tier1_keep_recent_observations",
+        "tier1_keep_recent_observations",
+        int(_compressor_ctor_default("tier1_keep_recent_observations", 4)),
+    )
+    _assign_int(
         "protect_last_n",
         "protect_last_n",
         int(_compressor_ctor_default("protect_last_n", 20)),

@@ -27,6 +27,16 @@ for the full rationale):
       ~32K tokens): bare bridge + a one-line-per-server summary (server
       name + tool count) so the model still knows WHICH domains are
       reachable; individual tools are discoverable only via ``tool_search``.
+* The activation DECISION (bridge on/off) is latched per SESSION, never per
+  assembly. Whether the bridge is on is visible in the model-facing tools
+  array, which is part of the cached prompt prefix: a decision that flips
+  between turns rewrites that prefix (bill + cache miss) and pulls tools an
+  in-flight model is already calling directly out from under it — the
+  observed "Tool 'longtask_attach_report' does not exist" while the tool sat
+  in the deferred catalog, one bridge call away. So the decision is taken
+  once, on the session's first assembly, and reused verbatim thereafter.
+  Later MCP connects / plugin loads grow the CATALOG; they never move an
+  already-direct tool into it. See :class:`DeferralSession`.
 * The catalog is stateless across turns and tools-array assemblies. It is
   rebuilt from the current tool-defs list every time. This is the lesson
   from OpenClaw's cron regression (openclaw/openclaw#84141): a session-keyed
@@ -306,6 +316,51 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
     return visible, deferrable
 
 
+def deferred_tool_guidance(name: str) -> Optional[str]:
+    """Model-facing text for a DIRECT call to a tool that is deferred.
+
+    Returns ``None`` when ``name`` is not a deferred tool, so callers keep
+    their generic unknown-name handling. When it IS one, the tool exists and
+    works — the session simply cannot see its schema directly — and answering
+    "Tool 'X' does not exist" makes the model abandon a capability that is one
+    bridge call away (the reported failure: plugin tools swept into the
+    catalog when the bridge activated mid-session, then reported missing on
+    the next direct call).
+
+    The message names the tool's SOURCE (plugin toolset / MCP server), because
+    that is what lets the model judge whether the capability it wants is the
+    one behind the name, and it routes the model to the bridge instead of
+    guessing at renamed tools.
+    """
+    if not name or name in BRIDGE_TOOL_NAMES:
+        return None
+    if not is_deferrable_tool_name(name):
+        return None
+    try:
+        if load_config_readonly().enabled == "off":
+            # Deferral is disabled: a hidden deferrable tool is a registry
+            # anomaly, not the bridge's doing. Don't blame tool search for it.
+            return None
+    except Exception:
+        pass
+    source, source_name = _classify_source(name)
+    if source == "mcp":
+        server = source_name[len("mcp-"):] if source_name.startswith("mcp-") else source_name
+        where = f"MCP server '{server}'" if server else "an MCP server"
+    elif source_name:
+        where = f"plugin toolset '{source_name}'"
+    else:
+        where = "a deferred toolset"
+    return (
+        f"Tool '{name}' is deferred (source: {where}) — it exists and works, "
+        f"but its schema is not in this session's tools array. Call it with "
+        f"{TOOL_CALL_NAME}(name='{name}', arguments={{...}}); use "
+        f"{TOOL_SEARCH_NAME} with a few capability keywords to find deferred "
+        f"tools, and {TOOL_DESCRIBE_NAME} to read one's full schema before "
+        f"calling it. Do not conclude the tool is missing."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Token estimation and threshold gate
 # ---------------------------------------------------------------------------
@@ -356,6 +411,86 @@ def should_activate(
     if deferrable_tokens <= 0:
         return False
     return True
+
+
+@dataclass
+class DeferralSession:
+    """Session-scoped latch for the bridge activation decision.
+
+    The decision is a property of the CONVERSATION, not of any one assembly.
+    The model-facing tools array carries the decision (bridge tools present or
+    not, deferrable tools absent or not) and is part of the provider's cached
+    prompt prefix, so a decision that changes between turns rewrites that
+    prefix and moves tools across the direct/deferred boundary mid-session —
+    a tool the model called directly last turn starts answering "does not
+    exist" this turn.
+
+    The inputs to the decision DO drift inside one session:
+
+    * an MCP server finishing its connect after the bounded startup wait
+      (``tools.mcp_tool.refresh_agent_mcp_tools`` rebuilds the snapshot at a
+      turn boundary and picks the new tools up),
+    * a plugin toolset appearing/disappearing,
+    * the active model's context window resolving differently across turns
+      (``_resolve_active_context_length`` probes a live endpoint and falls
+      back to catalog values when the probe is down), which moves the listing
+      budget.
+
+    So the decision is taken ONCE — on the session's first assembly — and
+    reused for every later assembly of that session. Tools added later land on
+    whichever side of the bridge the session already chose.
+
+    The latch is OWNED BY THE CALLER that owns the session (the agent object
+    for chat/ACP sessions; see ``agent_init``) and passed in per assembly. It
+    is deliberately not a module-global: a process-wide (or TTL'd) cache would
+    serve one conversation's decision to another, and a long-lived gateway
+    process serves many conversations.
+    """
+
+    activated: Optional[bool] = None
+
+    def decide(self, computed: bool) -> bool:
+        """Return the latched decision, recording ``computed`` on first use."""
+        if self.activated is None:
+            self.activated = bool(computed)
+        return self.activated
+
+    def pin_eager(self) -> None:
+        """Latch "no bridge" without computing anything.
+
+        Used when the session's first assembly could not be computed at all —
+        ``model_tools`` swallows an assembly failure (a missing optional
+        dependency, a registry anomaly) and returns the pre-assembly list, so
+        that first turn was EAGER whatever the reason. Which is exactly the
+        reported flip: the stemmer import was missing for the first hours of a
+        session (assembly silently no-oped, every tool direct), the package
+        landed, and the next assembly turned the bridge on — hiding plugin
+        tools the model had been calling directly. The reason must not matter:
+        the session already showed its hand, so it stays eager.
+
+        No-op once a decision exists.
+        """
+        if self.activated is None:
+            self.activated = False
+
+
+def resolve_deferral_activation(
+    session: Optional[DeferralSession],
+    config: ToolSearchConfig,
+    deferrable_tokens: int,
+    context_length: Optional[int],
+) -> bool:
+    """Resolve whether the bridge activates for this assembly.
+
+    Without a ``session`` this is the plain :func:`should_activate` gate (an
+    inspection call: ``/tools``, a banner, a binding probe). With one, the
+    first assembly's answer is latched and every later assembly of that
+    session gets it back unchanged.
+    """
+    computed = should_activate(config, deferrable_tokens, context_length)
+    if session is None:
+        return computed
+    return session.decide(computed)
 
 
 def listing_token_budget(
@@ -907,13 +1042,24 @@ def assemble_tool_defs(
     *,
     context_length: Optional[int] = None,
     config: Optional[ToolSearchConfig] = None,
+    session: Optional[DeferralSession] = None,
 ) -> AssemblyResult:
     """Return the tool-defs list the model should actually see.
 
-    When tool search is inactive (off, no deferrable tools, or below
-    threshold), this is a passthrough. When active, MCP and plugin tools
-    are stripped from the visible list and replaced with the three bridge
-    tools. Core tools are *never* deferred regardless of config.
+    When tool search is inactive (``off``, no deferrable tools, or the
+    conversation's latched decision says eager) this is a passthrough. When
+    active, MCP and plugin tools are stripped from the visible list and
+    replaced with the three bridge tools. Core tools are *never* deferred
+    regardless of config.
+
+    ``session`` carries the conversation's latched activation decision (see
+    :class:`DeferralSession`). Callers that own a conversation — the agent's
+    own tool snapshot (``agent_init``) and every rebuild of it
+    (``refresh_agent_mcp_tools``) — pass the SAME latch on every assembly, so
+    a mid-session MCP connect can only ever ADD tools to the side the session
+    already chose; it can never sweep an already-direct tool into the
+    deferred catalog. Inspection callers (``/tools``, banners, probes) leave
+    it None and get the live view.
 
     Idempotent: calling with bridge tools already in the input is a no-op
     (they classify as non-core/non-deferrable but their names are reserved,
@@ -928,11 +1074,13 @@ def assemble_tool_defs(
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
 
     visible, deferrable = classify_tools(incoming)
-    if not deferrable:
-        return AssemblyResult(tool_defs=incoming, activated=False)
-
     deferrable_tokens = estimate_tokens_from_schemas(deferrable)
-    if not should_activate(config, deferrable_tokens, context_length):
+    activated = resolve_deferral_activation(
+        session, config, deferrable_tokens, context_length)
+    if not activated or not deferrable:
+        # Not activating — or activating with nothing left to defer (every
+        # MCP/plugin tool went away): passthrough either way, so the session's
+        # visible tools are never rewritten to add a bridge with no catalog.
         return AssemblyResult(
             tool_defs=incoming,
             activated=False,
@@ -1302,8 +1450,11 @@ __all__ = [
     "load_config",
     "is_deferrable_tool_name",
     "classify_tools",
+    "deferred_tool_guidance",
     "estimate_tokens_from_schemas",
     "should_activate",
+    "DeferralSession",
+    "resolve_deferral_activation",
     "build_catalog",
     "build_catalog_listing",
     "build_catalog_listing_with_form",

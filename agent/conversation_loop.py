@@ -189,6 +189,47 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
     return False
 
 
+def _maybe_reinject_board(agent: Any, messages: List[Dict[str, Any]]) -> bool:
+    """Event-driven long-horizon board snapshot (P4).
+
+    Cache-safe delivery: the snapshot is appended to the NEWEST ``role:"tool"``
+    message — the channel ``/steer`` and the run-budget notice already use — so no
+    synthetic user message is inserted mid-loop and no past context is rewritten.
+    The reinjection module hash-dedups the render, so an unchanged board leaves
+    the tool result byte-identical. Dormant when the session has no board.
+    """
+    try:
+        from agent.longtask_reinjection import maybe_reinject_board
+
+        return bool(maybe_reinject_board(agent, messages))
+    except Exception:
+        logger.debug("Longtask board reinjection failed", exc_info=True)
+        return False
+
+
+def _apply_board_final_gate(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    final_response: Optional[str],
+    finish_reason: Optional[str],
+) -> "tuple[Optional[str], bool]":
+    """Finalization gate for a no-tool-call response (P4).
+
+    Returns ``(final_response, continue_turn)``; True asks the loop for exactly
+    ONE more iteration (the note rides the newest tool result — never a synthetic
+    user message). Dormant with no board or ``enforce_finalization_gate: off``.
+    """
+    try:
+        from agent.longtask_reinjection import apply_final_gate
+
+        return apply_final_gate(
+            agent, messages, final_response, finish_reason=finish_reason
+        )
+    except Exception:
+        logger.debug("Longtask board final gate failed", exc_info=True)
+        return final_response, False
+
+
 def _restore_user_after_reference_handoff(
     messages: List[Dict[str, Any]], user_message: Any
 ) -> bool:
@@ -1421,6 +1462,12 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     error that tells the model in-context tool-call syntax is DATA, not a
     call to make. A genuinely-wrong-but-nonempty name (an actual typo) still
     gets the catalog so the model can self-correct.
+
+    The third case is a name that EXISTS but is deferred behind the
+    ``tool_search`` bridge this session is running: the tool is one
+    ``tool_call`` away, so the reply is bridge routing (which tool it is, which
+    source it came from, how to call it) instead of the "does not exist"
+    catalog the model would read as "this capability is gone".
     """
     if not (name or "").strip():
         return (
@@ -1431,6 +1478,23 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
             "tool, use a valid name from your tool list; "
             "otherwise reply in plain text."
         )
+    # A deferred (tool_search-hidden) tool is a NAMED, working capability, not
+    # a typo: answering "does not exist" makes the model abandon it even though
+    # the bridge can invoke it in one call. Delegate the wording to the search
+    # layer, which knows the tool's source; fall back to the generic message
+    # whenever it has nothing to say (unknown name, core tool, feature off).
+    # Gated on the bridge actually being in THIS session's tool list: a session
+    # that kept its plugin/MCP tools direct has no tool_call to route through,
+    # and then the plain "does not exist" is the truthful answer.
+    _guidance = None
+    try:
+        from tools.tool_search import BRIDGE_TOOL_NAMES, deferred_tool_guidance
+        if BRIDGE_TOOL_NAMES & set(valid_tool_names or ()):
+            _guidance = deferred_tool_guidance(name)
+    except Exception:
+        _guidance = None
+    if _guidance:
+        return _guidance
     available = ", ".join(sorted(valid_tool_names))
     return f"Tool '{name}' does not exist. Available tools: {available}"
 
@@ -2161,6 +2225,14 @@ def run_conversation(
         if getattr(agent, "run_budget_seconds", None):
             _maybe_inject_run_budget_wrapup(agent, messages)
 
+        # ── Long-horizon board re-injection (P4) ───────────────────────
+        # Event-driven, never clock-driven: when the board materially changed
+        # since the last render (or the model has not consulted it for
+        # longtask.board_reinject_idle_turns while items remain unresolved),
+        # append a numbered snapshot to the newest tool result. Same cache-safe
+        # channel as /steer; hash-deduped, so an unchanged board is a no-op.
+        _maybe_reinject_board(agent, messages)
+
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages
         # Note: Reasoning is embedded in content via <think> tags for trajectory storage.
@@ -2587,6 +2659,17 @@ def run_conversation(
         # messages walk inside estimate_request_tokens_rough. Tools added
         # separately (compression needs them: 50+ tools = 20-30K tokens).
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
+        #
+        # Caliber (verified): ``api_messages`` ALREADY carries the system
+        # prompt as its first element — see "Build the final system message"
+        # above — so this sum is the FULL-REQUEST caliber (system prompt +
+        # messages + tool schemas) and does not understate the real request.
+        # Do NOT "complete" it by also passing
+        # ``system_prompt=_cached_system_prompt`` into a
+        # ``estimate_request_tokens_rough`` call here: that double-counts the
+        # whole system prompt (thousands of tokens) and moves this number off
+        # the basis recorded by ``note_request_rough_estimate`` — see
+        # tests/agent/test_pre_api_request_pressure_basis.py.
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
@@ -7538,12 +7621,17 @@ def run_conversation(
                     # post-compression estimate as real context pressure.
                     _real_tokens = 0
                 else:
-                    # Include tool schemas — with 50+ tools enabled
-                    # these add 20-30K tokens the messages-only
-                    # estimate misses, which can skip compression
-                    # past the configured threshold (#14695).
+                    # Full-request caliber, mirroring the pre-API pressure check
+                    # and the turn-prologue preflight: tool schemas (50+ tools =
+                    # 20-30K tokens, #14695) AND the system prompt. ``messages``
+                    # here is the durable transcript, which does not carry the
+                    # system prompt, so it must be passed explicitly — omitting
+                    # it understates the real request and can let the session
+                    # creep past the threshold with no output room left.
                     _real_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
+                        messages,
+                        system_prompt=active_system_prompt or "",
+                        tools=agent.tools or None,
                     )
 
                 if (
@@ -7682,6 +7770,24 @@ def run_conversation(
                 # chokepoint below, after final_msg is built, so it catches
                 # every path that reaches turn finalization, not just this one.)
                 final_response = assistant_message.content or ""
+
+                # ── Long-horizon board finalization gate (P4) ──────────────
+                # The model is about to wrap up while the board still has
+                # unresolved items. "warn" (default) appends the unresolved list
+                # to the newest tool result and finishes; "hard" refuses ONCE —
+                # the note rides that same tool result and we take exactly one
+                # more iteration (the latch in longtask_reinjection forbids a
+                # second). Never a synthetic user message; nothing is inserted.
+                final_response, _board_continue = _apply_board_final_gate(
+                    agent, messages, final_response, finish_reason
+                )
+                if _board_continue:
+                    logger.info(
+                        "Longtask final gate: continuing one bounded turn "
+                        "(session=%s)",
+                        getattr(agent, "session_id", None) or "none",
+                    )
+                    continue
                 
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery

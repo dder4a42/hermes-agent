@@ -6290,6 +6290,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 turn_live=getattr(self, "_prompt_start_time", None) is not None,
             ),
             "context_tokens": 0,
+            "context_tokens_unknown": False,
             "context_length": None,
             "context_percent": None,
             "session_input_tokens": 0,
@@ -6401,17 +6402,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # compression, until the next real API call reports a prompt count
             # (awaiting_real_usage_after_compression). The status bar must not
             # render that sentinel verbatim — it produced "-1/200K" / "-1%".
-            # Clamp it to 0 so the one transitional turn reads as empty context.
+            # Report it as UNKNOWN rather than clamping to a literal 0: the bar
+            # read "0/1.0M · 0%" for that turn, which claims an EMPTY context
+            # right after a compaction landed (#P13). Consumers render "--".
             context_tokens = getattr(compressor, "last_prompt_tokens", 0) or 0
-            if context_tokens < 0:
+            context_tokens_unknown = context_tokens < 0
+            if context_tokens_unknown:
                 context_tokens = 0
             context_length = getattr(compressor, "context_length", 0) or 0
             if context_length < 0:
                 context_length = 0
             snapshot["context_tokens"] = context_tokens
+            snapshot["context_tokens_unknown"] = context_tokens_unknown
             snapshot["context_length"] = context_length or None
             snapshot["compressions"] = getattr(compressor, "compression_count", 0) or 0
-            if context_length:
+            if context_length and not context_tokens_unknown:
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
         return snapshot
@@ -7071,7 +7076,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             if snapshot["context_length"]:
                 ctx_total = _format_context_length(snapshot["context_length"])
-                ctx_used = format_token_count_compact(snapshot["context_tokens"])
+                ctx_used = (
+                    "--"
+                    if snapshot.get("context_tokens_unknown")
+                    else format_token_count_compact(snapshot["context_tokens"])
+                )
                 context_label = f"{ctx_used}/{ctx_total}"
             else:
                 context_label = "ctx --"
@@ -7187,7 +7196,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 else:
                     if snapshot["context_length"]:
                         ctx_total = _format_context_length(snapshot["context_length"])
-                        ctx_used = format_token_count_compact(snapshot["context_tokens"])
+                        ctx_used = (
+                            "--"
+                            if snapshot.get("context_tokens_unknown")
+                            else format_token_count_compact(snapshot["context_tokens"])
+                        )
                         context_label = f"{ctx_used}/{ctx_total}"
                     else:
                         context_label = "ctx --"
@@ -9243,6 +9256,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         ctx_label = None
         try:
             snap = self._get_status_bar_snapshot()
+            ctx_unknown = bool(snap.get("context_tokens_unknown"))
             ctx_tokens = snap.get("context_tokens") or 0
             ctx_max = snap.get("context_length")
             ctx_pct = snap.get("context_percent")
@@ -9250,7 +9264,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 left = ""
                 if isinstance(ctx_pct, (int, float)):
                     left = f"{max(0, 100 - int(ctx_pct))}% left · "
-                ctx_label = f"{left}{ctx_tokens:,} / {ctx_max:,} tokens used"
+                ctx_used = "--" if ctx_unknown else f"{ctx_tokens:,}"
+                ctx_label = f"{left}{ctx_used} / {ctx_max:,} tokens used"
         except Exception:
             ctx_label = None
 
@@ -12280,6 +12295,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._show_gateway_status()
         elif canonical == "status":
             self._show_session_status()
+        elif canonical == "board":
+            self._show_task_board(cmd_original)
         elif canonical == "context":
             self._show_context_breakdown(cmd_original)
         elif canonical == "egress":
@@ -13673,6 +13690,93 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print("  ❌ Timed out talking to the Codex backend — try again shortly.")
                 return
         print(f"  {result.message}")
+
+    def _show_task_board(self, cmd_original: str = ""):
+        """`/board [node_id]` — render this session's long-horizon task board.
+
+        Read-only: loads the board for this session's workspace and prints it via
+        the shared renderer (agent.longtask_board.render_board_summary). Execution
+        status is the runtime's record of a dispatched run; resolution is the
+        agent's judgement — this shows both and changes neither.
+        """
+        if not self.agent:
+            print("  (._.) No active agent -- send a message first.")
+            return
+
+        arg = (
+            cmd_original.split(maxsplit=1)[1].strip()
+            if " " in (cmd_original or "")
+            else ""
+        )
+
+        from agent.longtask_board import (
+            LongtaskBoardError,
+            load_board,
+            render_board_summary,
+        )
+        from tools.longtask_tool import _root, _session_id
+
+        session_id = _session_id(self.agent)
+        try:
+            board = load_board(_root(self.agent), session_id)
+        except LongtaskBoardError:
+            self._console_print(
+                f"  (._.) No task board for this session ({session_id}).",
+                highlight=False,
+                markup=False,
+            )
+            self._console_print(
+                "        Create one with longtask_create (the longtask toolset "
+                "must be enabled for this platform).",
+                highlight=False,
+                markup=False,
+            )
+            return
+        except Exception as exc:
+            self._console_print(
+                f"  (._.) Could not read the task board: {exc}",
+                highlight=False,
+                markup=False,
+            )
+            return
+
+        if arg:
+            node = next((n for n in board["nodes"] if n["node_id"] == arg), None)
+            if node is None:
+                self._console_print(
+                    f"  (._.) No item {arg!r} on {board['task_id']}.",
+                    highlight=False,
+                    markup=False,
+                )
+                return
+            lines = [
+                f"  {node['node_id']} — {node['goal']}",
+                f"    resolution={node['resolution']}   execution={node['execution']}",
+            ]
+            if node.get("dependencies"):
+                lines.append(f"    deps: {', '.join(node['dependencies'])}")
+            if node.get("blocked_reason"):
+                lines.append(f"    blocked: {node['blocked_reason']}")
+            if node.get("report_path"):
+                lines.append(
+                    f"    report: {node['report_path']} "
+                    f"(child said: {node.get('report_status') or 'unknown'})"
+                )
+            verification = node.get("verification")
+            if isinstance(verification, dict) and verification:
+                summary = str(verification.get("summary_for_parent") or "").strip()
+                lines.append(
+                    f"    verdict: {verification.get('verdict') or 'unknown'}"
+                    + (f" — {summary[:200]}" if summary else "")
+                )
+            if node.get("notes"):
+                lines.append(f"    notes: {str(node['notes'])[:400]}")
+            for line in lines:
+                self._console_print(line, highlight=False, markup=False)
+            return
+
+        for line in render_board_summary(board).splitlines():
+            self._console_print(line, highlight=False, markup=False)
 
     def _show_context_breakdown(self, cmd_original: str = ""):
         """`/context [all]` — visual context-window usage breakdown.

@@ -1605,10 +1605,23 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
+    # Tool Search activation latch, owned by THIS session. The decision whether
+    # MCP/plugin tools hide behind the tool_search bridge is taken on this first
+    # assembly and reused for every later one (see tools/tool_search.py::
+    # DeferralSession) — the tool array is a cached prompt prefix, so it must not
+    # be rewritten mid-conversation when an MCP server finishes connecting or a
+    # plugin toolset appears. Every rebuild of this snapshot
+    # (tools.mcp_tool.refresh_agent_mcp_tools) passes the same latch.
+    try:
+        from tools.tool_search import DeferralSession
+        agent._deferral_session = DeferralSession()
+    except Exception:
+        agent._deferral_session = None
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        deferral_session=agent._deferral_session,
     )
     
     # Show tool configuration and store valid tool names for validation
@@ -2239,6 +2252,15 @@ def init_agent(
             _compression_cfg.get("proactive_prune_min_reclaim_tokens", 4096), 4096
         ),
     )
+    # Tier-1 tool-observation eviction (board item P5). Both keys drive the
+    # cheap, no-LLM tier of a compression pass; the compressor applies the
+    # sanity floors/ceilings, these just carry the operator's intent through.
+    compression_tier1_min_observation_chars = _parse_prune_int(
+        _compression_cfg.get("tier1_min_observation_chars", 2000), 2000
+    )
+    compression_tier1_keep_recent = _parse_prune_int(
+        _compression_cfg.get("tier1_keep_recent_observations", 4), 4
+    )
     # protect_first_n is the number of non-system messages to protect at
     # the head, in addition to the system prompt (which is always
     # implicitly protected by the compressor).  Floor at 0 — a value of
@@ -2791,6 +2813,8 @@ def init_agent(
             proactive_prune_tokens=compression_proactive_prune_tokens,
             proactive_prune_min_result_chars=compression_proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=compression_proactive_prune_min_reclaim,
+            tier1_min_observation_chars=compression_tier1_min_observation_chars,
+            tier1_keep_recent_observations=compression_tier1_keep_recent,
             min_tail_user_messages=compression_min_tail_users,
             tail_mode=compression_tail_mode,
         )

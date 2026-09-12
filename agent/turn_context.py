@@ -90,6 +90,29 @@ def _preflight_request_tokens(
     )
 
 
+def _preflight_surface_tokens(compressor: Any, rough_tokens: int) -> tuple[int, str]:
+    """``(tokens, basis)`` for the preflight log line and status message.
+
+    The compaction TRIGGER already projects the last real provider reading
+    forward (``should_defer_preflight_to_real_usage``). Reporting the raw rough
+    estimate instead made a correctly-fired compaction look mis-calibrated:
+    ``~937,546`` logged for a request the provider billed at 754,271 — a ~24%
+    basis gap (CJK-heavy text, dense JSON payloads) with nothing telling the
+    reader the two numbers measure different things (#P13). Falls back to the
+    raw estimate when the compressor cannot project (first turn, no paired
+    reading, test doubles, older plugin engines).
+    """
+    project = getattr(compressor, "projected_request_tokens", None)
+    if callable(project):
+        try:
+            tokens, basis = project(rough_tokens)
+            if isinstance(tokens, int) and tokens > 0:
+                return int(tokens), str(basis or "estimate")
+        except Exception:
+            logger.debug("preflight projection unavailable", exc_info=True)
+    return int(rough_tokens or 0), "estimate"
+
+
 def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
@@ -679,6 +702,19 @@ def build_turn_context(
         agent._run_budget_started_at = None
     agent._run_budget_wrapup_injected = False
 
+    # Long-horizon board re-injection (P4) is run-scoped, not session-scoped: the
+    # idle counter starts fresh and the one-shot "wrap-up refused" latch from a
+    # prior turn is cleared, so a later turn can never inherit a spent refusal
+    # (and the hard gate can never loop across turns). The render dedup hash is
+    # deliberately NOT reset — it must survive a user "continue" so the same
+    # board is not re-appended every turn.
+    try:
+        from agent.longtask_reinjection import begin_board_run
+
+        begin_board_run(agent)
+    except Exception:
+        pass
+
     # Log conversation turn start for debugging/observability.
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
@@ -1061,9 +1097,21 @@ def build_turn_context(
             _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
             if callable(_clear_warn):
                 _clear_warn()
+            # Report the SAME basis the trigger decided on, not the raw rough
+            # estimate: the two differ by the estimator's by-design margin
+            # (~24% on CJK/dense-JSON sessions, #P13), and logging the rough
+            # number next to a real provider reading makes a correct compaction
+            # look like a mis-calibration.
+            _surface_tokens, _surface_basis = _preflight_surface_tokens(
+                _compressor, _preflight_tokens
+            )
             logger.info(
-                "Preflight compression: ~%s tokens >= %s threshold (model %s, ctx %s)",
-                f"{_preflight_tokens:,}",
+                "Preflight compression: ~%s tokens (%s) >= %s threshold "
+                "(model %s, ctx %s)",
+                f"{_surface_tokens:,}",
+                "projected from the last provider reading"
+                if _surface_basis == "provider"
+                else "local rough estimate",
                 f"{_compressor.threshold_tokens:,}",
                 agent.model,
                 f"{_compressor.context_length:,}",
@@ -1072,10 +1120,10 @@ def build_turn_context(
                 _compressor,
                 phase="preflight",
                 default_message=PREFLIGHT_COMPRESSION_STATUS_TEMPLATE.format(
-                    tokens=_preflight_tokens,
+                    tokens=_surface_tokens,
                     threshold=_compressor.threshold_tokens,
                 ),
-                approx_tokens=_preflight_tokens,
+                approx_tokens=_surface_tokens,
                 threshold_tokens=_compressor.threshold_tokens,
                 context_length=_compressor.context_length,
                 model=agent.model,

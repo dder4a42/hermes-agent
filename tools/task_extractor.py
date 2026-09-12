@@ -135,6 +135,15 @@ Output a single compact JSON object with EXACTLY these keys:
                    remind_before_min (integer minutes or expression string
                    like '30m'/'1h'/'2小时'), checklist (list[string]),
                    recurrence (one of once|daily|weekly|monthly|yearly).
+                 OMIT recurrence (or set 'once') unless the user EXPLICITLY
+                 names a repeating cadence (每天/每周/每月/每周三/every day/
+                 every week/daily/weekly...). A single point in time
+                 ('明早10点', '明天下午3点', '下周三', 'tomorrow 3pm') is ALWAYS
+                 once — never infer recurrence from title, notes or context.
+                 If you DO set a non-once recurrence, you MUST also set
+                 next_prompt to a one-line confirmation question and
+                 done=false, so the bot confirms the recurring schedule
+                 with the user before committing.
                  OMIT keys the user did not provide; do NOT invent values.
                  Merge the user's new info with the existing draft.
                  For lists (attendees/tags/checklist), return the FULL
@@ -381,6 +390,22 @@ def extract_fields(
                     next_prompt = "这个提醒的内容是什么？"
                 else:
                     next_prompt = "什么时间？"
+
+    # Recurrence confirmation gate: a non-once recurrence must be confirmed
+    # by the user before commit. LLM slot-fillers hallucinate weekly/daily
+    # from one-time phrases like '明早10点', which would otherwise silently
+    # convert a one-shot reminder into a recurring one.
+    if done and not cancelled:
+        rec = str(merged.get("recurrence") or "once").strip().lower() or "once"
+        if rec != "once":
+            done = False
+            if next_prompt is None:
+                freq = {"daily": "每天", "weekly": "每周",
+                        "monthly": "每月", "yearly": "每年"}.get(rec, rec)
+                next_prompt = (
+                    f"这条提醒会按「{freq}」重复，确认要设成周期性提醒吗？"
+                    f"（回复「确认」或说明频率，或「不用」改为一次性）"
+                )
 
     try:
         confidence = float(payload.get("confidence") or 0.0)

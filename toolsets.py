@@ -297,6 +297,25 @@ TOOLSETS = {
         "includes": []
     },
 
+    "longtask": {
+        "description": (
+            "Durable DAG task board for long-horizon work: plan items, select "
+            "ready work by dependency order, replan mid-run (add/cancel/rewire), "
+            "attach subagent reports, and keep state outside the model context."
+        ),
+        "tools": [
+            "longtask_create",
+            "longtask_add_node",
+            "longtask_cancel_node",
+            "longtask_read",
+            "longtask_next",
+            "longtask_update_node",
+            "longtask_attach_report",
+            "longtask_verify_node",
+        ],
+        "includes": [],
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 
@@ -401,7 +420,7 @@ TOOLSETS = {
     # in alongside this selection for a desktop-sourced session (see
     # tui_gateway/server.py::_load_enabled_toolsets).
     "coding": {
-        "description": "Coding-focused toolset: files, terminal, search, web docs, skills, todo, delegate, vision, browser",
+        "description": "Coding-focused toolset: files, terminal, search, web docs, skills, todo, longtask, delegate, vision, browser",
         "tools": [
             "web_search", "web_extract",
             "terminal", "process",
@@ -416,6 +435,10 @@ TOOLSETS = {
             "todo", "memory",
             "session_search", "clarify",
             "execute_code", "delegate_task",
+            "longtask_create", "longtask_add_node", "longtask_cancel_node",
+            "longtask_read", "longtask_next",
+            "longtask_update_node", "longtask_attach_report",
+            "longtask_verify_node",
         ],
         "includes": [],
         # Posture toolset: selected per-session by agent/coding_context.py,

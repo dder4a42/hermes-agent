@@ -37,6 +37,14 @@ Per-task overrides are configured in config.yaml under the ``auxiliary:`` sectio
 (e.g. ``auxiliary.vision.provider``, ``auxiliary.compression.model``).
 Default "auto" follows the chains above.
 
+Misconfiguration diagnostics: an ``auxiliary.<task>.provider`` value that is
+neither a sentinel/alias nor a known provider id — and that arrives without an
+explicit ``base_url``/``api_key`` to describe a custom endpoint — is reported
+once per process, naming the offending value and the fix. The call itself is
+unchanged (no raise, no rerouting), so a setup that currently limps along keeps
+working while the misconfiguration stops being silent
+(see ``_warn_unrecognized_aux_provider_once``).
+
 Payment / credit exhaustion fallback:
   When a resolved provider returns HTTP 402 or a credit-related error,
   call_llm() automatically retries with the next available provider in the
@@ -8124,6 +8132,145 @@ _AUX_DIRECT_API_BASE_URLS: Dict[str, str] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Unrecognized auxiliary-provider diagnostics
+# ---------------------------------------------------------------------------
+# ``auxiliary.<task>.provider`` accepts a sentinel ("auto"/"custom"/"main"/
+# "moa"), an alias, or a real provider id. Anything else (measured: a user
+# wrote the *display name* ``Models.sjtu.edu.cn``) is passed through
+# _resolve_task_provider_model verbatim; nothing in the catalog answers to that
+# name, so the call either goes out with a placeholder key (measured: a 401
+# "expected to start with 'sk-'" from the endpoint) or — worse — silently rides
+# the main runtime's credentials while substituting the configured model, and
+# nothing in the logs names the offending config value.
+#
+# This is deliberately diagnostics ONLY: the value is still returned unchanged
+# and nothing raises. Auxiliary calls run mid-conversation, so a hard failure
+# here would break setups that currently limp along; the point is that the
+# misconfiguration stops being SILENT. One WARNING per distinct bad value per
+# process, and a value that arrives with an explicit base_url/api_key (a label
+# for a custom endpoint) is never reported.
+_UNRECOGNIZED_AUX_PROVIDER_WARNED: set = set()
+_UNRECOGNIZED_AUX_PROVIDER_WARN_LOCK = threading.Lock()
+
+# Non-provider values that are meaningful to the resolver above and must never
+# be reported: "auto" (inherit main runtime / auto-detect), "custom" plus any
+# "custom:<name>" (endpoint supplied alongside), "main" (alias for the user's
+# primary provider) and "moa" (virtual ensemble facade, unwrapped above).
+_AUX_PROVIDER_SENTINELS = frozenset({"auto", "custom", "main", "moa"})
+
+
+def _aux_provider_is_known(value: str) -> bool:
+    """True when *value* is something the provider catalog recognizes.
+
+    Consults the layers that define the documented aux-provider set, cheapest
+    first: this module's alias table, the auth ``PROVIDER_REGISTRY`` (the
+    "provider registry" the docs point at), and the models.dev catalog +
+    Hermes overlays. Each is a dict lookup over state already cached
+    in-process, and the catalog call passes ``allow_network=False`` because
+    this runs on every auxiliary call and must never block on models.dev.
+
+    A layer that raises does not vote: this is a warning-only diagnostic, and
+    one unavailable lookup must not silently disable it. The trade-off is that
+    in a process with no catalog data at all a catalog-only provider id can be
+    reported once — a false warning we accept over staying quiet about a value
+    we genuinely cannot resolve.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return True
+    normalized = raw.lower()
+    if normalized in _AUX_PROVIDER_SENTINELS or normalized.startswith("custom:"):
+        return True
+    try:
+        # Aliases this module rewrites ("codex" → "openai-codex", "z.ai" →
+        # "zai", …) resolve even when no catalog is loaded.
+        if _normalize_aux_provider(normalized) != normalized:
+            return True
+    except Exception:
+        pass
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        if normalized in PROVIDER_REGISTRY:
+            return True
+    except Exception:
+        pass
+    try:
+        from hermes_cli.providers import get_provider
+        if get_provider(normalized, allow_network=False) is not None:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _aux_config_provider_name(value: str) -> Optional[str]:
+    """Name of the config.yaml provider whose name/alias matches *value*, if any.
+
+    ``resolve_provider_client``'s named-custom branch (``providers:`` /
+    ``custom_providers:``) also matches on the entry's display name, so such a
+    value can still route by coincidence even though the documented aux
+    provider set is ``auto`` / ``main`` / registry ids. Naming that coincidence
+    in the warning keeps the advice usable instead of telling a user their
+    working endpoint does not exist.
+    """
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+        entry = _get_named_custom_provider(str(value or "").strip().lower())
+    except Exception:
+        return None
+    if not isinstance(entry, dict):
+        return None
+    return str(entry.get("name") or "").strip() or None
+
+
+def _warn_unrecognized_aux_provider_once(task: Optional[str], value: str) -> None:
+    """Warn once per process about an auxiliary provider value that cannot resolve.
+
+    Diagnostics only — the caller still returns the value unchanged (see the
+    block comment above ``_UNRECOGNIZED_AUX_PROVIDER_WARNED``). The dedup key is
+    the value itself, so several tasks sharing one bad value produce one
+    warning; the (cached, dict-only) recognition lookups run at most once per
+    distinct value per process.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return
+    key = raw.lower()
+    with _UNRECOGNIZED_AUX_PROVIDER_WARN_LOCK:
+        if key in _UNRECOGNIZED_AUX_PROVIDER_WARNED:
+            return
+    if _aux_provider_is_known(raw):
+        return
+    config_name = _aux_config_provider_name(raw)
+    with _UNRECOGNIZED_AUX_PROVIDER_WARN_LOCK:
+        if key in _UNRECOGNIZED_AUX_PROVIDER_WARNED:
+            return
+        # Bounded by the number of distinct misconfigured values a process ever
+        # sees (one or two in practice), never by call volume.
+        _UNRECOGNIZED_AUX_PROVIDER_WARNED.add(key)
+    if config_name:
+        hint = (
+            f" It does match your config.yaml provider {config_name!r}, which "
+            f"can only work by display-name coincidence — route that endpoint "
+            f"with auxiliary.{task or '<task>'}.base_url (+ api_key) instead."
+        )
+    else:
+        hint = ""
+    logger.warning(
+        "Auxiliary task %s: provider %r is not a recognized provider id. "
+        "The value is passed through unresolved, so this call can silently "
+        "ride the main runtime's credentials (or go out with a placeholder "
+        "key and 401) while still sending the configured model. Fix: set "
+        "auxiliary.%s.provider to `auto` to inherit the main runtime, or to a "
+        "real provider id (run `hermes model` to list them).%s",
+        task or "<unknown>",
+        raw,
+        task or "<task>",
+        hint,
+    )
+
+
 def _resolve_task_provider_model(
     task: str = None,
     provider: str = None,
@@ -8281,6 +8428,13 @@ def _resolve_task_provider_model(
     if base_url:
         return "custom", resolved_model, base_url, api_key, resolved_api_mode
     if provider:
+        # No endpoint alongside the provider: an unrecognized id here is the
+        # silent-misroute case (see the block comment far above). Report it,
+        # then return exactly what we always returned — and, when an explicit
+        # api_key came with it, treat the id as a label for a custom endpoint
+        # and stay quiet.
+        if not api_key:
+            _warn_unrecognized_aux_provider_once(task, provider)
         return provider, resolved_model, base_url, api_key, resolved_api_mode
 
     if task:
@@ -8294,6 +8448,11 @@ def _resolve_task_provider_model(
             # (e.g. OPENROUTER_API_KEY) instead of locking into "custom".
             return cfg_provider, resolved_model, cfg_base_url, None, resolved_api_mode
         if cfg_provider and cfg_provider != "auto":
+            # Same unrecognized-value diagnostic as the explicit-provider
+            # branch above: `auxiliary.<task>.provider` naming something that
+            # is not a provider is what silently rode the main runtime.
+            if not cfg_base_url and not cfg_api_key:
+                _warn_unrecognized_aux_provider_once(task, cfg_provider)
             return cfg_provider, resolved_model, cfg_base_url, cfg_api_key, resolved_api_mode
 
         return "auto", resolved_model, None, None, resolved_api_mode

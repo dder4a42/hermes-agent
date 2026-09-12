@@ -8018,6 +8018,7 @@ class AIAgent:
         """
         from agent.conversation_compression import (
             CompressionCommitFence,
+            _emit_compression_no_progress_warning,
             compress_context,
             resolve_context_compression_timeouts,
             run_compress_context_with_progress_timeout,
@@ -8082,7 +8083,29 @@ class AIAgent:
             direct_path = commit_fence is not None
             idle_timeout = total_ceiling = None
             if not direct_path:
-                idle_timeout, total_ceiling = resolve_context_compression_timeouts()
+                # P12: the watchdog scales with the size of the transcript the
+                # summary has to read, so a ~900K-token preflight does not get
+                # the same inactivity budget as a small one — the fixed 120s
+                # window aborted real compressions that a later attempt
+                # completed in ~124s. `approx_tokens` is the caller's own
+                # request estimate; when the caller supplied none (or a stale
+                # 0 after durable-snapshot adoption), derive it from the
+                # transcript so every owned call still gets a scaled budget.
+                _estimated_tokens = approx_tokens
+                if not _estimated_tokens:
+                    try:
+                        from agent.model_metadata import (
+                            estimate_messages_tokens_rough,
+                        )
+
+                        _estimated_tokens = estimate_messages_tokens_rough(
+                            messages
+                        )
+                    except Exception:
+                        _estimated_tokens = None
+                idle_timeout, total_ceiling = resolve_context_compression_timeouts(
+                    estimated_tokens=_estimated_tokens
+                )
                 if idle_timeout <= 0:
                     direct_path = True
 
@@ -8170,15 +8193,16 @@ class AIAgent:
                                     "cooldown",
                                     exc_info=True,
                                 )
-                    emit = getattr(self, "_emit_warning", None)
-                    if callable(emit):
-                        emit(
-                            "⚠ Context compression timed out "
-                            f"after {idle:.1f}s with no output from the summary "
-                            "model. No messages were dropped — continuing without "
-                            "compression. Run /compress to retry, /new for a clean "
-                            "session, or check auxiliary.compression."
-                        )
+                    # P12: the abort must reach the USER, not just the log — the
+                    # context is still over the threshold, so the session keeps
+                    # growing toward the hard provider token limit. Single-
+                    # sourced from the compressor's FAILURE notice template (and
+                    # pinned un-swallowed by the gateway noise-filter test),
+                    # emitted through the shared dedup helper so the
+                    # compressor's own no-progress report for this same attempt
+                    # cannot double it. The helper is fail-soft on agents with
+                    # no warning channel.
+                    _emit_compression_no_progress_warning(self)
 
                 def _on_commit_overrun(waited, ceiling):
                     # Commit-phase ceiling breach: the SessionDB mutation is in
@@ -8215,6 +8239,13 @@ class AIAgent:
                     on_commit_overrun=_on_commit_overrun,
                     fence=active_fence,
                     telemetry_agent=self,
+                    # P12: one same-turn retry of the same route after an
+                    # inactivity abort (the stalls observed in the wild
+                    # recovered ~2min later, but only on the NEXT turn's
+                    # preflight, so the session kept growing past the
+                    # threshold in the meantime). Bounded to exactly one
+                    # attempt by the retry path's own retry_on_abort=False.
+                    retry_on_abort=True,
                     new_fence=_publish_new_fence,
                 )
             # _DB_PERSISTED_MARKER lives at module level in

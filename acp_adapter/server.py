@@ -1174,6 +1174,11 @@ class HermesACPAgent(acp.Agent):
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True,
+                # Same session latch the agent's own snapshot was taken with:
+                # newly registered MCP servers may ADD tools, but this rebuild
+                # must not re-decide whether the tool_search bridge is on (see
+                # agent_init / tools.tool_search.DeferralSession).
+                deferral_session=getattr(state.agent, "_deferral_session", None),
             )
             state.agent.valid_tool_names = {
                 tool["function"]["name"] for tool in state.agent.tools or []

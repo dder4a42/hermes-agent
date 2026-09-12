@@ -26,6 +26,22 @@ MAX_SCHEMA_RETRIES = 1
 _CONTRACT_HEADER = "OUTPUT CONTRACT (machine-validated)"
 
 
+def jsonschema_available() -> bool:
+    """Whether the strict JSON Schema validator can be imported.
+
+    ``jsonschema`` is a declared direct dependency of this package (see
+    ``pyproject.toml``), so this is ``True`` on any supported install. It is
+    public so callers/tests can assert the *intended* strict mode actually ran
+    — a suite that passes on both the strict and degraded paths would hide an
+    undeclared dependency instead of failing on it.
+    """
+    try:
+        from jsonschema.validators import validator_for  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+    return True
+
+
 def coerce_output_schema(raw: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Validate a model/caller-supplied output_schema value.
 
@@ -52,8 +68,9 @@ def coerce_output_schema(raw: Any) -> Tuple[Optional[Dict[str, Any]], Optional[s
 
         validator_for(raw).check_schema(raw)
     except ImportError:
-        # jsonschema is a hard dependency in practice; degrade to accepting
-        # the dict as-is so delegation still works without it.
+        # Belt-and-braces only: jsonschema is a declared direct dependency, so
+        # this arm is unreachable on supported installs. If it ever does fire,
+        # accept the dict as-is rather than fail the delegation outright.
         logger.debug("jsonschema unavailable; skipping output_schema meta-validation")
     except Exception as exc:
         return None, f"output_schema is not a valid JSON Schema: {exc}"
@@ -120,6 +137,9 @@ def validate_output(
     try:
         from jsonschema.validators import validator_for  # type: ignore[import-untyped]
     except ImportError:
+        # Belt-and-braces only (jsonschema is a declared direct dependency).
+        # Without it the strict validation below cannot run, so the parsed JSON
+        # is accepted rather than deadlocking delegation on every report.
         logger.debug("jsonschema unavailable; accepting parsed JSON without validation")
         return True, []
     validator = validator_for(schema)(schema)
@@ -133,6 +153,22 @@ def validate_output(
         )
         rendered.append(f"{path}: {err.message}")
     return False, rendered
+
+
+def parse_output_object(text: str) -> Optional[Dict[str, Any]]:
+    """Return the JSON object a validated child answer carries, or ``None``.
+
+    Deliberately reuses ``extract_json_candidate`` — the same extraction
+    ``validate_output`` ran — so the object that gets attached to a board node
+    is exactly the one that passed validation. A second, independent parser
+    could accept a fenced/prose-wrapped answer the validator rejected (or vice
+    versa), which would attach a report the contract never approved.
+    """
+    try:
+        parsed = json.loads(extract_json_candidate(text or ""))
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def build_retry_message(errors: List[str]) -> str:

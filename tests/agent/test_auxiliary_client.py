@@ -262,7 +262,163 @@ class TestResolveTaskProviderModel:
         assert model is None
 
 
+class TestUnrecognizedAuxProviderWarning:
+    """An ``auxiliary.<task>.provider`` value that is not a provider must not
+    silently ride the main runtime.
 
+    Diagnostics-only contract: the value is still returned verbatim (no
+    routing change, no raise — auxiliary calls run mid-conversation), but the
+    misconfiguration is reported once per distinct value with a fix hint.
+    """
+
+    BOGUS = "Models.sjtu.edu.cn"
+
+    @pytest.fixture(autouse=True)
+    def _reset_warned_values(self):
+        import agent.auxiliary_client as _aux_mod
+        _aux_mod._UNRECOGNIZED_AUX_PROVIDER_WARNED.clear()
+        yield
+        _aux_mod._UNRECOGNIZED_AUX_PROVIDER_WARNED.clear()
+
+    def test_config_provider_warns_once_naming_value_and_fix(self, monkeypatch, caplog):
+        """Two calls with the same bogus value → exactly one WARNING that names
+        the value and tells the user how to fix it."""
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"provider": self.BOGUS, "model": "qwen"},
+        )
+
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            _resolve_task_provider_model(task="session_archive_summary")
+            _resolve_task_provider_model(task="session_archive_summary")
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, warnings
+        assert self.BOGUS in warnings[0]
+        # remediation: inherit the main runtime, or name a real provider id
+        assert "auto" in warnings[0]
+        assert "hermes model" in warnings[0]
+
+    def test_explicit_provider_arg_warns_too(self, monkeypatch, caplog):
+        """The same detection fires when the bad value arrives as an explicit
+        call-time provider (the reported clean-process repro path)."""
+        monkeypatch.setattr("agent.auxiliary_client._get_auxiliary_task_config", lambda task: {})
+
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            resolved = _resolve_task_provider_model(
+                task=None, provider="Some Display Name", model="qwen",
+            )
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, warnings
+        assert "Some Display Name" in warnings[0]
+        assert resolved == ("Some Display Name", "qwen", None, None, None)
+
+    def test_warning_is_diagnostics_only(self, monkeypatch, caplog):
+        """Resolution is untouched by the warning: the bogus value passes
+        through exactly as before, with and without the warning firing."""
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"provider": self.BOGUS, "model": "qwen"},
+        )
+        import agent.auxiliary_client as _aux_mod
+
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            warned = _resolve_task_provider_model(task="session_archive_summary")
+        assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+        # Same call once the per-value warning has already been spent.
+        _aux_mod._UNRECOGNIZED_AUX_PROVIDER_WARNED.add(self.BOGUS.lower())
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            silent = _resolve_task_provider_model(task="session_archive_summary")
+        assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+        assert warned == silent == (self.BOGUS, "qwen", None, None, None)
+
+    @pytest.mark.parametrize(
+        "provider, base_url, api_key",
+        [
+            # documented aux-provider values: auto / main / registry ids
+            ("auto", None, None),
+            ("main", None, None),
+            ("openrouter", None, None),
+            ("nous", None, None),
+            ("anthropic", None, None),
+            ("deepseek", None, None),
+            ("moa", None, None),
+            # custom endpoint supplied alongside the provider
+            ("custom", "https://api.example.com/v1", "sk-test"),
+            ("custom:my-endpoint", None, None),
+            # alias this module rewrites, and the direct-API alias
+            ("codex", None, None),
+            ("openai", None, None),
+            ("openai", "https://api.openai.com/v1", "sk-test"),
+            # an unrecognized *label* is fine when it comes with its endpoint
+            ("Models.sjtu.edu.cn", "https://models.sjtu.edu.cn/api/v1", None),
+            ("Models.sjtu.edu.cn", None, "sk-test"),
+        ],
+    )
+    def test_recognized_values_do_not_warn(self, monkeypatch, caplog, provider, base_url, api_key):
+        monkeypatch.setattr("agent.auxiliary_client._get_auxiliary_task_config", lambda task: {})
+
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            _resolve_task_provider_model(
+                task=None, provider=provider, model="m",
+                base_url=base_url, api_key=api_key,
+            )
+
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    @pytest.mark.parametrize("provider", ["auto", "main", "openrouter", "nous", "anthropic"])
+    def test_recognized_config_value_does_not_warn(self, monkeypatch, caplog, provider):
+        """Configured (not call-time) values take the same path and stay silent."""
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {"provider": provider, "model": "m"},
+        )
+
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            _resolve_task_provider_model(task="vision")
+
+        assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == []
+
+    def test_display_name_matching_a_config_provider_is_named(self, tmp_path, monkeypatch, caplog):
+        """Real config.yaml: a display name that coincides with a declared
+        custom provider still warns (it is not a provider id), and the warning
+        says so instead of pretending the endpoint does not exist."""
+        import yaml
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "custom_providers": [
+                        {
+                            "name": self.BOGUS,
+                            "base_url": "https://models.sjtu.edu.cn/api/v1",
+                            "key_env": "SJTU_TEST_KEY",
+                            "model": "deepseek-reasoner",
+                        }
+                    ],
+                    "auxiliary": {
+                        "session_archive_summary": {"provider": self.BOGUS, "model": "qwen"}
+                    },
+                }
+            )
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            resolved = _resolve_task_provider_model(task="session_archive_summary")
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, warnings
+        assert self.BOGUS in warnings[0]
+        # points at the config-declared endpoint rather than denying it exists
+        assert "base_url" in warnings[0]
+        assert resolved[0] == self.BOGUS
 
 
 class TestMoaAggregatorSharedResolution:
