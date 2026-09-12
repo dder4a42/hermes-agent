@@ -1605,10 +1605,23 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
+    # Tool Search activation latch, owned by THIS session. The decision whether
+    # MCP/plugin tools hide behind the tool_search bridge is taken on this first
+    # assembly and reused for every later one (see tools/tool_search.py::
+    # DeferralSession) — the tool array is a cached prompt prefix, so it must not
+    # be rewritten mid-conversation when an MCP server finishes connecting or a
+    # plugin toolset appears. Every rebuild of this snapshot
+    # (tools.mcp_tool.refresh_agent_mcp_tools) passes the same latch.
+    try:
+        from tools.tool_search import DeferralSession
+        agent._deferral_session = DeferralSession()
+    except Exception:
+        agent._deferral_session = None
     agent.tools = _ra().get_tool_definitions(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        deferral_session=agent._deferral_session,
     )
     
     # Show tool configuration and store valid tool names for validation

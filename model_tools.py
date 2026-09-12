@@ -325,6 +325,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    deferral_session: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -340,6 +341,15 @@ def get_tool_definitions(
             tool_search / tool_describe bridge handlers so they can read the
             real catalog, not the already-collapsed one. Public callers should
             leave this False.
+        deferral_session: The conversation's tool-search activation latch
+            (``tools.tool_search.DeferralSession``). Callers that own a session
+            — ``agent_init`` when it takes the tool snapshot and
+            ``refresh_agent_mcp_tools`` whenever it rebuilds that snapshot —
+            pass the agent's latch so the bridge decision is taken once and
+            reused for the life of the conversation. Passed results are never
+            memoized (see the cache note below) and never served from the memo,
+            because the decision belongs to one conversation, not to the
+            process.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
@@ -352,8 +362,14 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
+    #
+    # A caller-supplied ``deferral_session`` opts OUT of the memo entirely:
+    # the assembly it produces depends on that conversation's latched bridge
+    # decision, so a process-wide cache entry (keyed on toolsets alone) would
+    # hand one session's tool surface to another, and would freeze the first
+    # session's decision into a key other sessions hit.
     cache_key = None
-    if quiet_mode:
+    if quiet_mode and deferral_session is None:
         try:
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
@@ -387,7 +403,8 @@ def get_tool_definitions(
             return list(cached)
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+                                       skip_tool_search_assembly=skip_tool_search_assembly,
+                                       deferral_session=deferral_session)
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -419,6 +436,7 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    deferral_session: Optional[Any] = None,
 ) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     # Determine which tool names the caller wants
@@ -681,6 +699,7 @@ def _compute_tool_definitions(
                 filtered_tools,
                 context_length=context_length,
                 config=ts_cfg,
+                session=deferral_session,
             )
             if assembly.activated and not quiet_mode:
                 _forms = {"full": "catalog listing embedded",
@@ -696,6 +715,18 @@ def _compute_tool_definitions(
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
+        # This session's first assembly just failed, which means this turn
+        # ships the PRE-ASSEMBLY list: every tool direct, no bridge. Fail-open
+        # is fine once, but it must not be re-decided later — the reported
+        # regression turned the bridge on mid-session the moment the optional
+        # stemmer import started working, sweeping plugin tools the model had
+        # been calling directly into the deferred catalog. Pin the session
+        # eager so a later successful assembly cannot rewrite its tool surface.
+        if deferral_session is not None:
+            try:
+                deferral_session.pin_eager()
+            except Exception:
+                pass
 
     return filtered_tools
 

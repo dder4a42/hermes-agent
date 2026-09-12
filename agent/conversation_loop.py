@@ -1462,6 +1462,12 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     error that tells the model in-context tool-call syntax is DATA, not a
     call to make. A genuinely-wrong-but-nonempty name (an actual typo) still
     gets the catalog so the model can self-correct.
+
+    The third case is a name that EXISTS but is deferred behind the
+    ``tool_search`` bridge this session is running: the tool is one
+    ``tool_call`` away, so the reply is bridge routing (which tool it is, which
+    source it came from, how to call it) instead of the "does not exist"
+    catalog the model would read as "this capability is gone".
     """
     if not (name or "").strip():
         return (
@@ -1472,6 +1478,23 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
             "tool, use a valid name from your tool list; "
             "otherwise reply in plain text."
         )
+    # A deferred (tool_search-hidden) tool is a NAMED, working capability, not
+    # a typo: answering "does not exist" makes the model abandon it even though
+    # the bridge can invoke it in one call. Delegate the wording to the search
+    # layer, which knows the tool's source; fall back to the generic message
+    # whenever it has nothing to say (unknown name, core tool, feature off).
+    # Gated on the bridge actually being in THIS session's tool list: a session
+    # that kept its plugin/MCP tools direct has no tool_call to route through,
+    # and then the plain "does not exist" is the truthful answer.
+    _guidance = None
+    try:
+        from tools.tool_search import BRIDGE_TOOL_NAMES, deferred_tool_guidance
+        if BRIDGE_TOOL_NAMES & set(valid_tool_names or ()):
+            _guidance = deferred_tool_guidance(name)
+    except Exception:
+        _guidance = None
+    if _guidance:
+        return _guidance
     available = ", ".join(sorted(valid_tool_names))
     return f"Tool '{name}' does not exist. Available tools: {available}"
 

@@ -8211,6 +8211,13 @@ def refresh_agent_mcp_tools(
             enabled_toolsets=enabled,
             disabled_toolsets=disabled,
             quiet_mode=quiet_mode,
+            # Same latch ``agent_init`` used to take the snapshot: a rebuild may
+            # add the tools an MCP server just contributed, but it must not
+            # re-decide whether the bridge (tool_search/describe/call) is on —
+            # that decision is part of the cached tools prefix. An agent built
+            # before the latch existed (or a mock without it) rebuilds with the
+            # live decision, as before.
+            deferral_session=getattr(agent, "_deferral_session", None),
         )
         or []
     )
