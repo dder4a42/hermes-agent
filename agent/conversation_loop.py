@@ -2659,6 +2659,17 @@ def run_conversation(
         # messages walk inside estimate_request_tokens_rough. Tools added
         # separately (compression needs them: 50+ tools = 20-30K tokens).
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
+        #
+        # Caliber (verified): ``api_messages`` ALREADY carries the system
+        # prompt as its first element — see "Build the final system message"
+        # above — so this sum is the FULL-REQUEST caliber (system prompt +
+        # messages + tool schemas) and does not understate the real request.
+        # Do NOT "complete" it by also passing
+        # ``system_prompt=_cached_system_prompt`` into a
+        # ``estimate_request_tokens_rough`` call here: that double-counts the
+        # whole system prompt (thousands of tokens) and moves this number off
+        # the basis recorded by ``note_request_rough_estimate`` — see
+        # tests/agent/test_pre_api_request_pressure_basis.py.
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
@@ -7610,12 +7621,17 @@ def run_conversation(
                     # post-compression estimate as real context pressure.
                     _real_tokens = 0
                 else:
-                    # Include tool schemas — with 50+ tools enabled
-                    # these add 20-30K tokens the messages-only
-                    # estimate misses, which can skip compression
-                    # past the configured threshold (#14695).
+                    # Full-request caliber, mirroring the pre-API pressure check
+                    # and the turn-prologue preflight: tool schemas (50+ tools =
+                    # 20-30K tokens, #14695) AND the system prompt. ``messages``
+                    # here is the durable transcript, which does not carry the
+                    # system prompt, so it must be passed explicitly — omitting
+                    # it understates the real request and can let the session
+                    # creep past the threshold with no output room left.
                     _real_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
+                        messages,
+                        system_prompt=active_system_prompt or "",
+                        tools=agent.tools or None,
                     )
 
                 if (
